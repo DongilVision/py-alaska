@@ -1,0 +1,21 @@
+{
+  "app_info": {
+    "name": "joystick_cnc",
+    "id": "joystick-cnc-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "joystick/JoyStickTask": {
+      "@import": "example.ex180_JoyStick.task_joystick"
+    },
+    "ui/UITask": {
+      "@import": "example.ex180_JoyStick.task_ui"
+    }
+  }
+}

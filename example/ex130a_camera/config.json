@@ -1,0 +1,36 @@
+{
+  "app_info": {
+    "name": "cam_dp_example",
+    "id": "node-cam-dp-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_smblock": {
+      "smblock2048": {
+        "shape": [2048, 2448, 3],
+        "maxsize": 100
+      }
+    },
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true,
+      "measurement": true
+    }
+  },
+  "task_config": {
+    "camera1/imi_cam_dp": {
+      "@import": "example.ex130a_camera.task_cam_driver",
+      "smblock": "smblock:smblock2048",
+      "mac_address": "00:09:7e:35:80:38",
+      "fps": 900,
+      "exposure": 15000,
+      "trigger_source": "hardware",
+      "trigger_mode": false
+    },
+    "viewer/ImiCameraView": {
+      "@import": "example.ex130a_camera.task_viewer",
+      "target": "client:camera1",
+      "smblock": "smblock:smblock2048"
+    }
+  }
+}

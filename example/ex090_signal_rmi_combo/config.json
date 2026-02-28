@@ -1,0 +1,22 @@
+{
+  "app_info": {
+    "name": "signal_rmi_combo",
+    "id": "combo-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "sensor/SensorTask": {
+      "@import": "example.ex090_signal_rmi_combo.tasks"
+    },
+    "dashboard/DashboardTask": {
+      "@import": "example.ex090_signal_rmi_combo.tasks",
+      "sensor": "client:sensor"
+    }
+  }
+}

@@ -1,0 +1,458 @@
+test_base.py
+
+base 시험이 완료되면 즉시 시험내용과 결과를 표시한다.
+단위구현을 시험하는 내용으로 혼합시험은 next에서 한다.
+
+[목표]
+- ipc와 signal을 0.1ms에 완료하는 것.
+
+[제약사항]
+- 메시지(payload)는 1KB를 넘지 않는다.
+- cpu 부하를 유발해서는 안 된다.
+- Multiprocessing.manager.queue를 사용하지 않는다.
+
+[시험조건]
+- 성능시험시는 통계 및 디버거기능을 off하고 시험한다.
+- task 재실행, watchdog 등은 off하고 시험한다.
+- random wait: 0.01ms~0.5ms
+
+
+[sm_memory 시험]  (test_sm_memory.py)
+핵심자원에 대한 신뢰도 확보
+핵심이 되는 공유메모리 방식 각 클래스에 대한 시험
+Multiprocessing.manager.queue를 사용하지 않고 SharedMemory 기반으로 대체한 것의 정당성 검증
+
+  대상 클래스 5종:
+  ├── SmRingBuffer  : Lock-free SPSC 링 버퍼 (바이트 메시지 전달)
+  ├── SmValue       : 고속 공유 메모리 스칼라 값
+  ├── SmBlock       : 이미지 블록 풀 관리자 (Free List O(1))
+  ├── SmBlockBuffer : SmBlock 컨텍스트 매니저 (자동 할당/해제)
+  └── SmQueue       : SharedMemory IPC Queue (mp.Queue 드롭인 대체)
+
+  시험 레벨:
+  Level 1 — 단위 시험 (단일 프로세스, 기능 정확성)
+  Level 2 — 프로세스 간 시험 (Producer/Consumer 2-프로세스)
+  Level 3 — 스트레스 시험 (다수 프로세스, 대량 반복)
+  Level 4 — 성능 비교 시험 (vs multiprocessing.Manager/Queue)
+
+─────────────────────────────────────────────────
+1. SmRingBuffer 시험 (28개)
+─────────────────────────────────────────────────
+  [Level 1: 단위 시험]
+  RB-U01  생성 및 속성 확인 (name, size, available)
+  RB-U02  기본 write/read — b"hello" 왕복
+  RB-U03  빈 버퍼 read → None
+  RB-U04  빈 데이터 write/read (b"")
+  RB-U05  연속 메시지 FIFO 순서 검증 (4개)
+  RB-U06  버퍼 가득 참 → write False
+  RB-U07  최대 크기 단일 메시지 (sz-5바이트)
+  RB-U08  최대 초과 메시지 → False
+  RB-U09  wrap-around 동작 검증
+  RB-U10  length prefix 자체가 wrap하는 경우
+  RB-U11  available() 정확성 (write/read 후 추적)
+  RB-U12  write/read 교차 반복 100회
+  RB-U13  바이너리 데이터 (0x00~0xFF 전체)
+  RB-U14  double close 안전성
+  RB-U15  __repr__ 출력 확인
+  RB-U16  Producer/Consumer 동일 프로세스 연결
+  RB-U18  스트레스 — 가득 채우고 비우기 10사이클
+  RB-U19  BUG-1 검증 — length=sz-4 read 검증
+  RB-U20  1바이트 데이터 write/read
+  RB-U21  대용량 데이터 (8KB)
+  RB-U22  write 실패 후 기존 데이터 무결성
+  RB-U23  여러 번 wrap-around 순환 50회
+  RB-U24  다양한 크기 메시지 혼합
+  RB-U25  여러 메시지 중 일부만 읽기
+  RB-U26  Producer/Consumer 교대 write/read
+  RB-U27  최소 버퍼 크기 (size=6)
+  RB-U28  긴 문자열 반복 write/read
+
+  [Level 2: 프로세스 간 시험]
+  RB-U17  프로세스 간 통신 — 자식 프로세스 writer, 부모 reader, 50개 메시지
+
+  [Level 3: 스트레스 시험]
+  RB-S01  프로세스 간 대량 전송 — 10,000개 메시지, 데이터 무결성 및 순서 확인
+  RB-S02  다중 Producer (10 프로세스) → 단일 Consumer, 각 1000개 메시지 (External Lock 사용)
+  RB-S03  연속 wrap-around 10,000회 — 수 시간 가동 시 메모리 오버런/유실 없음 확인
+  RB-S04  최대 크기 메시지 (sz-5) 연속 write/read 1000회 — 경계값 안정성
+  RB-S05  무작위 크기 메시지 (1B~1KB) 5000개 랜덤 간격 송수신
+  RB-S06  Consumer 프로세스 강제 종료 후 재시작 시 링버퍼 복구 및 잔여 데이터 읽기
+
+─────────────────────────────────────────────────
+2. SmValue 시험 (30개)
+─────────────────────────────────────────────────
+  [Level 1: 단위 시험]
+  SV-U01  int 타입 생성 및 기본값 (=0)
+  SV-U02  초기값 설정 (initial=42)
+  SV-U03  value getter/setter
+  SV-U04~U13  전체 typecode 10종 테스트 (b,B,h,H,i,I,q,Q,f,d)
+  SV-U14  잘못된 typecode → ValueError
+  SV-U15  lock 사용 get/set
+  SV-U16  increment 동작 (+5, -3)
+  SV-U17  lock 사용 increment 100회
+  SV-U18  Producer/Consumer 연결 (double, 값 변경 추적)
+  SV-U20  float vs double 정밀도 차이 검증
+  SV-U21  name 속성
+  SV-U22  __repr__ 출력
+  SV-U23  int8 경계값 (-128, 127)
+  SV-U24  uint8 경계값 (0, 255)
+  SV-U25  int16 경계값
+  SV-U26  double 특수값 (inf, -inf)
+  SV-U27  반복 쓰기 안정성 1000회
+  SV-U28  increment 기본 delta=1
+  SV-U29  lock 없이 get/set
+  SV-U30  음수 초기값
+
+  [Level 2: 프로세스 간 시험]
+  SV-U19  프로세스 간 값 공유 — 자식이 1~50 기록, 부모 최종값=50 확인
+
+  [Level 3: 스트레스 시험]
+  SV-S01  10 프로세스 동시 increment (Lock 사용) → 10,000회 수행 후 최종값 정확성
+  SV-S02  프로세스 간 값 변경 10,000회 (0.1ms 간격), 최종값 일치 확인
+  SV-S03  전 typecode (10종)에 대해 프로세스 간 경계값 (MAX/MIN) 100회 write/read
+  SV-S04  다중 프로세스(4) 동시 read + 단일 프로세스 write (10,000회) 무결성
+  SV-S05  부모 프로세스 write → 자식(5) 동시 read 성능 및 지연 측정 (Broadcast 유사 효과)
+
+─────────────────────────────────────────────────
+3. SmBlock 시험 (26개)
+─────────────────────────────────────────────────
+  [Level 1: 단위 시험]
+  SB-U01  생성 및 속성 (name, shape, maxsize, item_size, is_new)
+  SB-U02  malloc → get 데이터 정확성
+  SB-U03  alloc → get_buffer → 직접 쓰기 (Zero-copy)
+  SB-U04  Free list 무결성 — 할당/해제 반복
+  SB-U05  풀 가득 참 → -1
+  SB-U06  double free → ValueError
+  SB-U07  범위 외 인덱스 → IndexError (get, mfree, get_buffer)
+  SB-U08  shape 불일치 → ValueError
+  SB-U09  비어있는 블록 get → ValueError
+  SB-U10  count() — free 블록 수 추적
+  SB-U11  size() 반환값
+  SB-U12  malloc2 순차 할당 (서로 다른 인덱스)
+  SB-U13  블록 간 데이터 격리 (red vs blue)
+  SB-U16  __str__ / __repr__
+  SB-U17  대형 shape (100x100x3)
+  SB-U18  최소 shape (1x1x1)
+  SB-U19  malloc/mfree 반복 안정성 100회
+  SB-U20  index_size 속성
+  SB-U21  malloc2 풀 가득 참 → -1
+  SB-U22  alloc → mfree → 재 alloc (스택 LIFO 확인)
+  SB-U23  역순 해제 후 재할당
+  SB-U24  get() 복사본 확인 (원본 수정 무영향)
+  SB-U25  get_buffer() 뷰 확인 (원본 연동)
+  SB-U26  2D shape (grayscale H×W)
+
+  [Level 2: 프로세스 간 시험]
+  SB-U14  Producer/Consumer 연결 — 동일 메모리 접근
+  SB-U15  프로세스 간 공유 — 자식에서 get_buffer write, 부모에서 get 확인
+
+  [Level 3: 스트레스 시험]
+  SB-S01  4 프로세스 동시 malloc/mfree 1000회, count 최종 일치 (Lock 무결성)
+  SB-S02  대형 풀 (maxsize=100) 전체 할당 → 해제 100사이클, 누수 및 인덱스 꼬임 없음
+  SB-S03  malloc/mfree 무작위 순서 5000회, Free list 일관성 및 count() 정확성
+  SB-S04  다중 프로세스(4) 동시 malloc → 데이터 기록 → 해제 (1000프레임 시뮬레이션)
+  SB-S05  사용 중인 인덱스 write → 다른 프로세스 read 1000회 데이터 무결성
+  SB-S06  mfree 시 잘못된 인덱스 주입 → Exception 발생 및 기존 풀 상태 보존
+
+─────────────────────────────────────────────────
+4. SmBlockBuffer 시험 (16개)
+─────────────────────────────────────────────────
+  [Level 1: 단위 시험]
+  BB-U01  with문 기본 동작 (할당, 쓰기, 자동 해제)
+  BB-U02  예외 시 자동 해제
+  BB-U03  keep() — 자동 해제 방지 → 수동 mfree 필요
+  BB-U04  release() — with 블록 내 수동 해제
+  BB-U05  풀 가득 참 → RuntimeError
+  BB-U06  copy=True — 독립 복사본
+  BB-U07  __repr__
+  BB-U08  다중 버퍼 동시 사용 (2개 중첩)
+  BB-U09  copy=False → 공유 참조 (기본값)
+  BB-U10  release 후 재할당 가능
+  BB-U11  keep 후 데이터 persist 확인
+  BB-U12  3개 동시 중첩
+  BB-U13  keep 후 repr
+  BB-U14  반복 buffer 할당/해제 50회
+  BB-U15  buffer data shape 확인 (10x20x3)
+  BB-U16  release 여러 번 호출 안전
+
+─────────────────────────────────────────────────
+5. SmQueue 시험 (신규)
+─────────────────────────────────────────────────
+  SmQueue는 Multiprocessing.Manager.Queue 대체 핵심 클래스
+  SmRingBuffer + Semaphore + pickle 기반
+
+  [Level 1: 단위 시험]
+  SQ-U01  생성 및 속성 확인 (name, repr)
+  SQ-U02  기본 put/get — 정수, 문자열, 리스트
+  SQ-U03  put/get — dict, tuple 등 pickle 가능 객체
+  SQ-U04  get timeout → queue.Empty
+  SQ-U05  get_nowait — 비어있을 때 queue.Empty
+  SQ-U06  empty() — 비어있음/데이터 있음 확인
+  SQ-U07  qsize() — 대략적 바이트 수 확인
+  SQ-U08  연속 put/get FIFO 순서 검증 (10개)
+  SQ-U09  close 후 안전성
+  SQ-U10  __getstate__/__setstate__ — pickle 직렬화/역직렬화
+  SQ-U11  FileExistsError 처리 — create=True 중복 생성 시 리셋
+  SQ-U12  spin=0 (Semaphore only) 모드 동작
+  SQ-U13  spin=-1 (pure spin) 모드 동작
+  SQ-U14  대용량 객체 (512B~1KB) put/get
+  SQ-U15  빈 객체 (b"", "", []) put/get
+
+  [Level 2: 프로세스 간 시험]
+  SQ-P01  2-프로세스 기본 통신 — 자식 put 50개 → 부모 get 50개
+  SQ-P02  양방향 통신 — 2개 SmQueue 사용, 각각 put/get 교대
+  SQ-P03  Producer/Consumer — 자식이 pickle 객체 전송, 부모 역직렬화 확인
+  SQ-P04  다중 Producer (4 프로세스) → 단일 Consumer, Lock 사용
+
+  [Level 3: 스트레스 시험]
+  SQ-S01  1000개 메시지 연속 전송 — 데이터 무결성, 순서 보장
+  SQ-S02  프로세스 간 1000개 왕복 — put/get 교대 무손실 확인
+  SQ-S03  버퍼 가득 참 상황에서 put 재시도 → 정상 전달 확인
+  SQ-S04  다중 Producer 10 프로세스 × 100개 = 총 1000개 수신 확인
+
+  [Level 4: 성능 비교 시험]
+  SQ-B01  SmQueue vs multiprocessing.Queue — 단방향 1000회 왕복 시간
+  SQ-B02  SmQueue vs multiprocessing.Queue — 프로세스 간 왕복 지연(RTT)
+  SQ-B03  SmQueue spin 모드별 비교 — spin=0 / spin=64 / spin=-1
+  ※ Multiprocessing.Manager.Queue는 사용 금지 (제약사항)
+  ※ 비교 대상은 multiprocessing.Queue (Pipe 기반)
+
+─────────────────────────────────────────────────
+6. 통합 스트레스 시험 (sm_memory 전체)
+─────────────────────────────────────────────────
+  SM-I01  SmQueue + SmValue 연동 — SmQueue로 메시지 전달, SmValue로 카운터 동기화
+         4 프로세스, 1000회 메시지 교환 후 카운터 값 일치 확인
+  SM-I02  SmBlock + SmQueue 연동 — SmBlock에 이미지 할당 후 인덱스를 SmQueue로 전달
+         2 프로세스, 100프레임 전달 후 데이터 무결성 확인
+  SM-I03  전체 클래스 동시 사용 — SmBlock(이미지) + SmValue(카운터) + SmQueue(이벤트)
+         실제 카메라 파이프라인 시뮬레이션, 100프레임 처리
+  SM-I04  장시간 안정성 — 5분간 지속적 메시지 교환, 메모리 누수 없음 확인
+
+─────────────────────────────────────────────────
+7. 판정 기준
+─────────────────────────────────────────────────
+  [기능 정확성]
+  - 모든 Level 1~2 시험 PASS (0 failures)
+  - FIFO 순서 100% 보장
+  - 프로세스 간 데이터 무결성 100%
+
+  [성능 기준]
+  - SmQueue 프로세스 간 왕복 지연: < 0.1ms (spin=64 기준)
+  - SmValue 접근 지연: < 0.01ms
+  - SmRingBuffer write/read 단일 호출: < 0.01ms
+  - SmQueue vs mp.Queue 성능: 5x 이상 개선
+
+  [안정성 기준]
+  - 1000개 메시지 무손실 전달 (100%)
+  - 다중 프로세스 동시 접근 시 교착상태 없음
+  - close/해제 후 리소스 잔류 없음 (SharedMemory unlink)
+  - 5분 장시간 시험 시 메모리 증가 없음
+
+─────────────────────────────────────────────────
+8. Signal 단위 시험 (test_signal.py, 54개)
+─────────────────────────────────────────────────
+  핵심 시그널 클래스에 대한 기능 정확성, 동시성, 시퀀스 트래킹 검증
+  SignalBroker (thread 모드) + SignalClient 단위 동작 확인
+
+  [Signal 데이터클래스]  SIG-01~SIG-10 (10개)
+  SIG-01  Signal 생성 — name, source 설정 확인
+  SIG-02  Signal + dict 데이터 포함 생성
+  SIG-03  Signal + 문자열 데이터
+  SIG-04  Signal + 정수 데이터
+  SIG-05  Signal + 리스트 데이터
+  SIG-06  Signal + None 데이터
+  SIG-07  Signal + 중첩 dict 데이터
+  SIG-08  Signal + bytes 데이터
+  SIG-09  Signal + 유니코드 (한글) 데이터
+  SIG-10  Signal + 빈 컬렉션 (dict, list, str) 데이터
+
+  [SignalBroker 기본]  SIG-11~SIG-15 (5개)
+  SIG-11  Broker 생성
+  SIG-12  태스크 큐 등록 — register() → 큐 반환
+  SIG-13  태스크 해제 — unregister() 후 큐 제거
+  SIG-14  동일 태스크 재등록 — 유효한 큐 반환
+  SIG-15  다중 태스크 등록 — 서로 다른 큐
+
+  [구독/발행]  SIG-16~SIG-25 (10개)
+  SIG-16  시그널 구독 — subscribe 후 구독자 목록 확인
+  SIG-17  구독 해제 — unsubscribe 후 구독자 제거
+  SIG-18  시그널 발행 — emit → 큐에서 데이터 수신
+  SIG-19  특정 태스크에 직접 발행 — emit_to 지정 전송
+  SIG-20  다중 구독자 — 1개 시그널 2개 태스크 동시 수신
+  SIG-21  중복 구독 방지 — 같은 태스크 2회 구독해도 1회
+  SIG-22  구독자 없는 시그널 발행 — 에러 없이 무시
+  SIG-23  해제 시 모든 구독 정리
+  SIG-24  큐 데이터 형식 — name/source/data 필드 확인
+  SIG-25  대용량 데이터 — 1000개 항목 dict 전송
+
+  [SignalClient]  SIG-26~SIG-35 (10개)
+  SIG-26  클라이언트 시작/정지
+  SIG-27  핸들러 등록 후 수신 — on() + emit → handler 호출
+  SIG-28  핸들러 해제 — off() 후 수신 안 됨
+  SIG-29  다중 핸들러 — 1개 시그널에 3개 핸들러 등록
+  SIG-30  핸들러 예외 격리 — 에러 핸들러가 다른 핸들러에 영향 없음
+  SIG-31  source 정확성 — sender ID가 signal.source에 반영
+  SIG-32  빠른 연속 발행 — 50개 시그널 모두 수신
+  SIG-33  다중 클라이언트 브로드캐스트 — 5개 수신자 모두 수신
+  SIG-34  여러 시그널 타입 구독 — 3개 시그널 각각 수신
+  SIG-35  자기 자신에게 emit_to — 자신의 핸들러 호출
+
+  [동시성]  SIG-36~SIG-40 (5개)
+  SIG-36  동시 구독 — 5개 스레드에서 동시에 구독
+  SIG-37  동시 emit — 5개 스레드 × 10회 = 50회 수신
+  SIG-38  동시 시작/정지 — 10개 클라이언트 동시 시작/정지
+  SIG-39  다수 구독자 — 20개 클라이언트 동시 수신
+  SIG-40  단일 클라이언트 100개 시그널 수신
+
+  [엣지 케이스]  SIG-41~SIG-45 (5개)
+  SIG-41  빈 시그널명 — 에러 없이 발행/구독
+  SIG-42  특수문자 시그널명 (sig:sub/path.test)
+  SIG-43  매우 긴 시그널명 (500자)
+  SIG-44  유니코드 데이터 전송
+  SIG-45  다중 브로커 격리 — 서로 다른 브로커는 독립 동작
+
+  [시퀀스 트래킹]  SIG-46~SIG-54 (9개)
+  SIG-46  emit 시 시그널별 seq 자동 증가
+  SIG-47  큐 데이터에 _seq 포함 확인
+  SIG-48  수신측 gap 감지 — 중간 seq 누락 시 경고 출력
+  SIG-49  연속 seq — gap 없으면 경고 없음
+  SIG-50  source별 독립 seq 추적
+  SIG-51  _seq=0 하위호환 — 트래킹 대상 아님
+  SIG-52  emit_fast 통한 _seq 전파 확인
+  SIG-53  _distribute_signal 통한 _seq 전파 확인
+  SIG-54  송수신 end-to-end seq 검증
+
+─────────────────────────────────────────────────
+9. Signal 선택적 분배 시험 (test_select_signal.py, 14개)
+─────────────────────────────────────────────────
+  Process 간 시그널 선택적 분배 (ex050_select_signal 동일 구조)
+  시그널 흐름: SourceTask(process) → job.{a,b,c,d} → WorkerTask(process) → result → CollectorTask(thread)
+
+  [Process → Thread 정적 구독]  SEL-01~SEL-02 (2개)
+  SEL-01  Process emit → Thread on_ping 수신
+  SEL-02  2초간 다수 시그널 수신 확인 (≥10)
+
+  [Process → Process 정적 구독]  SEL-03~SEL-04 (2개)
+  SEL-03  Process emit → Process on_ping 수신 (pre-subscribe)
+  SEL-04  Process→Process 정적 구독 다수 수신 (≥10)
+
+  [동적 구독 relay]  SEL-05~SEL-06 (2개)
+  SEL-05  Process 동적 구독 (runtime.signal.on) → 시그널 수신
+  SEL-06  동적 구독 선택 수신 — alpha/beta 각각 독립 구독
+
+  [선택적 분배]  SEL-07~SEL-09 (3개)
+  SEL-07  worker_a는 job.a만 수신
+  SEL-08  worker_a~d 모두 각자의 job 시그널 수신
+  SEL-09  정적 on_job_a Worker는 job.a만 수신
+
+  [전체 체인]  SEL-10~SEL-12 (3개)
+  SEL-10  Source → worker_a → Collector 단일 체인
+  SEL-11  Source → worker_a~d → Collector 전체 체인 (4개 job_type 결과 확인)
+  SEL-12  result 데이터 구조 검증 (job_id, job_type, result 필드)
+
+  [브로드캐스트]  SEL-13~SEL-14 (2개)
+  SEL-13  같은 시그널을 thread/process 수신자가 동시 수신
+  SEL-14  같은 시그널을 3개 process Task가 동시 수신
+
+─────────────────────────────────────────────────
+10. Signal 고부하 시험 (test_signal_stress.py, 8개) ★신규
+─────────────────────────────────────────────────
+  process모드(4), thread모드(4): signal 발생하고 일련번호 부여
+  각 수신자가 1000개를 정확히 수신하는지 시험
+  - 라운드로빈: 4 task가 돌아가면서 송신
+  - 병렬: 4 task가 동시에 송신
+
+  [Thread 모드] (현재 활성)
+  SS-T01  라운드로빈 송신: 4 task 순차 × 250 signal (총 1000), 수신측 90%+ 확인
+  SS-T02  병렬 송신: 4 task 동시 × 250 signal (총 1000), 수신측 90%+ 확인
+  SS-T03  시퀀스 무결성: 수신 seq gap 0 확인 (source별 추적)
+
+  [Process 모드] (SKIP — cross-process broker 캐시 동기화 미지원)
+  SS-P01  라운드로빈 송신: 4 task 순차 × 250 signal (총 1000)
+  SS-P02  병렬 송신: 4 task 동시 × 250 signal (총 1000)
+  SS-P03  시퀀스 무결성: 수신 seq gap 0 확인
+
+  [혼합 모드] (SKIP — Process 모드 시그널 전달 이슈)
+  SS-M01  Process(2) → Thread(2) 크로스 모드 1000 signal
+  SS-M02  Thread(2) → Process(2) 크로스 모드 1000 signal
+
+─────────────────────────────────────────────────
+11. IPC/Signal 기본 시험 (test_base.py, 5개)
+─────────────────────────────────────────────────
+  BS-01  Process IPC: 2 task (alpha, beta), 상호 RMI 호출 100회, latency 측정
+  BS-02  Thread Signal: 2 task (alpha, beta), 상호 signal 100회, latency 측정
+  BS-03  SmValue: process 간 1000x read/write, 최종값 일치 확인
+  BS-04  SmRingBuffer: process 간 1000x write/read, FIFO 순서 검증
+  BS-05  SmQueue: process 간 1000x put/get, FIFO 순서 검증
+
+─────────────────────────────────────────────────
+12. Signal QoS 및 실시간성 시험 (test_qos.py, 30개) ★신규
+─────────────────────────────────────────────────
+  우선순위 스케줄링, 데드라인 폐기, 타이밍 통계, BlackBox 세션 검증
+
+  [우선순위 스케줄링]  QOS-P01~P05 (5개)
+  QOS-P01  Strict Priority — BACKGROUND 100개 처리 중 CRITICAL 1개 즉시 수신 (LIFO 유사 효과)
+  QOS-P02  멀티 큐 격리 — 각 우선순위별 5개 큐 독립 동작 및 qsize 확인
+  QOS-P03  기아(Starvation) 재현 — 고순위 시그널(100/s) 발생 시 저순위 대기 확인
+  QOS-P04  컨트롤 메시지 우선 처리 — SYNC_REGISTRY가 Queue[0]를 통해 즉시 반영
+  QOS-P05  기본 우선순위 — _signal_priority 설정값 반영 및 명시적 override 확인
+
+  [데드라인 메커니즘]  QOS-D01~D06 (6개)
+  QOS-D01  데드라인 준수 — 유효 시간 내(10ms) 정상 처리 확인
+  QOS-D02  처리 전 만료 폐기 — 큐 대기 시간 초과 시 handler 미호출 및 DISCARDED 로그
+  QOS-D03  처리 중 만료 감지 — handler 실행 중 데드라인 초과 시 OVERRUN 에러 보고
+  QOS-D04  데드라인 미지정(None) — 무기한 대기 및 기존 동작 호환성
+  QOS-D05  데드라인 위반 통계 — miss_before/after 카운트 정확성 (get_stats)
+  QOS-D06  짧은 데드라인(0.001s) — 극한 환경에서의 즉각 폐기 동작
+
+  [타이밍 통계 및 트레이스]  QOS-T01~T06 (6개)
+  QOS-T01  4구간 타이밍 측정 — transit, wait, proc, total 시간 정확성 (±0.1ms)
+  QOS-T02  윈도우 통계 (min/avg/max) — 최근 50개 샘플 기반 계산 정확성
+  QOS-T03  중첩 체인 추적 — A→B→C 체인 전체 경과 시간(chain_elapsed) 및 depth 검증
+  QOS-T04  Signal ID 추적 — EMIT → HANDLE_START → HANDLE_END 전 구간 수명주기 조회
+  QOS-T05  Chain ID 전파 — 체인 내 모든 시그널이 동일한 chain_id(최초 ID) 공유 확인
+  QOS-T06  큐 길이(qlen) 측정 — 수신 시점의 큐 깊이 기록 및 병목 구간 식별
+
+  [BlackBox 완료 보장]  QOS-B01~B08 (8개)
+  QOS-B01  BlackBox 세션 생성 — blackbox_id 기반 공유 메모리 슬롯 할당 (ACTIVE)
+  QOS-B02  이벤트 자동 기록 — 체인 내 모든 emit/handler 이벤트가 세션 로그에 적재
+  QOS-B03  단계 완료 자동 추적 — blackbox_steps 도달 시 세션 상태 변화 확인
+  QOS-B04  정상 완료 (ACK) — acknowledge() 호출 시 COMPLETED 전환 및 TTL 삭제
+  QOS-B05  타임아웃 감시 — 5초(기본) 초과 시 ALARM 상태 전환 및 경보 시그널 발생
+  QOS-B06  BlackBox Task — 주기적 스캔을 통한 타임아웃/정리 자동 수행 확인
+  QOS-B07  다중 세션 — 10개 병렬 BlackBox 세션 독립 관리 및 간섭 없음
+  QOS-B08  세션 로그 조회 — 특정 blackbox_id의 전체 이벤트 히스토리 추출 (API)
+
+  [하위 호환성 및 안정성]  QOS-S01~S05 (5개)
+  QOS-S01  QoS 미사용 시 성능 — v2.1 대비 오버헤드 측정 (< 5% 증가 허용)
+  QOS-S02  Thread/Process 혼합 모드 — 크로스 모드 시그널 전달 및 QoS 데이터 보존
+  QOS-S03  대용량 Payload — 1KB 초과 시 Manager.Queue fallback 및 QoS 유지
+  QOS-S04  공유 메모리 리셋 — TaskManager 재시작 시 SM 리소스(stats, registry) 초기화
+  QOS-S05  장시간 가동 — 10분간 지속적 QoS 시그널 발행 시 메모리 누수 없음
+
+─────────────────────────────────────────────────
+13. 판정 기준 (Signal/IPC 전체 및 QoS 통합)
+─────────────────────────────────────────────────
+  [기능 정확성]
+  - Signal 단위 시험 54개 전체 PASS
+  - 선택적 분배 시험 14개 전체 PASS
+  - 고부하 시험 8개 전체 PASS
+  - 우선순위 큐(5개)의 분배 및 처리 순서 정확성 (95% 이상 적중)
+  - 데드라인 위반 시 즉각 폐기 및 에러 통계 반영 (100% 반영)
+  - BlackBox 세션 타임아웃 감지 및 경보 시그널 수신 (100% 성공)
+
+  [성능/실시간성 기준]
+  - IPC/Signal 왕복 지연: < 0.1ms (p50)
+  - Signal emit 단일 호출: < 0.01ms
+  - transit_time: < 0.1ms (thread), < 0.5ms (process)
+  - chain_elapsed: 전체 3단계 체인 합계 < 1.0ms
+  - stats 접근 오버헤드: < 0.01ms (SmValue/SmSignalStats 적용 후)
+
+  [신뢰도/안정성 기준]
+  - 1000개 메시지 100% 수신 (0 loss, 데드라인 만료 제외)
+  - 시퀀스 gap 0 (source별 추적)
+  - 다중 구독자 동시 수신 100%
+  - Process/Thread 크로스 모드 안정 동작
+  - BlackBox 세션 64개 풀 가득 참 상황에서도 시스템 패닉 없음
+  - 프로세스 비정상 종료 시 SM 핸들러 자동 회수 확인
+  - 10분 장시간 가동 시 메모리 누수 없음

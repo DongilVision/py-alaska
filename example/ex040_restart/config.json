@@ -1,0 +1,22 @@
+{
+  "app_info": {
+    "name": "restart_example",
+    "id": "restart-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "unstable/UnstableTask": {
+      "@import": "example.ex040_restart.tasks"
+    },
+    "watcher/WatcherTask": {
+      "@import": "example.ex040_restart.tasks",
+      "unstable": "client:unstable"
+    }
+  }
+}

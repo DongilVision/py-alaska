@@ -1,0 +1,116 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.0 - 수정이력                                                      ║
+║  Modification History                                                        ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Version : 2.2.0                                                             ║
+║  Date    : 2026-02-18                                                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+================================================================================
+[v2.2.0] 2026-02-18
+================================================================================
+
+■ Signal 시스템 안정화 및 _seq 트래킹 추가
+
+1. Signal 객체 재사용 버그 수정 (task_signal.py)
+   - 증상 : "Block X is already free" 오류, SmBlock 이중 해제
+   - 원인 : _recv_loop에서 Signal 객체 1개를 재사용하는 구조에서,
+            @ui_thread 데코레이터가 클로저를 Qt 이벤트 큐에 지연 등록하는 동안
+            Signal 객체의 데이터가 다음 시그널로 덮어씌워짐
+   - 수정 : _recv_loop에서 수신 메시지마다 Signal 객체를 새로 생성하도록 변경
+   - 파일 : src/py_alaska/task_signal.py (SignalClient._recv_loop)
+
+2. 플랫폼 레벨 _seq 시퀀스 트래킹 추가 (task_signal.py)
+   - 목적 : 시그널 누락(drop) 여부를 수신측에서 자동 감지
+   - 동작 :
+     · 송신측(SignalClient.emit)에서 signal_name별 seq 번호 자동 부여 (1부터 증가)
+     · seq 번호는 전달 경로 전체를 통해 보존됨
+       (emit_fast → relay_queue/shm_buffer → _distribute_signal → subscriber_queue)
+     · 수신측(_recv_loop)에서 (source, signal_name) 키로 마지막 seq를 추적하여
+       gap 발생 시 표준 출력에 경고 메시지 출력
+       예: [Signal:viewer] 2 missed: 'camera.received' from 'camera1' (seq 3~4)
+   - 하위호환 : _seq=0(기본값)인 경우 트래킹 비활성화, 기존 코드 영향 없음
+   - 수정 파일 :
+     · src/py_alaska/task_signal.py
+       - SignalClient.__slots__      : _emit_seqs, _recv_seqs 추가
+       - SignalClient.__init__       : seq dict 초기화
+       - SignalClient.emit()         : signal_name별 seq 증가, emit_fast에 전달
+       - SignalClient._recv_loop()   : gap 감지 로직 추가
+       - SignalBroker.emit()         : _seq 파라미터 전파
+       - SignalBroker.emit_fast()    : _seq 파라미터 전파
+       - SignalBroker._distribute_signal() : _seq 파라미터 전파
+       - SignalBroker._relay_loop()  : data.get('_seq', 0) 전달
+       - SignalBroker._relay_loop_shm() : data.get('_seq', 0) 전달
+       - SignalSharedBuffer.put()    : _seq 파라미터, pickle payload에 포함
+
+3. 카메라 프레임 전달 방식 변경 (ex130_camera)
+   - 변경 전 : nextTask.on_input.nowait(frame_info) — RMI 1:1 전달
+   - 변경 후 : signal.camera.received.emit({...})  — Signal 브로드캐스트
+   - 효과 : 여러 구독자가 동시에 카메라 프레임을 수신 가능
+   - 수정 파일 :
+     · src/py_alaska/drives/imi/imi_camera.py   : emit 방식으로 변경
+     · example/ex130_camera/task_viewer.py      : on_input → on_camera_received
+     · example/ex130_camera/config.json         : nextTask 제거, 클래스명 대소문자 수정
+
+4. 성능 테스트 기준값 조정 (ex140_performance)
+   - 변경 전 : SIGNAL_TARGET_MS=0.1, IPC_TARGET_MS=0.1, TARGET_TPS=1000 (비현실적)
+   - 변경 후 : SIGNAL_TARGET_MS=0.5, IPC_TARGET_MS=3.0, TARGET_TPS=300 (실측 기반)
+   - 수정 파일 : example/ex140_performance/task_gui.py
+
+--------------------------------------------------------------------------------
+
+■ 테스트 추가 (tests/test_signal.py)
+
+   - SIG-46 : emit 시 시그널별 seq 자동 증가 확인
+   - SIG-47 : 큐 전달 데이터에 _seq 필드 포함 확인
+   - SIG-48 : 수신측 gap 감지 — 누락 seq 경고 출력 확인
+   - SIG-49 : 연속 seq — gap 없으면 경고 없음 확인
+   - SIG-50 : source별 독립 seq 추적 확인
+   - SIG-51 : _seq=0 하위호환 — 트래킹 무시 확인
+   - SIG-52 : emit_fast 경로 _seq 전파 확인
+   - SIG-53 : _distribute_signal 경로 _seq 전파 확인
+   - SIG-54 : end-to-end 송수신 seq 일치 확인
+
+   전체 테스트 결과: 151 passed, 0 failed (2026-02-18 기준)
+
+
+================================================================================
+[v2.1.0] 2026-02-07
+================================================================================
+
+■ 주요 변경사항
+
+1. @import 자동 모듈 로딩
+   - task_config에서 "@import": "module.path" 로 모듈 자동 임포트
+   - main.py에서 명시적 import 불필요
+
+2. RMI 타임아웃 설정
+   - platform_config.rmi.timeout 으로 전역 타임아웃 설정 (기본값: 2.0초)
+
+3. SharedMemory 기반 고성능 릴레이 (선택적)
+   - use_shm: True 설정 시 Queue 대신 SharedMemory 링버퍼 사용
+   - 지연시간 ~10μs (Queue ~100μs 대비 약 10배 향상)
+
+4. Signal 통계 및 Trace 기능
+   - SignalBroker.get_stats() : 시그널별 발행 횟수, 마지막 시각
+   - SignalBroker.set_trace() : 실시간 전달 경로 추적 (delivered/dropped)
+
+5. 웹 모니터링 (task_monitor_debug_html.py)
+   - 브라우저 기반 태스크 상태, 시그널 통계 모니터링
+
+
+================================================================================
+[v2.0.0] 2026-01-30
+================================================================================
+
+■ 최초 릴리즈
+
+   - TaskManager : thread/process 기반 태스크 생성·관리
+   - RMI         : Queue 기반 원격 메서드 호출 (동기/비동기)
+   - Signal      : Pub/Sub 브로드캐스트 이벤트 시스템
+   - SmBlock     : 공유메모리 블록 풀 (zero-copy 프레임 공유)
+   - GConfig     : JSON 기반 계층형 설정 관리
+   - @task       : on_* 메서드 자동 시그널 구독 데코레이터
+   - @ui_thread  : Qt 메인 스레드 전환 데코레이터
+

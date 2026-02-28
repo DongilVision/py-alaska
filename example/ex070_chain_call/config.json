@@ -1,0 +1,47 @@
+{
+  "app_info": {
+    "name": "chain_call_example",
+    "id": "node-chain-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "rmi": {
+      "timeout": 5.0
+    },
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true,
+      "measurement": false
+    }
+  },
+  "task_config": {
+    "source/SourceTask": {
+      "@import": "example.ex070_chain_call.task_source",
+      "mid": "client:mid1",
+      "initial_tokens": 10
+    },
+    "mid1/RelayTask": {
+      "@import": "example.ex070_chain_call.task_relay",
+      "nextTask": "client:mid2"
+    },
+    "mid2/RelayTask": {
+      "@import": "example.ex070_chain_call.task_relay",
+      "nextTask": "client:mid3"
+    },
+    "mid3/RelayTask": {
+      "@import": "example.ex070_chain_call.task_relay",
+      "nextTask": "client:mid4"
+    },
+    "mid4/RelayTask": {
+      "@import": "example.ex070_chain_call.task_relay",
+      "nextTask": "client:mid5"
+    },
+    "mid5/RelayTask": {
+      "@import": "example.ex070_chain_call.task_relay",
+      "nextTask": "client:dest"
+    },
+    "dest/RelayTask": {
+      "@import": "example.ex070_chain_call.task_relay"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "app_info": {
+    "name": "dynamic_signal",
+    "id": "dynamic-signal-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "sensor/SensorTask": {
+      "@import": "example.ex060_dynamic_signal.tasks"
+    },
+    "monitor/MonitorTask": {
+      "@import": "example.ex060_dynamic_signal.tasks"
+    }
+  }
+}

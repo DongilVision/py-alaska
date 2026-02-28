@@ -1,0 +1,17 @@
+{
+  "app_info": {
+    "name": "qt_signal_demo",
+    "id": "demo-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "rmi": {"timeout": 2.0},
+    "_monitor": {"port": 7100, "exit_hook": true}
+  },
+  "task_config": {
+    "sensor_ui/sensor_ui": {},
+    "device_ui/device_ui": {},
+    "sensor_worker/sensor_worker": {"interval": 1.0},
+    "device_worker/device_worker": {"interval": 2.0}
+  }
+}

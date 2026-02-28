@@ -1,0 +1,27 @@
+{
+  "app_info": {
+    "name": "persistent_example",
+    "id": "persistent-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "rmi": {
+      "timeout": 2.0
+    },
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "user_config": {
+    "interval": 1.0
+  },
+  "task_config": {
+    "source/SourceTask": {
+      "@import": "example.ex080_persistent.tasks"
+    },
+    "viewer/ViewerTask": {
+      "@import": "example.ex080_persistent.viewer"
+    }
+  }
+}

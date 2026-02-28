@@ -1,0 +1,40 @@
+{
+  "app_info": {
+    "name": "performance_test",
+    "id": "perf-test",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {"port": 7000, "exit_hook": true}
+  },
+  "task_config": {
+    "gui/PerformanceGui": {
+      "@import": "example.ex140_performance.task_gui",
+      "iterations": 100
+    },
+    "p1/Process1": {
+      "@import": "example.ex140_performance.task_process",
+      "next_task": "client:p2"
+    },
+    "p2/Process2": {
+      "@import": "example.ex140_performance.task_process",
+      "next_task": "client:p3"
+    },
+    "p3/Process3": {
+      "@import": "example.ex140_performance.task_process",
+      "next_task": "client:gui"
+    },
+    "t1/Thread1": {
+      "@import": "example.ex140_performance.task_thread",
+      "next_task": "client:t2"
+    },
+    "t2/Thread2": {
+      "@import": "example.ex140_performance.task_thread",
+      "next_task": "client:t3"
+    },
+    "t3/Thread3": {
+      "@import": "example.ex140_performance.task_thread",
+      "next_task": "client:gui"
+    }
+  }
+}

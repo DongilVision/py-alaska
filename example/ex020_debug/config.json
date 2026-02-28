@@ -1,0 +1,22 @@
+{
+  "app_info": {
+    "name": "debug_example",
+    "id": "debug-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "producer/ProducerTask": {
+      "@import": "example.ex020_debug.tasks"
+    },
+    "consumer/ConsumerTask": {
+      "@import": "example.ex020_debug.tasks",
+      "producer": "client:producer"
+    }
+  }
+}

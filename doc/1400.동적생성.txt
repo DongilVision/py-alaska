@@ -1,0 +1,592 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.0 - 동적 Task 생성/삭제 설계서                                    ║
+║  Dynamic Task Lifecycle Management                                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Version : 1.0.0                                                            ║
+║  Date    : 2026-02-17                                                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+1. 개요
+================================================================================
+
+현재 ALASKA는 start_all() 이전에 모든 Task를 config.json에 정적 선언해야 한다.
+런타임 중 Task를 추가/삭제할 수 없어, 동적 스케일링이나 플러그인 교체가 불가하다.
+
+본 설계는 TaskManager에 add_task() / remove_task() API를 추가하여
+실행 중 안전하게 Task를 생성·삭제할 수 있도록 한다.
+
+
+2. 현재 구조 분석 (정적 생명주기)
+================================================================================
+
+2.1 start_all() 실행 순서
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  __init__()                                                             │
+  │    1. TaskInfo 생성 (task_class_name → job_class 해석)                    │
+  │    2. _init_task_info() → Queue, stop_flag, 통계 카운터 할당             │
+  │    3. _tasks[tid] = ti                                                  │
+  │    4. SignalBroker 생성                                                  │
+  ├──────────────────────────────────────────────────────────────────────────┤
+  │  start_all()                                                            │
+  │    5. SmBlockHandler.creation() → 공유메모리 풀 생성                      │
+  │    6. signal_broker.register(tid) → 시그널 큐 등록                       │
+  │    7. Worker(Thread/Process) 생성 & start()                             │
+  │       7a. TaskRuntime.run() 내부:                                       │
+  │           - job 인스턴스 생성                                             │
+  │           - SignalClient 시작 + 자동 구독                                │
+  │           - _inject_dependencies() → RmiClient/SmBlock 주입              │
+  │           - _rmi_handler 스레드 시작                                     │
+  │           - _run_main_loop() 실행                                       │
+  │    8. Monitor 시작                                                      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+2.2 영향받는 자원 목록
+--------------------------------------------------------------------------------
+
+  자원                     소유자            생성 시점        동적 추가 시 필요
+  ────────────────────────────────────────────────────────────────────────────
+  TaskInfo                 TaskManager       __init__         O (필수)
+  request_q / response_q   TaskInfo          _init_task_info  O (필수)
+  stop_flag / 통계 카운터   TaskInfo          _init_task_info  O (필수)
+  Signal 큐                SignalBroker      start_all        O (필수)
+  Worker (Thread/Process)  TaskManager       start_all        O (필수)
+  TaskRuntime              Worker 내부       Worker.run()     O (자동)
+  job_instance             TaskRuntime       Worker.run()     O (자동)
+  RmiClient (의존성 주입)   TaskRuntime       _inject_deps     O (자동)
+  SmBlock                  SmBlockHandler    start_all        △ (선택)
+  Monitor 등록             TaskMonitor       start_all        O (자동*)
+
+  * Monitor는 _tasks dict를 직접 참조하므로 dict에 추가되면 자동 반영
+
+
+3. API 설계
+================================================================================
+
+3.1 add_task()
+--------------------------------------------------------------------------------
+
+  def add_task(self, task_id: str, task_class_name: str,
+               injection: Dict[str, Any] = None,
+               mode: str = None) -> bool:
+      """실행 중 Task 동적 추가
+
+      Args:
+          task_id: 고유 태스크 ID (예: "camera_2")
+          task_class_name: @rmi_task 등록명 (예: "CameraTask")
+          injection: 의존성 주입 딕셔너리 (예: {"next": "client:processor"})
+          mode: 'thread' 또는 'process' (None이면 데코레이터 설정 사용)
+
+      Returns:
+          True: 성공, False: 실패 (이미 존재, 클래스 미등록 등)
+
+      Raises:
+          ValueError: task_class_name이 rmi_task 레지스트리에 없을 때
+
+      Example:
+          manager.add_task("camera_2", "CameraTask",
+                           injection={"next": "client:processor"})
+      """
+
+  내부 절차:
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  1. 중복 검사: task_id in self._tasks → False 반환                     │
+  │  2. TaskInfo 생성: TaskInfo(task_class_name, task_id, injection)       │
+  │     - rmi_task 레지스트리에서 job_class 조회                             │
+  │     - mode 결정 (파라미터 > 데코레이터 > 기본값 'thread')                │
+  │  3. _init_task_info(ti, self._mgr) → Queue, 카운터 할당                │
+  │  4. with self._task_lock:                                              │
+  │       self._tasks[tid] = ti                                            │
+  │  5. signal_broker.register(tid, mode=ti.mode)                          │
+  │  6. Worker 생성 & start (start_all과 동일 로직)                         │
+  │  7. _ready_event.wait(timeout=5.0)                                    │
+  │     → TaskRuntime이 초기화 완료 후 set() (생성 완료 보장)               │
+  │  8. print(f"[TaskManager] Task added: {tid}")                          │
+  └────────────────────────────────────────────────────────────────────────┘
+
+
+3.2 remove_task()
+--------------------------------------------------------------------------------
+
+  def remove_task(self, task_id: str, timeout: float = 5.0) -> bool:
+      """실행 중 Task 동적 삭제
+
+      Args:
+          task_id: 삭제할 태스크 ID
+          timeout: 종료 대기 시간 (초)
+
+      Returns:
+          True: 성공, False: 실패 (존재하지 않음)
+
+      Example:
+          manager.remove_task("camera_2")
+      """
+
+  내부 절차:
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  1. 존재 검사: task_id not in self._tasks → False 반환                 │
+  │  2. 의존성 검사 (경고): 다른 Task가 이 Task를 참조하는지 확인            │
+  │     → 경고 출력만, 삭제는 진행 (호출자 판단)                             │
+  │  3. ti.stop_flag.value = True → Task 실행 루프 종료 요청                │
+  │  4. signal_broker.unregister(tid) → 시그널 구독 해제                   │
+  │  5. worker.join(timeout=timeout)                                      │
+  │     → 타임아웃 시 process.terminate() (thread는 daemon이므로 무시)      │
+  │  6. Queue 정리: request_q, response_q drain & close                   │
+  │  7. with self._task_lock:                                              │
+  │       del self._tasks[tid]                                             │
+  │       del self._workers[tid]                                           │
+  │       self._runtimes.pop(tid, None)                                    │
+  │  8. print(f"[TaskManager] Task removed: {tid}")                        │
+  └────────────────────────────────────────────────────────────────────────┘
+
+
+3.3 사용 예시
+--------------------------------------------------------------------------------
+
+  # main.py
+  from py_alaska import TaskManager, GConfig
+
+  gconfig = GConfig("config.json")
+  manager = TaskManager(gconfig)
+  manager.start_all()
+
+  # --- 런타임 중 동적 추가 ---
+  manager.add_task("camera_2", "CameraTask",
+                   injection={"next": "client:processor"})
+
+  # 추가된 Task에 RMI 호출
+  client = manager.get_client("camera_2")
+  client.ping()  # OK
+
+  # --- 런타임 중 동적 삭제 ---
+  manager.remove_task("camera_2")
+
+
+4. 핵심 문제점과 해결 방안
+================================================================================
+
+4.1 동시성 안전: _tasks dict 수정 중 순회
+--------------------------------------------------------------------------------
+
+  문제:
+    _tasks dict를 add/remove로 수정하는 동안
+    다른 스레드(Monitor, Signal, RMI)에서 순회 → RuntimeError
+
+  해결:
+    threading.RLock 도입 (_task_lock)
+
+    class TaskManager:
+        def __init__(self, ...):
+            self._task_lock = threading.RLock()
+
+    쓰기 연산 (add_task, remove_task):
+        with self._task_lock:
+            self._tasks[tid] = ti   # 또는 del
+
+    읽기 연산 (get_status, Monitor, stop_all):
+        with self._task_lock:
+            snapshot = dict(self._tasks)  # 스냅샷 복사
+        for tid, ti in snapshot.items():
+            ...  # 안전한 순회
+
+  성능 영향:
+    - 읽기가 대부분이므로 RLock 경합 최소
+    - Monitor는 1초 간격 폴링 → 실질적 경합 없음
+    - 스냅샷 복사 비용: dict 100개 기준 ~1μs (무시 가능)
+
+
+4.2 삭제된 Task를 참조하는 RmiClient 무효화
+--------------------------------------------------------------------------------
+
+  문제:
+    TaskA가 RmiClient(TaskB)를 보유 → TaskB 삭제 →
+    TaskA에서 client.ping() → request_q.put() → 응답 없음 → timeout
+
+  해결 방안:
+
+    방안 A: Lazy 검증 (권장)
+    ─────────────────────────────────────────────────────────────────────
+    RmiClient._call() 진입 시 target이 살아있는지 검사
+
+        def _call(self, m, *a, **kw):
+            if self._id not in self._tasks_ref:  # WeakRef to _tasks
+                raise TaskRemovedError(self._id)
+            ...
+
+    장점: 구현 간단, 즉시 에러 반환 (timeout 불필요)
+    단점: RmiClient에 _tasks 참조 추가 필요
+
+    방안 B: Sentinel 응답
+    ─────────────────────────────────────────────────────────────────────
+    remove_task() 시 request_q에 종료 sentinel 주입
+
+        ti.request_q.put({'m': '__removed__'})
+
+    _rmi_handler가 종료되면서 대기 중인 response_q에 에러 응답 push
+
+    장점: 기존 RmiClient 수정 불필요
+    단점: 이미 put된 요청에 대해서만 처리 가능
+
+    ★ 선택: 방안 A (Lazy 검증)
+    이유: 삭제 후 즉시 에러 반환, timeout 대기 없음
+
+
+4.3 초기화 완료 보장 (Race Condition)
+--------------------------------------------------------------------------------
+
+  문제:
+    add_task() 반환 직후 get_client()로 RMI 호출 →
+    Worker 내부 _inject_dependencies() 미완료 → 호출 실패 가능
+
+  해결:
+    multiprocessing.Event 기반 ready 신호
+
+    # TaskManager.add_task()
+    ready_event = multiprocessing.Event()  # or threading.Event
+    ti._ready_event = ready_event
+    # Worker 시작 ...
+    ready_event.wait(timeout=5.0)  # 초기화 완료 대기
+
+    # TaskRuntime.run()
+    self._inject_dependencies()
+    self._th.start()  # rmi_handler 시작
+    if hasattr(self.ti, '_ready_event') and self.ti._ready_event:
+        self.ti._ready_event.set()  # 초기화 완료 알림
+
+  타임아웃 시:
+    - 경고 출력: "[W:TaskManager] add_task timeout: {tid}"
+    - Task는 유지 (비동기 초기화 계속 진행)
+
+
+4.4 Process 모드 Task의 tasks dict 전달
+--------------------------------------------------------------------------------
+
+  문제:
+    Process 모드 Task는 start_all()에서 tasks dict의 복사본을 pickle로 전달.
+    동적 추가된 Task는 이 복사본에 포함되지 않음.
+    → 중첩 RMI 호출 시 새 Task를 찾을 수 없음
+
+  해결:
+    Process 모드 Task는 기존과 동일하게 request_q를 통해 RMI 호출.
+    _rmi_handler에서 caller_id 기반으로 response 라우팅.
+    tasks dict가 아닌 Queue 참조만 필요하므로, 동적 추가된 Task의
+    Queue를 기존 Process에 전달할 방법이 필요.
+
+    ★ 제약사항:
+    - Process 모드 Task 간 동적 의존성 주입은 지원하지 않음
+    - 동적 추가 Task는 thread 모드만 지원 (Phase 1)
+    - Process 모드 동적 지원은 Phase 2에서 검토
+
+
+4.5 Signal 구독 타이밍
+--------------------------------------------------------------------------------
+
+  문제:
+    Task 추가 직후 다른 Task에서 signal.emit() →
+    새 Task의 _auto_subscribe_signals() 미완료 → 시그널 유실
+
+  해결:
+    4.3의 ready_event가 set되면 구독 완료 보장.
+    add_task()가 ready_event.wait() 후 반환하므로,
+    반환 시점에는 시그널 수신 가능.
+
+    emit 측에서 유실이 허용되지 않는 경우:
+    → add_task() 반환 후 emit (순서 보장)
+
+
+4.6 SmBlock 동적 할당
+--------------------------------------------------------------------------------
+
+  문제:
+    SmBlockHandler.creation()은 start_all()에서 1회만 실행.
+    동적 추가 Task가 SmBlock을 필요로 하면 할당 불가.
+
+  해결:
+    Phase 1에서는 SmBlock이 필요한 Task의 동적 추가를 금지.
+    Phase 2에서 SmBlockHandler에 incremental_create() 추가 검토.
+
+    # Phase 2 예정
+    SmBlockHandler.add_block(name, config, mgr, tasks)
+
+
+5. 구현 계획
+================================================================================
+
+5.1 Phase 1: Thread 모드 동적 생성/삭제
+--------------------------------------------------------------------------------
+
+  범위:
+    - thread 모드 Task만 지원
+    - add_task() / remove_task() API
+    - _task_lock 동시성 보호
+    - ready_event 초기화 완료 보장
+    - 기존 테스트 호환 유지
+
+  변경 파일:
+    ┌────────────────────────────────────────────────────────────────────┐
+    │  파일                          변경 내용                           │
+    │  ──────────────────────────────────────────────────────────────── │
+    │  task_manager.py               _task_lock 추가                    │
+    │                                add_task() 메서드 추가             │
+    │                                remove_task() 메서드 추가          │
+    │                                get_status() 스냅샷 방식 변경      │
+    │                                stop_all() 스냅샷 방식 변경        │
+    │  task_manager.py (TaskInfo)    _ready_event 필드 추가             │
+    │  task_manager.py (TaskRuntime) run()에 ready_event.set() 추가    │
+    │  task_manager.py (RmiClient)   _tasks_ref 추가 (Lazy 검증)       │
+    │  task_monitor.py               _tasks 순회를 스냅샷 방식으로 변경  │
+    │  tests/test_dynamic.py         동적 생성/삭제 테스트 (신규)        │
+    └────────────────────────────────────────────────────────────────────┘
+
+  테스트 케이스:
+    D-01  add_task 후 RMI ping 호출
+    D-02  add_task 후 Signal 수신 확인
+    D-03  remove_task 후 RMI 호출 → TaskRemovedError
+    D-04  remove_task 후 재추가 (같은 ID)
+    D-05  동시 add_task 3개 (스레드 안전성)
+    D-06  add + remove 반복 10회 (리소스 누수 확인)
+    D-07  존재하지 않는 Task remove → False 반환
+    D-08  이미 존재하는 Task add → False 반환
+    D-09  삭제된 Task에 대한 Signal emit → 무시 (에러 없음)
+    D-10  Monitor에서 동적 추가된 Task 조회 확인
+
+5.2 Phase 2: Process 모드 + SmBlock (향후)
+--------------------------------------------------------------------------------
+
+  범위:
+    - process 모드 Task 동적 추가
+    - SmBlock 동적 할당
+    - 기존 Process Task에 새 Task Queue 전달 메커니즘
+
+  검토 사항:
+    - Process 간 Queue 참조 전달 (pickle 필요)
+    - SmBlockHandler.add_block() 추가
+    - Process Task의 tasks dict 업데이트 메커니즘
+
+
+6. 데이터 흐름
+================================================================================
+
+6.1 add_task() 시퀀스
+--------------------------------------------------------------------------------
+
+  호출자           TaskManager          TaskRuntime         SignalBroker
+  ─────           ────────────         ──────────          ────────────
+    │                  │                    │                    │
+    │ add_task(id,cls) │                    │                    │
+    │─────────────────>│                    │                    │
+    │                  │ TaskInfo 생성       │                    │
+    │                  │ _init_task_info()   │                    │
+    │                  │ _tasks[id] = ti     │                    │
+    │                  │                    │  register(id)      │
+    │                  │                    │───────────────────>│
+    │                  │                    │                    │
+    │                  │ Worker.start()     │                    │
+    │                  │───────────────────>│                    │
+    │                  │                    │ job 생성            │
+    │                  │                    │ SignalClient.start()│
+    │                  │                    │ _auto_subscribe()  │
+    │                  │                    │ _inject_deps()     │
+    │                  │                    │ _rmi_handler.start()│
+    │                  │  ready_event.set() │                    │
+    │                  │<───────────────────│                    │
+    │  return True     │                    │ _run_main_loop()   │
+    │<─────────────────│                    │                    │
+
+6.2 remove_task() 시퀀스
+--------------------------------------------------------------------------------
+
+  호출자           TaskManager          TaskRuntime         SignalBroker
+  ─────           ────────────         ──────────          ────────────
+    │                  │                    │                    │
+    │ remove_task(id)  │                    │                    │
+    │─────────────────>│                    │                    │
+    │                  │ stop_flag = True   │                    │
+    │                  │                    │  unregister(id)    │
+    │                  │                    │───────────────────>│
+    │                  │                    │                    │
+    │                  │ worker.join()      │                    │
+    │                  │───────────────────>│ run() 종료         │
+    │                  │                    │ signal.off_all()   │
+    │                  │                    │ signal.stop()      │
+    │                  │<───────────────────│                    │
+    │                  │ Queue drain/close  │                    │
+    │                  │ del _tasks[id]     │                    │
+    │                  │ del _workers[id]   │                    │
+    │  return True     │                    │                    │
+    │<─────────────────│                    │                    │
+
+
+7. 에러 처리
+================================================================================
+
+  에러 상황                     처리 방법                          반환값
+  ────────────────────────────────────────────────────────────────────────
+  이미 존재하는 ID로 add       경고 출력, 즉시 반환                 False
+  미등록 클래스명으로 add       ValueError 발생                    예외
+  존재하지 않는 ID로 remove    경고 출력, 즉시 반환                 False
+  초기화 타임아웃 (5초)        경고 출력, Task 유지 (비동기 계속)    True
+  Worker 종료 타임아웃         process → terminate(), thread → 무시  True
+  삭제된 Task에 RMI 호출       TaskRemovedError 발생               예외
+  삭제된 Task에 Signal emit    무시 (에러 없음, _queues에서 제거됨)  -
+
+
+8. 성능 영향 분석
+================================================================================
+
+8.1 _task_lock 도입에 따른 핫 경로 영향
+--------------------------------------------------------------------------------
+
+  _task_lock(RLock)이 추가되면 _tasks dict 접근마다 lock acquire/release 발생.
+  각 경로별 영향을 분석한다.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  경로                      빈도            lock 필요    성능 영향       │
+  │  ─────────────────────────────────────────────────────────────────────  │
+  │                                                                        │
+  │  [RMI 핫 경로 - Worker 내부]                                            │
+  │  _rmi_handler              매 RMI 호출     X (불필요)   영향 없음       │
+  │   └ tasks.get(caller_id)   ~1600 TPS       X            영향 없음       │
+  │   └ caller_ti.response_q   ~1600 TPS       X            영향 없음       │
+  │  _create_rmi_client        Task 시작 1회   X            영향 없음       │
+  │  _inject_dependencies      Task 시작 1회   X            영향 없음       │
+  │                                                                        │
+  │  [Signal 핫 경로]                                                       │
+  │  emit_fast/_distribute     매 emit         X (불필요)   영향 없음       │
+  │   └ _sub_snapshot lookup   ~900K TPS       X            영향 없음       │
+  │   └ _queues.get(tid)       ~900K TPS       X            영향 없음       │
+  │                                                                        │
+  │  [TaskManager 외부 호출]                                                │
+  │  get_status()              Monitor 1초/회  O (스냅샷)   +1μs           │
+  │  get_client()              사용자 호출     O (lookup)   +0.3μs         │
+  │  get_task()                사용자 호출     O (lookup)   +0.3μs         │
+  │  stop_all()                종료 1회        O (스냅샷)   무시            │
+  │  clear_stats()             수동 호출       O (스냅샷)   무시            │
+  │                                                                        │
+  │  [동적 생성/삭제]                                                       │
+  │  add_task()                사용자 호출     O (쓰기)     ~5ms (1회성)   │
+  │  remove_task()             사용자 호출     O (쓰기)     ~10ms (1회성)  │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  핵심: RMI 핫 경로와 Signal 핫 경로는 lock이 불필요.
+
+  이유:
+    - TaskRuntime(Worker)은 시작 시 self.tasks 참조를 로컬 변수로 보유
+    - _rmi_handler의 tasks.get(caller_id)는 Worker 로컬 참조 → lock 불필요
+    - Signal의 _queues, _sub_snapshot은 SignalBroker 내부 관리 → lock 불필요
+    - lock이 필요한 경로는 TaskManager 외부 API (get_status, get_client 등)뿐
+    - 이들은 호출 빈도가 낮아 (1초/회 이하) 경합 발생 확률 ≈ 0
+
+
+8.2 RmiClient Lazy 검증 오버헤드
+--------------------------------------------------------------------------------
+
+  방안 A (Lazy 검증)는 _call() 진입마다 dict lookup 1회 추가.
+
+  측정 (Python dict 'in' 연산):
+    - dict 크기 10개: ~0.03μs
+    - dict 크기 100개: ~0.04μs
+    - dict 크기 1000개: ~0.05μs
+
+  현재 RMI 1건 = ~600μs (Queue put + get + 처리)
+  추가 오버헤드 = ~0.04μs = 전체의 0.007%
+
+  결론: 무시 가능
+
+
+8.3 _tasks dict 스냅샷 복사 비용
+--------------------------------------------------------------------------------
+
+  get_status(), stop_all() 등에서 스냅샷 복사:
+    snapshot = dict(self._tasks)
+
+  측정 (dict 복사):
+    - 10개 Task: ~0.3μs
+    - 50개 Task: ~1.2μs
+    - 100개 Task: ~2.5μs
+
+  get_status()는 Monitor가 1초마다 호출 → 2.5μs/초 = 무시 가능
+
+
+8.4 add_task() 소요 시간 상세
+--------------------------------------------------------------------------------
+
+  단계                              예상 시간     비고
+  ──────────────────────────────────────────────────────────────────────
+  TaskInfo 생성                     ~1μs         dataclass 생성
+  _init_task_info()                 ~500μs       Queue 2개 + mgr.Value 7개
+    └ multiprocessing.Queue()       ~200μs       OS pipe 생성
+    └ mgr.Value() × 7               ~300μs       Manager proxy 생성
+  _tasks[tid] = ti (with lock)      ~1μs         dict insert + lock
+  signal_broker.register()          ~10μs        Queue 생성 + dict insert
+  Worker 생성 + start()             ~500μs       Thread 생성 (thread 모드)
+  ready_event.wait()                ~2ms         job 생성 + 의존성 주입
+  ──────────────────────────────────────────────────────────────────────
+  합계                              ~3ms         (Thread 모드 기준)
+
+  참고: Process 모드 (Phase 2) 시 ~50ms 예상 (프로세스 fork/spawn)
+
+
+8.5 remove_task() 소요 시간 상세
+--------------------------------------------------------------------------------
+
+  단계                              예상 시간     비고
+  ──────────────────────────────────────────────────────────────────────
+  stop_flag = True                  ~10μs        mgr.Value 쓰기
+  signal_broker.unregister()        ~10μs        dict delete + snapshot 갱신
+  worker.join(timeout)              ~2ms         run_main_loop 종료 대기
+    └ _rmi_handler 종료 대기         ~1ms         Queue.get timeout 1회분
+  Queue drain                       ~100μs       잔여 메시지 소비
+  del _tasks[tid] (with lock)       ~1μs         dict delete + lock
+  ──────────────────────────────────────────────────────────────────────
+  합계                              ~3ms         (정상 종료 기준)
+  최악                              ~5초         (timeout 도달 시)
+
+
+8.6 기존 성능 지표 대비 영향 요약
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  항목                    현재 성능      동적 생성 후    차이          │
+  │  ────────────────────────────────────────────────────────────────── │
+  │  IPC ping 왕복           0.59ms        0.59ms         0% (무변경)  │
+  │  IPC add 연산            0.58ms        0.58ms         0% (무변경)  │
+  │  중첩호출 1단             0.99ms        0.99ms         0% (무변경)  │
+  │  중첩호출 2단             1.14ms        1.14ms         0% (무변경)  │
+  │  Signal emit             0.001ms       0.001ms        0% (무변경)  │
+  │  Signal broadcast 5구독  0.013ms       0.013ms        0% (무변경)  │
+  │  Monitor get_status()    ~0.5ms        ~0.503ms       +0.5% (스냅샷)│
+  │  get_client()            ~0.1ms        ~0.1003ms      +0.03%       │
+  │  ──────────────────────────────────────────────────────────────────│
+  │  add_task() 1회          N/A           ~3ms           신규 API     │
+  │  remove_task() 1회       N/A           ~3ms           신규 API     │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  결론:
+  ─────────────────────────────────────────────────────────────────────
+  - RMI/Signal 핫 경로: 성능 영향 0% (lock 불필요 경로)
+  - Monitor/외부 API: +0.03~0.5% (무시 가능)
+  - 동적 생성/삭제: 3ms/회 (1회성 작업, 빈도 극히 낮음)
+
+  _task_lock은 핫 경로를 보호하지 않으므로,
+  기존 TPS(1,600+)와 Signal 처리량(900,000+)에 영향 없음.
+
+
+9. 제약 사항 (Phase 1)
+================================================================================
+
+  제약                          이유                              해결 시기
+  ────────────────────────────────────────────────────────────────────────
+  Thread 모드만 지원             Process dict 전달 복잡            Phase 2
+  SmBlock 필요 Task 불가         SmBlock 동적 생성 미지원          Phase 2
+  기존 Process Task에서           pickle된 tasks 복사본에          Phase 2
+    새 Task RMI 불가              새 Task 미포함
+  삭제 시 의존 Task 자동          의존성 그래프 추적 필요           Phase 2
+    정리 미지원 (경고만)
+
+
+================================================================================
+  End of Dynamic Task Lifecycle Design
+================================================================================

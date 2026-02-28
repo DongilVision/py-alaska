@@ -1,0 +1,2157 @@
+# [ALASKA v2.2] 시그널 QOS 기능 설계서
+
+본 문서는 ALASKA v2.2 시그널 시스템에 QoS(Quality of Service) 기능을 추가하기 위한
+기술 설계서이다. 우선순위 기반 스케줄링, 데드라인 기반 시그널 폐기, 정밀 타이밍 측정,
+중첩 시그널 트레이스, 시그널 라이프사이클 디버그, BlackBox 완료 보장,
+공유 메모리 인프라 재설계를 포함한다.
+
+---
+
+## 1. 개요 (Overview)
+
+### 1.1 배경
+
+ALASKA v2.1의 시그널 시스템은 P2P 직접 전송 방식으로 평균 0.117ms의 emit 지연과
+8,500+ TPS의 처리량을 달성하고 있다. 그러나 산업용 비전/로봇 제어 환경에서
+다음과 같은 실시간성 요구사항이 충족되지 못하고 있다:
+
+| 현재 제약사항                | 영향                         | 요구되는 기능                |
+|------------------------------|------------------------------|------------------------------|
+| 시그널에 만료 기한 없음       | Stale 데이터로 오동작 가능    | 데드라인 기반 자동 폐기       |
+| 전달/대기/처리 시간 미측정    | 병목 구간 식별 불가           | 구간별 정밀 타이밍 통계       |
+| 큐 길이 통계 없음             | 백프레셔 상태 파악 불가       | 실시간 큐 깊이 모니터링       |
+| 중첩 시그널 체인 시간 미추적  | A→B→C 누적 지연 측정 불가    | 체인 누적 시간 트레이스       |
+| 데드라인 위반 보고 없음       | 시스템 이상 감지 불가         | 시스템 에러 보고 메커니즘     |
+| 시그널 발생/종료 추적 없음    | 개별 시그널 라이프사이클 불투명 | Signal ID 기반 추적 디버그   |
+| 연계 시그널 흐름 불투명       | 체인 전체 흐름 파악 불가      | Chain ID 기반 연계 추적       |
+| 단일 FIFO 큐                 | longterm이 shortterm을 지연   | 우선순위 기반 스케줄링         |
+| 체인 완료 확인 불가           | 계획된 동작 미완료 감지 불가  | BlackBox 세션 기반 완료 보장   |
+| Manager 소켓 IPC 오버헤드     | 값 접근에 0.1~0.5ms 소요     | SharedMemory 직접 접근        |
+
+### 1.2 설계 목표
+
+1. **우선순위 기반 스케줄링** — 5단계 우선순위로 shortterm 시그널이 longterm에 의해 지연되지 않도록 보장
+2. **데드라인 기반 시그널 생명주기 관리** — 처리 시작 전 만료 시 자동 폐기, 처리 중 만료 시 시스템 에러
+3. **4구간 타이밍 측정** — 전달시간(Transit), 대기시간(Wait), 처리시간(Processing), Q길이 독립 측정
+4. **통계 집계** — 시그널명별 min/avg/max/count 윈도우 기반 통계
+5. **중첩 시그널 트레이스** — _depth 기반 체인 누적 시간 추적
+6. **시그널 라이프사이클 디버그** — Signal ID 기반 발생~종료 전 구간 추적
+7. **연계(Chain) 추적** — Chain ID 기반 시그널 체인 그룹 조회 및 시각화
+8. **BlackBox 완료 보장** — blackbox_id 기반 세션 감시로 시그널 체인 완료 보장, 미완료 시 경보
+9. **공유 메모리 인프라** — Manager 소켓 IPC를 SharedMemory로 교체하여 지연시간 5-12배 단축
+10. **하위호환성** — priority/deadline/blackbox 미지정 시 기존 동작과 100% 동일
+
+### 1.3 적용 범위
+
+- `task_signal.py` : SignalBroker, SignalClient, Signal 데이터클래스
+- `sm_block.py` : SmSignalStats, SmSignalRegistry, SmSignalBus 추가
+- `sm_blackbox.py` : SmBlackBox (BlackBox 세션 풀, 별도 모듈)
+- `task_monitor.py` : 웹 디버거 API 확장
+- `__init__.py` : 신규 클래스 export
+
+---
+
+## 2. 시간 모델 (Timing Model)
+
+### 2.1 시그널 생명주기 타임라인
+
+```text
+ emit()                queue.get()          handler 시작         handler 종료
+   │                      │                     │                    │
+   ▼                      ▼                     ▼                    ▼
+   t0 ─────────────────── t1 ──────────────── t2 ─────────────── t3
+   │                      │                     │                    │
+   │◀── transit_time ────▶│                     │                    │
+   │                      │◀── wait_time ──────▶│                    │
+   │                      │                     │◀── proc_time ─────▶│
+   │                                                                 │
+   │◀──────────────── total_time (end-to-end) ─────────────────────▶│
+```
+
+### 2.2 시간 정의
+
+| 구간                         | 기호      | 정의                            | 측정 위치           |
+|------------------------------|-----------|--------------------------------|---------------------|
+| **전달시간 (Transit Time)**   | t1 - t0   | emit() 시점 ~ queue.get() 시점 | 수신측 _recv_loop   |
+| **대기시간 (Wait Time)**      | t2 - t1   | queue.get() 시점 ~ handler 호출 직전 | 수신측 _recv_loop |
+| **처리시간 (Processing Time)**| t3 - t2   | handler 호출 시작 ~ handler 반환 | 수신측 _recv_loop  |
+| **총 시간 (Total Time)**      | t3 - t0   | emit() 시점 ~ handler 반환      | 수신측 _recv_loop  |
+| **Q길이 (Queue Length)**      | qsize()   | dequeue 직후 잔여 큐 깊이       | 수신측 _recv_loop   |
+
+### 2.3 타임스탬프 소스
+
+모든 타임스탬프는 `time.time()`을 사용한다 (현재 코드와 동일).
+
+* `time.perf_counter()`는 프로세스 간 비교가 불가능하다.
+* `time.time()`은 프로세스 경계에서도 일관된 절대 시간을 제공한다.
+* thread 모드에서는 동일 프로세스 내 클럭이므로 정밀도가 높다.
+* process 모드에서는 OS 수준 시간 동기화에 의존하며, 동일 머신 기준 수백 나노초 편차이다.
+
+### 2.4 payload 확장 필드
+
+현재 payload 구조:
+```python
+payload = {
+    'name': signal_name,
+    'source': self._task_id,
+    'data': data,
+    '_seq': seq,
+    '_depth': depth,
+    'signal_id': '',
+    'timestamp': ts          # ← t0 (emit 시각)
+}
+```
+
+확장 payload 구조 (조건부 추가 필드):
+```python
+# 우선순위 (항상 포함)
+    '_priority': int,         # 1(최고) ~ 5(최저), 기본값 3
+# deadline 기능 사용 시에만 포함
+    '_deadline': float,       # 절대 데드라인 시각 (time.time() 기준)
+# 체인 추적 시에만 포함
+    '_chain_t0': float,       # 최초 체인 시작 시각 (depth=1에서 설정)
+    '_chain_id': str,         # 체인 고유 ID (depth=1에서 생성)
+# Signal ID (항상 포함, 기존 빈 문자열 → 고유 ID)
+    'signal_id': str,         # "{source}:{signal_name}:{_seq}"
+```
+
+> **크기 영향:** int 1개 + float 2개 + str 2개 ≈ 88바이트. 현재 2KB 하드 리미트(payload data 기준)에
+> 영향 없음 (메타 필드는 data 크기 계산에서 제외).
+
+---
+
+## 3. 우선순위 메커니즘 (Priority Mechanism)
+
+### 3.1 문제 정의
+
+현재 시그널 시스템은 태스크당 단일 FIFO 큐(`queue.Queue` 또는 `multiprocessing.Queue`)를
+사용한다. longterm 시그널(처리시간이 긴 배치/분석 작업)과 shortterm 시그널(즉각 응답이
+필요한 제어/알람)이 동일 큐에 혼입되면, longterm handler 실행 중 shortterm 시그널이
+큐에서 대기하게 되어 실시간성이 훼손된다.
+
+```text
+[현재 문제] 단일 FIFO 큐
+
+  emit 순서:  longterm_A → shortterm_B → shortterm_C → longterm_D
+                  │
+                  ▼
+  ┌──────────────────────────────────────┐
+  │  Queue (FIFO)                        │
+  │  [longterm_A] [short_B] [short_C] [longterm_D]  │
+  └──────────────┬───────────────────────┘
+                 │
+                 ▼ 처리 순서 (FIFO)
+  longterm_A (50ms) → short_B (0.5ms) → short_C (0.5ms) → longterm_D (50ms)
+                       ↑                  ↑
+                  50ms 대기!          50.5ms 대기!
+```
+
+### 3.2 우선순위 레벨 정의
+
+| 레벨 | 이름        | 용도                                | 예시                          |
+|------|-------------|-------------------------------------|-------------------------------|
+| **1** | CRITICAL   | 긴급 제어/안전 시그널                | 비상정지, 알람, 인터락          |
+| **2** | HIGH       | 실시간 센서/트리거 응답              | 카메라 트리거, 모션 완료        |
+| **3** | NORMAL     | 일반 이벤트 (기본값)                 | 상태 변경, 측정값 전달          |
+| **4** | LOW        | 비실시간 분석/통계                   | 통계 집계, 로그 수집            |
+| **5** | BACKGROUND | 배경 작업, 지연 허용                 | 리포트 생성, 데이터 아카이브     |
+
+> **기본값:** `priority=3` (NORMAL). 기존 코드의 emit() 호출은 모두 NORMAL로 동작한다.
+
+### 3.3 멀티큐 아키텍처
+
+단일 FIFO 큐를 **5개 우선순위 큐**로 분리하고, 수신측에서 높은 우선순위 큐부터
+우선 처리한다.
+
+```text
+[해결] 우선순위 멀티큐
+
+  emit(priority=1):  ──▶ ┌─ Queue[1] CRITICAL ─┐
+  emit(priority=2):  ──▶ ├─ Queue[2] HIGH ──────┤
+  emit(priority=3):  ──▶ ├─ Queue[3] NORMAL ────┤  ← 기본
+  emit(priority=4):  ──▶ ├─ Queue[4] LOW ───────┤
+  emit(priority=5):  ──▶ └─ Queue[5] BACKGROUND ┘
+
+  _recv_loop 처리 순서:
+    1) Queue[1]에 시그널 있으면 → 즉시 처리
+    2) Queue[1] 비었으면 → Queue[2] 확인
+    3) ...
+    4) Queue[1~4] 모두 비었으면 → Queue[5] 처리
+    5) 전부 비었으면 → timeout 대기
+```
+
+### 3.4 emit() API 확장
+
+```python
+def emit(self, signal_name: str, data: Any = None,
+         deadline: float = None, priority: int = 3) -> bool:
+    """시그널 발행
+
+    Args:
+        signal_name: 시그널 이름
+        data: 페이로드 데이터
+        deadline: 데드라인 (초 단위, None=무제한)
+        priority: 우선순위 (1=CRITICAL ~ 5=BACKGROUND, 기본=3)
+    """
+```
+
+**하위호환성:** `priority=3`이 기본값이므로 기존 코드 변경 불필요.
+
+### 3.5 큐 등록 확장 (SignalBroker)
+
+```python
+# 기존: 태스크당 단일 큐
+self._queues[task_id] = mgr.Queue(maxsize=_SIGNAL_QUEUE_SIZE)
+
+# 확장: 태스크당 5개 우선순위 큐
+_PRIORITY_LEVELS = 5
+_PRIORITY_QUEUE_SIZES = [64, 128, 512, 256, 64]  # 레벨별 큐 크기
+
+def register_inbox(self, task_id: str, mode: str = 'thread') -> Any:
+    with self._write_lock:
+        if task_id not in self._queues:
+            queues = []
+            for i in range(_PRIORITY_LEVELS):
+                maxsize = _PRIORITY_QUEUE_SIZES[i]
+                if self._mode == 'process' and self._mgr:
+                    queues.append(self._mgr.Queue(maxsize=maxsize))
+                else:
+                    queues.append(queue.Queue(maxsize=maxsize))
+            self._queues[task_id] = tuple(queues)
+        self._broadcast_snapshot()
+        return self._queues.get(task_id)
+```
+
+**큐 크기 설계 근거:**
+
+| 레벨 | 큐 크기 | 근거                                        |
+|------|---------|---------------------------------------------|
+| 1    | 64      | CRITICAL은 소량이지만 절대 유실 불가          |
+| 2    | 128     | HIGH는 센서 트리거 등 중간 빈도               |
+| 3    | 512     | NORMAL은 가장 많은 트래픽 (기존 1024의 절반)  |
+| 4    | 256     | LOW는 분석/통계로 적당한 버퍼                 |
+| 5    | 64      | BACKGROUND는 지연 허용, 소량 충분             |
+| 합계 | 1024    | 기존 단일 큐 1024와 동일                      |
+
+### 3.6 emit 측 큐 선택
+
+```python
+# SignalClient.emit() 내부
+payload['_priority'] = priority
+
+# 대상 큐 선택 (0-indexed: priority 1 → index 0)
+queue_index = max(0, min(priority - 1, _PRIORITY_LEVELS - 1))
+
+for tid in target_tids:
+    if tid == self._task_id: continue
+    try:
+        target_qs = self._inbox_cache.get(tid)
+        if target_qs is None:
+            target_qs = self._broker._queues.get(tid)
+            if target_qs: self._inbox_cache[tid] = target_qs
+        if target_qs:
+            target_qs[queue_index].put_nowait(payload)
+            success = True
+    except queue.Full:
+        self._record_lifecycle(sig_id, 'DROP', time.time(),
+                               {'target': tid, 'priority': priority})
+```
+
+### 3.7 수신측 우선순위 스케줄링 (_recv_loop)
+
+```python
+def _recv_loop(self):
+    """우선순위 기반 수신 루프"""
+    qs = self._queue  # tuple of 5 queues
+
+    while self._running:
+        data = None
+
+        # 높은 우선순위부터 순서대로 확인 (Strict Priority)
+        for q in qs:
+            try:
+                data = q.get_nowait()
+                break
+            except queue.Empty:
+                continue
+
+        # 모든 큐가 비어있으면 가장 높은 우선순위 큐에서 timeout 대기
+        if data is None:
+            try:
+                data = qs[0].get(timeout=_RECV_TIMEOUT)
+            except queue.Empty:
+                continue
+
+        if not isinstance(data, dict): continue
+
+        # 컨트롤 메시지는 모든 우선순위 큐로 전달됨
+        if data.get('_ctrl') == 'SYNC_REGISTRY':
+            self._local_subs = data.get('subs', {})
+            self._inbox_cache.clear()
+            continue
+
+        # ... 이하 기존 handler 실행 로직 동일 ...
+```
+
+**Strict Priority 방식 선택 근거:**
+
+| 스케줄링 방식      | 장점                    | 단점                      | 채택 여부 |
+|--------------------|------------------------|---------------------------|-----------|
+| **Strict Priority** | shortterm 즉시 응답 보장 | 저우선순위 기아(starvation) 가능 | **채택** |
+| Weighted Fair       | 기아 방지               | shortterm 응답 보장 불가    | 미채택    |
+| Round-Robin         | 공정한 분배             | 우선순위 의미 없어짐        | 미채택    |
+
+> **기아 방지 대책:** deadline 메커니즘(섹션 4)과 결합하여, 저우선순위 시그널도
+> 데드라인 이내에 처리되지 않으면 시스템 에러로 감지된다. 또한 실제 운영에서
+> CRITICAL/HIGH 시그널은 전체 트래픽의 소수(<5%)이므로 기아 발생 확률이 매우 낮다.
+
+### 3.8 컨트롤 메시지 브로드캐스트
+
+`SYNC_REGISTRY` 등 컨트롤 메시지는 **우선순위 1번 큐(CRITICAL)에만 전달**한다.
+_recv_loop에서 가장 먼저 처리되므로 레지스트리 동기화가 지연되지 않는다.
+
+```python
+# SignalBroker._broadcast_snapshot() 수정
+for task_queues in list(self._queues.values()):
+    try: task_queues[0].put_nowait(msg)  # priority 1 큐에만
+    except Exception: pass
+```
+
+### 3.9 시그널 선언 시 기본 우선순위 설정
+
+태스크 클래스에서 시그널별 기본 우선순위를 선언할 수 있다:
+
+```python
+@task(mode="process")
+class SensorTask:
+    # 시그널별 기본 우선순위 선언
+    _signal_priority = {
+        'alarm.critical': 1,      # CRITICAL
+        'camera.trigger': 2,      # HIGH
+        'sensor.value': 3,        # NORMAL (기본)
+        'analytics.report': 4,    # LOW
+        'log.archive': 5,         # BACKGROUND
+    }
+
+    def run(self):
+        # priority 미지정 시 _signal_priority에서 조회, 없으면 3
+        self.signal.emit("alarm.critical", data)      # → priority 1
+        self.signal.emit("sensor.value", data)        # → priority 3
+        self.signal.emit("sensor.value", data, priority=1)  # → 명시적 override
+```
+
+**조회 순서:**
+1. `emit(priority=N)` 명시적 지정 → N 사용
+2. `_signal_priority[signal_name]` 선언값 → 해당 값 사용
+3. 둘 다 없음 → 기본값 3 (NORMAL)
+
+### 3.10 우선순위별 큐 길이 통계
+
+기존 `qlen` 통계를 우선순위별로 확장한다:
+
+```python
+# 타이밍 기록 시 우선순위별 큐 길이
+def _record_timing(self, sig_name, t_emit, t_dequeue, ...):
+    # 전체 큐 길이
+    total_qlen = 0
+    priority_qlens = []
+    for q in self._queue:
+        try:    ql = q.qsize()
+        except: ql = -1
+        priority_qlens.append(ql)
+        if ql > 0: total_qlen += ql
+
+    self._timing_stats.record(sig_name, transit_ms, wait_ms,
+                              proc_ms, total_ms, total_qlen,
+                              priority_qlens)
+```
+
+### 3.11 하위호환성
+
+| 시나리오                              | 동작                              | 호환성        |
+|---------------------------------------|-----------------------------------|--------------|
+| 기존 emit() 호출 (priority 미지정)     | priority=3(NORMAL), Queue[3]에 전달 | **100% 호환** |
+| 기존 _recv_loop (단일 큐 기대)        | 멀티큐 튜플로 변경 필요             | 내부 변경 필요 |
+| 기존 register_inbox 반환값            | 단일 큐 → 튜플 변경                | 내부 변경 필요 |
+
+> **주의:** register_inbox()의 반환값이 단일 Queue에서 tuple(Queue × 5)로 변경되므로,
+> SignalClient 내부의 큐 접근 코드가 함께 수정되어야 한다. 외부 API(emit, on, off)는
+> 변경 없다.
+
+---
+
+## 4. 데드라인 메커니즘 (Deadline Mechanism)
+
+### 4.1 개념 모델
+
+```text
+         emit("sig_a", data, deadline=0.005)
+              │
+              ▼
+    ┌─────────────────────┐
+    │   payload 생성       │  _deadline = time.time() + 0.005
+    │   timestamp = t0     │  signal_id = "sensor:sig_a:42"
+    └──────────┬──────────┘
+               │ queue.put_nowait()
+               ▼
+    ┌─────────────────────┐
+    │   큐 대기 중          │
+    └──────────┬──────────┘
+               │ queue.get()  ← t1 시점
+               ▼
+    ┌─────────────────────┐
+    │   데드라인 체크 #1    │  if t1 > _deadline:
+    │   (처리 시작 전)      │     → 폐기 (discard), 통계 기록
+    │                      │     → lifecycle: DISCARDED
+    └──────────┬──────────┘
+               │ OK (t1 <= _deadline)
+               ▼
+    ┌─────────────────────┐
+    │   handler 실행       │  t2 = time.time()
+    │                      │  lifecycle: HANDLE_START
+    │                      │  handler(sig_obj)
+    │                      │  t3 = time.time()
+    │                      │  lifecycle: HANDLE_END
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────┐
+    │   데드라인 체크 #2    │  if t3 > _deadline:
+    │   (처리 완료 후)      │     → 시스템 에러 보고
+    │                      │     → lifecycle: OVERRUN
+    └──────────┬──────────┘
+               │
+               ▼
+          정상 완료
+```
+
+### 4.2 emit() API 확장
+
+```python
+def emit(self, signal_name: str, data: Any = None,
+         deadline: float = None, priority: int = 3) -> bool:
+    """시그널 발행
+
+    Args:
+        signal_name: 시그널 이름
+        data: 페이로드 데이터
+        deadline: 데드라인 (초 단위, None=무제한)
+                  0.005 → 5ms 이내 처리 완료 필요
+                  None  → 기존 동작 (데드라인 없음)
+        priority: 우선순위 (1=CRITICAL ~ 5=BACKGROUND, 기본=3)
+                  섹션 3 참조
+    """
+```
+
+**하위호환성:** `deadline=None`, `priority=3`이 기본값이므로 기존 코드 변경 불필요.
+`deadline`이 None이면 payload에 `_deadline` 필드를 추가하지 않아
+직렬화 크기 증가도 없다.
+
+### 4.3 payload 생성 로직
+
+```python
+ts = time.time()
+seq = self._emit_seqs.get(signal_name, 0) + 1
+sig_id = f"{self._task_id}:{signal_name}:{seq}"
+
+payload = {
+    'name': signal_name, 'source': self._task_id,
+    'data': data, '_seq': seq, '_depth': depth,
+    'signal_id': sig_id, 'timestamp': ts
+}
+
+# deadline이 지정된 경우에만 추가
+if deadline is not None:
+    payload['_deadline'] = ts + deadline
+
+# 중첩 체인 시작 시각/ID 전파 (섹션 6 참조)
+chain_t0 = getattr(self._depth_ctx, 'chain_t0', None)
+chain_id = getattr(self._depth_ctx, 'chain_id', None)
+if chain_t0 is not None:
+    payload['_chain_t0'] = chain_t0
+    payload['_chain_id'] = chain_id
+elif depth == 1:
+    payload['_chain_t0'] = ts
+    payload['_chain_id'] = sig_id     # 최초 시그널 ID가 체인 ID
+```
+
+### 4.4 수신측 데드라인 처리 (_recv_loop 내부)
+
+```python
+data = q.get(timeout=_RECV_TIMEOUT)       # t1 시점
+t_dequeue = time.time()                    # t1 기록
+
+sig_name = data.get('name')
+sig_id = data.get('signal_id', '')
+deadline = data.get('_deadline')           # None이면 데드라인 없음
+t_emit = data.get('timestamp', 0)         # t0
+
+# ── 데드라인 체크 #1: 처리 시작 전 만료 확인 ──
+if deadline is not None and t_dequeue > deadline:
+    self._record_deadline_miss(sig_name, 'expired_before_start',
+                               t_emit, t_dequeue, deadline)
+    self._record_lifecycle(sig_id, 'DISCARDED', t_dequeue)
+    continue
+
+# ── 핸들러 실행 (타이밍 측정 포함) ──
+lst = self._handlers.get(sig_name)
+if lst:
+    sig_obj = Signal(name=sig_name, source=data.get('source', ''),
+                     data=data.get('data'), _seq=_seq, _depth=depth)
+
+    self._depth_ctx.val = depth
+    self._depth_ctx.chain_t0 = data.get('_chain_t0')
+    self._depth_ctx.chain_id = data.get('_chain_id')
+
+    t_handler_start = time.time()          # t2
+    self._record_lifecycle(sig_id, 'HANDLE_START', t_handler_start)
+
+    for handler in lst:
+        try: handler(sig_obj)
+        except Exception: pass
+
+    t_handler_end = time.time()            # t3
+    self._record_lifecycle(sig_id, 'HANDLE_END', t_handler_end)
+
+    self._depth_ctx.val = 0
+    self._depth_ctx.chain_t0 = None
+    self._depth_ctx.chain_id = None
+
+    # ── 데드라인 체크 #2: 처리 완료 후 만료 확인 ──
+    if deadline is not None and t_handler_end > deadline:
+        self._record_deadline_miss(sig_name, 'exceeded_after_start',
+                                   t_emit, t_handler_end, deadline)
+        self._record_lifecycle(sig_id, 'OVERRUN', t_handler_end)
+
+    # ── 타이밍 통계 기록 ──
+    self._record_timing(sig_name, t_emit, t_dequeue,
+                        t_handler_start, t_handler_end,
+                        data.get('_chain_t0'))
+```
+
+### 4.5 데드라인 위반 처리 정책
+
+| 위반 유형              | 발생 조건                | 처리 방식                              | 심각도  |
+|-----------------------|--------------------------|----------------------------------------|---------|
+| **expired_before_start** | t_dequeue > _deadline  | 시그널 폐기(drop), 통계 기록            | Warning |
+| **exceeded_after_start** | t_handler_end > _deadline | handler는 이미 완료됨, 시스템 에러 보고 | Error   |
+
+### 4.6 데드라인 에러 보고 메커니즘
+
+```python
+def _record_deadline_miss(self, sig_name, miss_type, t_emit, t_check, deadline):
+    """데드라인 위반 기록"""
+    overrun = t_check - deadline
+
+    # 로컬 통계 축적
+    key = f"{sig_name}:{miss_type}"
+    stats = self._deadline_stats.get(key)
+    if stats is None:
+        stats = {'count': 0, 'max_overrun': 0.0, 'last_ts': 0.0}
+        self._deadline_stats[key] = stats
+    stats['count'] += 1
+    stats['max_overrun'] = max(stats['max_overrun'], overrun)
+    stats['last_ts'] = t_check
+
+    # 브로커 전역 통계에도 기록
+    try:
+        stat_key = f"_deadline:{sig_name}"
+        curr = self._broker._stats.get(stat_key, {'cnt': 0, 'last': 0})
+        self._broker._stats[stat_key] = {
+            'cnt': curr['cnt'] + 1, 'last': t_check, 'miss_type': miss_type
+        }
+    except Exception: pass
+```
+
+---
+
+## 5. 통계 수집 (Statistics Collection)
+
+### 5.1 통계 데이터 구조
+
+현재 구조 (시그널명 → 단순 카운트):
+```python
+_stats[signal_name] = {'cnt': count, 'last': timestamp}
+```
+
+확장 구조 (SignalClient 로컬, 윈도우 기반):
+```python
+_signal_timing[signal_name] = {
+    'cnt': int,           # 총 수신 횟수
+    'last': float,        # 마지막 수신 시각
+
+    # 타이밍 윈도우 (최근 WINDOW_SIZE개, 단위: ms)
+    'transit': [],        # 전달시간 리스트
+    'wait': [],           # 대기시간 리스트
+    'proc': [],           # 처리시간 리스트
+    'total': [],          # 총 시간 리스트
+    'qlen': [],           # 큐 길이 리스트
+
+    # 데드라인 관련
+    'deadline_miss_before': int,   # 시작 전 만료 폐기 횟수
+    'deadline_miss_after': int,    # 완료 후 초과 횟수
+}
+```
+
+### 5.2 SignalTimingStats 클래스
+
+```python
+_TIMING_WINDOW_SIZE = 50  # 최근 50개 샘플 유지
+
+class SignalTimingStats:
+    """시그널 타이밍 통계 계산기 (SignalClient 내부용)"""
+
+    __slots__ = ('_data', '_chain_data')
+
+    def __init__(self):
+        self._data = {}
+        self._chain_data = {}
+
+    def record(self, sig_name, transit_ms, wait_ms, proc_ms, total_ms, qlen):
+        """타이밍 데이터 기록"""
+        s = self._data.get(sig_name)
+        if s is None:
+            s = {
+                'cnt': 0, 'last': 0.0,
+                'transit': [], 'wait': [], 'proc': [], 'total': [],
+                'deadline_miss_before': 0, 'deadline_miss_after': 0,
+                'qlen': []
+            }
+            self._data[sig_name] = s
+
+        s['cnt'] += 1
+        s['last'] = time.time()
+
+        for key, val in [('transit', transit_ms), ('wait', wait_ms),
+                         ('proc', proc_ms), ('total', total_ms)]:
+            lst = s[key]
+            lst.append(val)
+            if len(lst) > _TIMING_WINDOW_SIZE:
+                del lst[:len(lst) - _TIMING_WINDOW_SIZE]
+
+        ql = s['qlen']
+        ql.append(qlen)
+        if len(ql) > _TIMING_WINDOW_SIZE:
+            del ql[:len(ql) - _TIMING_WINDOW_SIZE]
+
+    def record_deadline_miss(self, sig_name, miss_type):
+        """데드라인 위반 카운트 증가"""
+        s = self._data.get(sig_name)
+        if s is None: return
+        if miss_type == 'expired_before_start':
+            s['deadline_miss_before'] += 1
+        else:
+            s['deadline_miss_after'] += 1
+
+    def get_stats(self, sig_name):
+        """특정 시그널의 통계 반환"""
+        s = self._data.get(sig_name)
+        if not s: return None
+        return {
+            'count': s['cnt'],
+            'last_time': s['last'],
+            'transit': _calc_window(s['transit']),
+            'wait': _calc_window(s['wait']),
+            'proc': _calc_window(s['proc']),
+            'total': _calc_window(s['total']),
+            'qlen': _calc_window(s['qlen']),
+            'deadline_miss_before': s['deadline_miss_before'],
+            'deadline_miss_after': s['deadline_miss_after'],
+        }
+
+    def get_all_stats(self):
+        """전체 시그널 통계 반환"""
+        return {name: self.get_stats(name) for name in self._data}
+
+
+def _calc_window(values):
+    """리스트에서 min/avg/max 계산"""
+    if not values:
+        return {'min': 0.0, 'avg': 0.0, 'max': 0.0, 'count': 0}
+    return {
+        'min': round(min(values), 3),
+        'avg': round(sum(values) / len(values), 3),
+        'max': round(max(values), 3),
+        'count': len(values)
+    }
+```
+
+### 5.3 _recv_loop 내 타이밍 기록
+
+```python
+def _record_timing(self, sig_name, t_emit, t_dequeue,
+                   t_handler_start, t_handler_end, chain_t0=None):
+    """타이밍 통계 기록 (밀리초 단위 변환)"""
+    transit_ms = (t_dequeue - t_emit) * 1000
+    wait_ms = (t_handler_start - t_dequeue) * 1000
+    proc_ms = (t_handler_end - t_handler_start) * 1000
+    total_ms = (t_handler_end - t_emit) * 1000
+
+    # 큐 길이 측정 (우선순위별, 섹션 3.10 참조)
+    total_qlen = 0
+    for q in self._queue:
+        try:    ql = q.qsize(); total_qlen += max(0, ql)
+        except: pass
+
+    self._timing_stats.record(sig_name, transit_ms, wait_ms,
+                              proc_ms, total_ms, total_qlen)
+
+    # 체인 누적 시간 (섹션 6)
+    if chain_t0 is not None:
+        chain_elapsed_ms = (t_handler_end - chain_t0) * 1000
+        depth = getattr(self._depth_ctx, 'val', 0)
+        self._timing_stats.record_chain(sig_name, depth, chain_elapsed_ms)
+```
+
+### 5.4 큐 길이(Q길이) 측정
+
+| 방식                       | 장점               | 단점                | 채택 여부 |
+|----------------------------|--------------------|---------------------|-----------|
+| `queue.qsize()` 매 get 후  | 추가 비용 거의 없음 | macOS 미지원 가능   | **채택**  |
+| 별도 모니터 스레드 폴링     | 정확한 시계열       | 스레드 추가 부하    | 미채택    |
+| 카운터 기반 추정             | 가장 빠름           | put_nowait 실패 시 부정확 | 미채택 |
+
+> `qsize()`는 thread 모드(`queue.Queue`)에서 정확하며, process 모드에서는
+> 근사값이나 실용적 수준에서 충분하다. `NotImplementedError` 발생 시 -1로 기록한다.
+
+### 5.5 SignalClient 통계 접근 인터페이스
+
+```python
+# SignalClient에 추가
+def get_timing_stats(self) -> dict:
+    """이 클라이언트의 시그널 타이밍 통계 반환"""
+    return self._timing_stats.get_all_stats()
+
+def clear_timing_stats(self):
+    """타이밍 통계 초기화"""
+    self._timing_stats = SignalTimingStats()
+```
+
+---
+
+## 6. 중첩 시그널 트레이스 (Nested Signal Trace)
+
+### 6.1 체인 시간 추적 개념
+
+시그널 체인 A → B → C에서 전체 누적 처리 시간을 측정한다.
+
+```text
+ Task X                   Task A                   Task B                   Task C
+   │                        │                        │                        │
+   │ emit("sig_a")          │                        │                        │
+   │  _chain_t0 = t0        │                        │                        │
+   │  _chain_id = "X:sig_a:1"                        │                        │
+   │  _depth = 1            │                        │                        │
+   │ ──────────────────────▶│                        │                        │
+   │                        │ handler:               │                        │
+   │                        │   emit("sig_b")        │                        │
+   │                        │   _chain_t0 = t0 전파   │                        │
+   │                        │   _chain_id 전파        │                        │
+   │                        │   _depth = 2           │                        │
+   │                        │ ──────────────────────▶│                        │
+   │                        │                        │ handler:               │
+   │                        │                        │   emit("sig_c")        │
+   │                        │                        │   _chain_t0 = t0 전파   │
+   │                        │                        │   _chain_id 전파        │
+   │                        │                        │   _depth = 3           │
+   │                        │                        │ ──────────────────────▶│
+   │                        │                        │                        │ handler
+   │                        │                        │                        │ chain_elapsed
+   │                        │                        │                        │  = now - t0
+```
+
+### 6.2 _chain_t0 / _chain_id 전파 메커니즘
+
+기존 `_depth_ctx` (threading.local)에 `chain_t0`, `chain_id` 필드를 추가한다.
+
+**emit() 내부 로직:**
+```python
+depth = getattr(self._depth_ctx, 'val', 0) + 1
+chain_t0 = getattr(self._depth_ctx, 'chain_t0', None)
+chain_id = getattr(self._depth_ctx, 'chain_id', None)
+
+payload = { ..., 'timestamp': ts, '_depth': depth }
+
+if chain_t0 is not None:
+    # handler 내부에서 emit 중 → 기존 체인 전파
+    payload['_chain_t0'] = chain_t0
+    payload['_chain_id'] = chain_id
+elif depth == 1:
+    # 최초 emit → 새 체인 시작
+    payload['_chain_t0'] = ts
+    payload['_chain_id'] = sig_id  # 최초 시그널 ID가 체인 ID
+```
+
+**_recv_loop 내부:**
+```python
+# handler 실행 전
+self._depth_ctx.chain_t0 = data.get('_chain_t0')
+self._depth_ctx.chain_id = data.get('_chain_id')
+
+# handler 실행 후 - 체인 누적 시간 기록
+chain_t0 = data.get('_chain_t0')
+if chain_t0 is not None:
+    chain_elapsed_ms = (t_handler_end - chain_t0) * 1000
+    depth = data.get('_depth', 0)
+    self._timing_stats.record_chain(sig_name, depth, chain_elapsed_ms)
+
+# 컨텍스트 정리
+self._depth_ctx.chain_t0 = None
+self._depth_ctx.chain_id = None
+```
+
+### 6.3 체인 통계 구조
+
+```python
+# SignalTimingStats에 추가
+def record_chain(self, sig_name, depth, chain_elapsed_ms):
+    """체인 누적 시간 기록"""
+    cd = self._chain_data.get(sig_name)
+    if cd is None:
+        cd = {'elapsed': [], 'max_depth': 0}
+        self._chain_data[sig_name] = cd
+    cd['elapsed'].append(chain_elapsed_ms)
+    if len(cd['elapsed']) > _TIMING_WINDOW_SIZE:
+        del cd['elapsed'][:len(cd['elapsed']) - _TIMING_WINDOW_SIZE]
+    cd['max_depth'] = max(cd['max_depth'], depth)
+```
+
+---
+
+## 7. 시그널 라이프사이클 디버그 (Signal Lifecycle Debug)
+
+### 7.1 개요
+
+개별 시그널의 발생(EMIT)부터 처리 완료(HANDLE_END)까지 전체 생명주기를
+Signal ID 기반으로 추적할 수 있는 디버그 시스템이다. 연계(Chain) 시그널은
+Chain ID로 그룹화하여 체인 전체 흐름을 조회할 수 있다.
+
+### 7.2 Signal ID 체계
+
+```text
+Signal ID 형식:  {source_task_id}:{signal_name}:{_seq}
+
+예시:
+  sensor_node:raw.sensor.1:42
+  analytics_node:analytics.peak.1:7
+  alarm_node:alarm.critical:3
+```
+
+* 기존 payload의 `signal_id` 필드(현재 빈 문자열)를 활용한다.
+* emit() 시점에 자동 생성되며, 시그널 수명 전체에서 불변이다.
+* 구독자가 여러 개인 경우, 동일 Signal ID가 각 구독자에게 전달된다.
+
+### 7.3 Chain ID 체계
+
+```text
+Chain ID = 체인의 최초 시그널 Signal ID
+
+예시 (체인: sensor → analytics → alarm):
+  Chain ID = "sensor_node:raw.sensor.1:42"
+
+  depth=1  sensor_node:raw.sensor.1:42       ← chain_id 생성
+  depth=2  analytics_node:analytics.peak.1:7  ← chain_id 전파
+  depth=3  alarm_node:alarm.critical:3        ← chain_id 전파
+```
+
+* depth=1에서 Signal ID가 곧 Chain ID가 된다.
+* depth>1에서는 handler 내 emit 시 기존 Chain ID를 그대로 전파한다.
+* Chain ID가 없는 시그널(기존 코드)은 독립 시그널로 취급한다.
+
+### 7.4 라이프사이클 이벤트 타입
+
+| 이벤트 타입      | 발생 시점              | 설명                              |
+|-----------------|------------------------|-----------------------------------|
+| **EMIT**        | SignalClient.emit()    | 시그널 발행 시점                    |
+| **QUEUED**      | put_nowait() 성공       | 대상 큐에 적재 완료                 |
+| **HANDLE_START**| handler 호출 직전       | 수신측에서 handler 실행 시작        |
+| **HANDLE_END**  | handler 반환 직후       | 수신측에서 handler 실행 완료        |
+| **DISCARDED**   | 데드라인 체크 #1 실패   | 처리 시작 전 만료로 폐기            |
+| **OVERRUN**     | 데드라인 체크 #2 실패   | 처리 완료했으나 데드라인 초과        |
+| **DROP**        | put_nowait() 실패       | 큐 가득 참으로 전달 실패            |
+
+### 7.5 라이프사이클 이벤트 기록
+
+```python
+def _record_lifecycle(self, sig_id, event_type, ts, extra=None):
+    """시그널 라이프사이클 이벤트 기록"""
+    if not self._broker.trace_enabled:
+        return
+    entry = {
+        'ts': ts,
+        'signal_id': sig_id,
+        'event': event_type,
+        'task': self._task_id,
+    }
+    if extra:
+        entry.update(extra)
+    self._broker._append_to_buffer(
+        sig_id, self._task_id,
+        f"[{event_type}] {sig_id}"
+    )
+```
+
+### 7.6 emit() 측 이벤트 기록
+
+```python
+def emit(self, signal_name, data=None, deadline=None):
+    # ... payload 생성 ...
+    sig_id = payload['signal_id']
+
+    # EMIT 이벤트
+    self._record_lifecycle(sig_id, 'EMIT', ts)
+
+    # 큐 전달
+    for tid in target_tids:
+        try:
+            target_q.put_nowait(payload)
+            # QUEUED 이벤트 (전달 성공)
+        except queue.Full:
+            self._record_lifecycle(sig_id, 'DROP', time.time(),
+                                   {'target': tid})
+```
+
+### 7.7 확장 트레이스 버퍼 항목
+
+기존:
+```python
+{'ts': float, 'signal': str, 'source': str, 'data_preview': str}
+```
+
+확장:
+```python
+{
+    'ts': float,
+    'signal': str,
+    'source': str,
+    'data_preview': str,
+    # 신규 필드 (있을 때만)
+    'event_type': str,         # EMIT, HANDLE_START, HANDLE_END, DISCARDED, OVERRUN, DROP
+    'signal_id': str,          # 고유 시그널 ID
+    'chain_id': str,           # 체인 ID (체인 소속 시)
+    'depth': int,              # 체인 깊이
+    'transit_ms': float,       # 전달시간
+    'proc_ms': float,          # 처리시간
+}
+```
+
+### 7.8 웹 디버거 디버그 API
+
+#### GET /api/debug/signal/lifecycle?signal_id={id}
+
+특정 Signal ID의 전체 라이프사이클 이벤트를 시간순으로 반환한다.
+
+```json
+{
+    "signal_id": "sensor_node:raw.sensor.1:42",
+    "events": [
+        {"ts": 1740556789.001, "event": "EMIT",         "task": "sensor_node"},
+        {"ts": 1740556789.002, "event": "QUEUED",        "task": "sensor_node"},
+        {"ts": 1740556789.003, "event": "HANDLE_START",  "task": "analytics_node"},
+        {"ts": 1740556789.005, "event": "HANDLE_END",    "task": "analytics_node"}
+    ]
+}
+```
+
+#### GET /api/debug/signal/chain?chain_id={id}
+
+특정 Chain ID에 속한 모든 시그널과 이벤트를 체인 흐름으로 반환한다.
+
+```json
+{
+    "chain_id": "sensor_node:raw.sensor.1:42",
+    "chain_elapsed_ms": 4.2,
+    "max_depth": 3,
+    "signals": [
+        {
+            "signal_id": "sensor_node:raw.sensor.1:42",
+            "depth": 1,
+            "signal_name": "raw.sensor.1",
+            "events": [ ... ]
+        },
+        {
+            "signal_id": "analytics_node:analytics.peak.1:7",
+            "depth": 2,
+            "signal_name": "analytics.peak.1",
+            "events": [ ... ]
+        },
+        {
+            "signal_id": "alarm_node:alarm.critical:3",
+            "depth": 3,
+            "signal_name": "alarm.critical",
+            "events": [ ... ]
+        }
+    ]
+}
+```
+
+### 7.9 웹 디버거 UI 시각화 제안
+
+#### 타임라인 뷰 (Waterfall Chart)
+
+```text
+Chain: sensor_node:raw.sensor.1:42
+Time(ms)  0.0    0.5    1.0    1.5    2.0    2.5    3.0    3.5    4.0
+          │      │      │      │      │      │      │      │      │
+d=1 raw.sensor.1
+          ├──┤ transit
+             ├──────┤ handler
+                      │
+d=2 analytics.peak.1  │
+                      ├─┤ transit
+                         ├──────────┤ handler
+                                     │
+d=3 alarm.critical                   │
+                                     ├┤ transit
+                                       ├────┤ handler
+          │      │      │      │      │      │      │      │      │
+          0.0    0.5    1.0    1.5    2.0    2.5    3.0    3.5    4.0
+                                                    chain_elapsed = 4.2ms
+```
+
+#### 시그널 흐름도 (Flow Diagram)
+
+```text
+  ┌──────────────┐         ┌──────────────────┐         ┌──────────────┐
+  │ sensor_node  │         │ analytics_node   │         │ alarm_node   │
+  │              │ 0.3ms   │                  │ 0.2ms   │              │
+  │ raw.sensor.1 ├────────▶│ analytics.peak.1 ├────────▶│ alarm.critical│
+  │ proc: 0.8ms  │         │ proc: 1.2ms      │         │ proc: 0.7ms  │
+  └──────────────┘         └──────────────────┘         └──────────────┘
+                                                         total chain: 4.2ms
+```
+
+---
+
+## 8. BlackBox ID 메커니즘 (BlackBox ID Mechanism)
+
+### 8.1 개요
+
+BlackBox는 시그널 체인의 **계획된 실행 완료를 보장**하기 위한 세션 기반 감시 메커니즘이다.
+산업용 비전/로봇 제어 환경에서 일련의 연계 동작(예: 이미지 촬영 → 검사 → 결과 전송 →
+로봇 제어)이 계획대로 완료되었는지 확인하고, 미완료 시 경보를 발생시킨다.
+
+**핵심 개념:**
+- `emit()` 호출 시 `blackbox_id`를 선언하면, 해당 체인의 모든 IPC/Signal이 공유 메모리 세션에 기록
+- 정상 완료 후 BlackBox에 ACK하면 해당 세션이 1초 TTL 후 삭제
+- 미완료 세션(timeout 초과)은 BlackBox Task가 경보 시그널을 발생
+- Chain ID, Signal ID, Lifecycle 이벤트(섹션 7)와 통합
+
+### 8.2 BlackBox 세션 생명주기
+
+```text
+ emit(blackbox_id="batch_42")
+      │
+      ▼
+ ┌──────────────────────────┐
+ │  BlackBox Session 생성    │  shared memory 슬롯 할당
+ │  session_id = "batch_42" │  status = ACTIVE
+ │  created_at = time.time()│  expected_steps = N
+ │  timeout = 5.0s (기본)   │  completed_steps = 0
+ └────────────┬─────────────┘
+              │
+              ▼
+ ┌──────────────────────────┐
+ │  체인 이벤트 기록          │  emit, IPC call, handler start/end
+ │  completed_steps++       │  각 HANDLE_END 시 카운트 증가
+ └────────────┬─────────────┘
+              │
+         ┌────┴────┐
+         │         │
+         ▼         ▼
+  [정상 완료]    [Timeout 초과]
+  completed ==   now - created_at
+  expected       > timeout
+         │         │
+         ▼         ▼
+ ┌──────────┐ ┌─────────────────┐
+ │ ACK 호출  │ │ BlackBox Task   │
+ │ status =  │ │ 경보 시그널 emit │
+ │ COMPLETED │ │ "_blackbox.alarm"│
+ │ ttl = 1s  │ │ priority = 1    │
+ └─────┬────┘ └─────────────────┘
+       │
+       ▼ (1초 후)
+ ┌──────────┐
+ │ 세션 삭제 │
+ │ 슬롯 반환 │
+ └──────────┘
+```
+
+### 8.3 emit() API 확장
+
+```python
+def emit(self, signal_name: str, data: Any = None,
+         deadline: float = None, priority: int = 3,
+         blackbox_id: str = None,
+         blackbox_steps: int = None,
+         blackbox_timeout: float = 5.0) -> bool:
+    """시그널 발행
+
+    Args:
+        signal_name: 시그널 이름
+        data: 페이로드 데이터
+        deadline: 데드라인 (초 단위, None=무제한)
+        priority: 우선순위 (1=CRITICAL ~ 5=BACKGROUND, 기본=3)
+        blackbox_id: BlackBox 세션 ID (None=BlackBox 미사용)
+                     지정 시 해당 체인의 모든 이벤트가 세션에 기록됨
+        blackbox_steps: 예상 완료 단계 수 (None=자동 추적, ACK로만 완료)
+        blackbox_timeout: BlackBox 세션 타임아웃 (초, 기본=5.0)
+    """
+```
+
+**하위호환성:** `blackbox_id=None`이 기본값이므로 기존 코드 변경 불필요.
+
+### 8.4 payload 확장 필드
+
+```python
+# BlackBox 사용 시에만 추가
+    '_blackbox_id': str,        # BlackBox 세션 ID
+    '_blackbox_steps': int,     # 예상 완료 단계 수 (0=자동)
+    '_blackbox_timeout': float, # 세션 타임아웃 (초)
+```
+
+### 8.5 Shared Memory 세션 저장소 레이아웃
+
+BlackBox 세션은 고정 크기 슬롯으로 공유 메모리에 저장된다. 동시 활성 세션 수는
+산업용 환경에서 최대 수십 개이므로 고정 슬롯 풀 방식이 적합하다.
+
+```text
+SmBlackBox Session Pool Memory Layout
+======================================
+
+ +── Header (64 bytes) ────────────────────────────────────+
+ │ [max_sessions: int32] [active_count: int32]             │
+ │ [scan_cursor: int32]  [alarm_count: int32]              │
+ │ [reserved: 48 bytes]                                    │
+ +── Session Slot 0 (256 bytes) ───────────────────────────+
+ │ [status: uint8]           1B   (0=FREE, 1=ACTIVE,      │
+ │                                 2=COMPLETED, 3=ALARM)   │
+ │ [padding: 3B]                                           │
+ │ [blackbox_id: char[64]]   64B  (null-terminated)        │
+ │ [chain_id: char[64]]      64B  (null-terminated)        │
+ │ [created_at: float64]     8B                            │
+ │ [timeout: float64]        8B                            │
+ │ [completed_at: float64]   8B   (COMPLETED 시 설정)      │
+ │ [expected_steps: int32]   4B   (0=자동 추적)            │
+ │ [completed_steps: int32]  4B                            │
+ │ [total_events: int32]     4B   (기록된 이벤트 수)       │
+ │ [source_task: char[32]]   32B  (생성 태스크 ID)         │
+ │ [last_event_ts: float64]  8B   (마지막 이벤트 시각)     │
+ │ [reserved: 49B]                                         │
+ +── Session Slot 1 (256 bytes) ───────────────────────────+
+ │ ...                                                     │
+ +── Session Slot N-1 (256 bytes) ─────────────────────────+
+ │ ...                                                     │
+ +-────────────────────────────────────────────────────────-+
+
+ 총 크기: 64 + (256 × MAX_SESSIONS) bytes
+ MAX_SESSIONS = 64 기준: 64 + 16,384 = 16,448 bytes (~16KB)
+```
+
+### 8.6 BlackBox Event Log (세션별 이벤트 링버퍼)
+
+각 BlackBox 세션의 이벤트 로그는 고정 크기 링버퍼로 관리한다.
+
+```text
+BlackBox Event Record (128 bytes)
+===================================
+ +── Event Record ─────────────────────────────────────────+
+ │ [timestamp: float64]      8B                            │
+ │ [event_type: uint8]       1B   (EMIT=1, IPC_CALL=2,    │
+ │                                 HANDLE_START=3,         │
+ │                                 HANDLE_END=4,           │
+ │                                 IPC_RESPONSE=5, ACK=6)  │
+ │ [padding: 3B]                                           │
+ │ [task_id: char[32]]       32B                           │
+ │ [signal_name: char[48]]   48B                           │
+ │ [signal_id_hash: uint64]  8B   (Signal ID의 hash)      │
+ │ [depth: uint8]            1B                            │
+ │ [padding: 3B]                                           │
+ │ [elapsed_ms: float32]     4B   (이전 이벤트 대비)       │
+ │ [reserved: 20B]                                         │
+ +-────────────────────────────────────────────────────────-+
+
+ 세션당 최대 이벤트: 64개 (128 × 64 = 8KB/세션)
+ 총 크기: 8KB × MAX_SESSIONS = 512KB (64 세션 기준)
+```
+
+### 8.7 SmBlackBox 클래스 (sm_blackbox.py)
+
+SmBlackBox는 `sm_block.py`와 별도의 독립 모듈(`sm_blackbox.py`)로 생성한다.
+SmBlockHandler의 생성/주입 패턴을 따른다.
+
+```python
+# sm_blackbox.py
+
+from multiprocessing.shared_memory import SharedMemory
+import numpy as np
+import struct
+import time
+
+_BB_MAX_SESSIONS = 64
+_BB_SLOT_SIZE = 256
+_BB_HEADER_SIZE = 64
+_BB_EVENT_SIZE = 128
+_BB_MAX_EVENTS = 64
+
+# Session status
+BB_FREE = 0
+BB_ACTIVE = 1
+BB_COMPLETED = 2
+BB_ALARM = 3
+
+class SmBlackBox:
+    """BlackBox 세션 풀 관리자 (Shared Memory 기반)
+
+    메인 프로세스에서 create=True로 생성, 서브 프로세스에서 create=False로 연결.
+    SmBlockHandler 패턴을 따라 TaskManager에서 자동 생성/주입한다.
+    """
+
+    def __init__(self, name: str = "alaska_blackbox",
+                 max_sessions: int = _BB_MAX_SESSIONS,
+                 create: bool = False, lock=None):
+        """SmBlackBox 초기화.
+
+        Args:
+            name: 공유 메모리 이름
+            max_sessions: 최대 동시 세션 수
+            create: True=생성, False=연결
+            lock: multiprocessing.Lock 동시성 제어용
+        """
+
+    def create_session(self, blackbox_id: str, source_task: str,
+                       chain_id: str = "",
+                       expected_steps: int = 0,
+                       timeout: float = 5.0) -> int:
+        """새 BlackBox 세션 생성.
+
+        Returns:
+            슬롯 인덱스 (0 ~ max-1), 풀 가득 참 시 -1
+        """
+
+    def record_event(self, blackbox_id: str, event_type: int,
+                     task_id: str, signal_name: str,
+                     signal_id: str, depth: int = 0):
+        """세션에 이벤트 기록.
+
+        HANDLE_END 이벤트 시 completed_steps 자동 증가.
+        """
+
+    def acknowledge(self, blackbox_id: str) -> bool:
+        """세션 완료 확인 (ACK).
+
+        status → COMPLETED, completed_at 기록. 1초 후 자동 삭제.
+        Returns: True=성공, False=세션 미존재/이미 완료
+        """
+
+    def scan_timeout(self) -> list:
+        """타임아웃 초과 세션 스캔.
+
+        ACTIVE이고 now - created_at > timeout인 세션 →
+        status를 ALARM으로 변경.
+        Returns: [(blackbox_id, slot_index), ...]
+        """
+
+    def cleanup_completed(self, ttl: float = 1.0) -> int:
+        """완료 후 TTL 경과 세션 삭제.
+
+        COMPLETED이고 now - completed_at > ttl인 세션 → FREE.
+        Returns: 삭제된 세션 수
+        """
+
+    def get_session_info(self, blackbox_id: str) -> dict:
+        """세션 상태 조회 (디버그/모니터링용)"""
+
+    def get_session_events(self, blackbox_id: str) -> list:
+        """세션의 이벤트 로그 반환"""
+
+    def get_all_active(self) -> list:
+        """모든 활성(ACTIVE+ALARM) 세션 목록 반환"""
+
+    def close(self):
+        """공유 메모리 해제"""
+```
+
+### 8.8 BlackBox Task (시스템 태스크)
+
+BlackBox Task는 TaskManager에 자동 등록되는 시스템 태스크로, SmBlackBox를
+주기적으로 스캔하여 타임아웃 세션을 감지하고 경보를 발생시킨다.
+
+```python
+@task(mode="thread")
+class BlackBoxTask:
+    """BlackBox 세션 감시 시스템 태스크
+
+    주기적으로 SmBlackBox를 스캔하여:
+    1. 타임아웃 초과 세션 → 경보 시그널 emit
+    2. 완료 후 TTL 경과 세션 → 슬롯 정리
+    """
+
+    _scan_interval: float = 0.1  # 100ms 주기 스캔
+
+    def run(self):
+        pool = self.blackbox_pool  # injection으로 주입
+
+        while self.running:
+            # 1. 타임아웃 스캔
+            alarmed = pool.scan_timeout()
+            for bb_id, slot_idx in alarmed:
+                info = pool.get_session_info(bb_id)
+                events = pool.get_session_events(bb_id)
+                # 경보 시그널 발행 (CRITICAL 우선순위)
+                self.signal.emit("_blackbox.alarm", {
+                    'blackbox_id': bb_id,
+                    'source_task': info['source_task'],
+                    'expected_steps': info['expected_steps'],
+                    'completed_steps': info['completed_steps'],
+                    'timeout': info['timeout'],
+                    'elapsed': time.time() - info['created_at'],
+                    'events': events,
+                }, priority=1)
+
+            # 2. 완료 세션 정리 (1초 TTL)
+            pool.cleanup_completed(ttl=1.0)
+
+            time.sleep(self._scan_interval)
+```
+
+### 8.9 emit() 내부 BlackBox 통합
+
+```python
+# SignalClient.emit() 내부
+
+if blackbox_id is not None:
+    payload['_blackbox_id'] = blackbox_id
+    payload['_blackbox_steps'] = blackbox_steps or 0
+    payload['_blackbox_timeout'] = blackbox_timeout
+
+    # 최초 emit (depth=1) 시 세션 생성
+    if depth == 1 or not getattr(self._depth_ctx, '_bb_active', False):
+        self._blackbox_pool.create_session(
+            blackbox_id=blackbox_id,
+            source_task=self._task_id,
+            chain_id=sig_id,
+            expected_steps=blackbox_steps or 0,
+            timeout=blackbox_timeout
+        )
+        self._depth_ctx._bb_active = True
+
+    # EMIT 이벤트 기록
+    self._blackbox_pool.record_event(
+        blackbox_id, 1,  # BB_EVENT_EMIT
+        self._task_id, signal_name, sig_id, depth
+    )
+```
+
+### 8.10 _recv_loop 내부 BlackBox 통합
+
+```python
+# SignalClient._recv_loop() 내부
+
+bb_id = data.get('_blackbox_id')
+
+# handler 실행 전
+if bb_id:
+    self._blackbox_pool.record_event(
+        bb_id, 3,  # BB_EVENT_HANDLE_START
+        self._task_id, sig_name, sig_id, depth
+    )
+
+# handler 실행 ...
+
+# handler 실행 후
+if bb_id:
+    self._blackbox_pool.record_event(
+        bb_id, 4,  # BB_EVENT_HANDLE_END
+        self._task_id, sig_name, sig_id, depth
+    )
+    # BlackBox context 전파 (체인 내부 emit 시 동일 bb_id 사용)
+    self._depth_ctx._bb_id = bb_id
+```
+
+### 8.11 BlackBox ACK 패턴 (사용 예제)
+
+```python
+@task(mode="process")
+class InspectionPipeline:
+    """검사 파이프라인 예제"""
+
+    def run(self):
+        while self.running:
+            # BlackBox 세션 시작과 함께 시그널 체인 개시
+            bb_id = f"inspect_{time.time_ns()}"
+            self.signal.emit("camera.capture", {
+                'target': 'front_camera',
+                'roi': [0, 0, 640, 480],
+            }, blackbox_id=bb_id, blackbox_steps=4, blackbox_timeout=3.0)
+            # 기대 체인: capture → process → analyze → report (4단계)
+            time.sleep(1)
+
+    def on_report_complete(self, sig):
+        """최종 보고 완료 시그널 수신 → BlackBox ACK"""
+        bb_id = sig.data.get('blackbox_id')
+        if bb_id:
+            self.blackbox_pool.acknowledge(bb_id)
+
+    def on__blackbox_alarm(self, sig):
+        """BlackBox 경보 수신 → 진단/복구"""
+        alarm = sig.data
+        print(f"[ALARM] BlackBox '{alarm['blackbox_id']}' 미완료!")
+        print(f"  완료: {alarm['completed_steps']}/{alarm['expected_steps']}")
+        print(f"  경과: {alarm['elapsed']:.1f}s / timeout: {alarm['timeout']}s")
+        for evt in alarm['events']:
+            print(f"  {evt}")
+```
+
+### 8.12 expected_steps 결정 방식
+
+| 모드                              | 동작                                | 사용 시나리오               |
+|-----------------------------------|-------------------------------------|---------------------------|
+| **명시적** (`blackbox_steps=N`)    | N번의 HANDLE_END → 완료 가능        | 단계 수가 고정된 파이프라인  |
+| **자동** (`blackbox_steps=None`)   | ACK 호출로만 완료 판정               | 단계 수가 동적인 경우       |
+| **chain_id 기반**                  | 동일 chain_id의 HANDLE_END 추적     | 섹션 6 체인 추적과 연계     |
+
+### 8.13 Chain ID / Signal ID 통합
+
+```text
+ blackbox_id = "batch_42"        (비즈니스 레벨, 사용자 정의)
+ chain_id    = "sensor:capture:1" (기술적 체인 ID, 섹션 6)
+ signal_id   = "sensor:capture:1" (개별 시그널 ID, 섹션 7)
+                    │
+     ┌──────────────┼──────────────┐
+     │              │              │
+ depth=1        depth=2        depth=3
+ capture        process        analyze
+     │              │              │
+     └── BlackBox Session "batch_42" 에 모두 기록 ──┘
+```
+
+- `blackbox_id`는 비즈니스 레벨 식별자 (사용자 정의)
+- `chain_id`는 기술적 체인 추적 식별자 (자동 생성)
+- 하나의 BlackBox 세션에 여러 체인이 포함될 수 있다 (분기 체인)
+
+### 8.14 웹 디버거 API 확장
+
+#### GET /api/debug/blackbox/sessions
+
+```json
+{
+    "active_count": 3,
+    "max_sessions": 64,
+    "sessions": [
+        {
+            "blackbox_id": "batch_42",
+            "status": "ACTIVE",
+            "source_task": "inspection_pipeline",
+            "created_at": 1740556789.001,
+            "timeout": 3.0,
+            "expected_steps": 4,
+            "completed_steps": 2,
+            "elapsed": 1.5,
+            "events_count": 6
+        }
+    ]
+}
+```
+
+#### GET /api/debug/blackbox/session?id={blackbox_id}
+
+```json
+{
+    "blackbox_id": "batch_42",
+    "status": "ACTIVE",
+    "chain_id": "sensor:capture:1",
+    "events": [
+        {"ts": 1740556789.001, "type": "EMIT",         "task": "inspection",  "signal": "camera.capture",  "depth": 1},
+        {"ts": 1740556789.003, "type": "HANDLE_START",  "task": "camera_task", "signal": "camera.capture",  "depth": 1},
+        {"ts": 1740556789.050, "type": "HANDLE_END",    "task": "camera_task", "signal": "camera.capture",  "depth": 1},
+        {"ts": 1740556789.051, "type": "EMIT",          "task": "camera_task", "signal": "image.process",   "depth": 2},
+        {"ts": 1740556789.055, "type": "HANDLE_START",  "task": "proc_task",   "signal": "image.process",   "depth": 2},
+        {"ts": 1740556789.120, "type": "HANDLE_END",    "task": "proc_task",   "signal": "image.process",   "depth": 2}
+    ]
+}
+```
+
+#### GET /api/debug/blackbox/alarms
+
+```json
+{
+    "alarm_count": 1,
+    "alarms": [
+        {
+            "blackbox_id": "batch_41",
+            "status": "ALARM",
+            "expected_steps": 4,
+            "completed_steps": 3,
+            "last_event": {"type": "HANDLE_START", "task": "report_task", "signal": "report.generate"}
+        }
+    ]
+}
+```
+
+---
+
+## 9. 공유 메모리 인프라 재설계 (Shared Memory Infrastructure Redesign)
+
+### 9.1 개요
+
+현재 시그널 시스템은 `multiprocessing.Manager()`를 통해 프로세스 간 상태를 공유한다.
+Manager는 내부적으로 소켓 기반 IPC를 사용하여, 단순 값 접근에도 0.1~0.5ms의 오버헤드가
+발생한다. ALASKA v2.1에서 이미 이미지 버퍼용으로 `SharedMemory` 기반 고속 인프라
+(`SmBlock`, `SmValue`, `SmRingBuffer`)를 구축하였으므로, 시그널 시스템의 공유 상태도
+동일한 인프라로 마이그레이션하여 성능을 극대화한다.
+
+### 9.2 현재 Manager 의존성 분석
+
+```text
+SignalBroker.__init__(mgr) 내부:
+
+ Manager 기반 공유 객체              접근 패턴           접근 빈도
+ ─────────────────────────────────────────────────────────────────
+ _stats_enabled = mgr.Value('b')    read-mostly         emit마다
+ _trace_enabled = mgr.Value('b')    read-mostly         emit마다
+ _stats_cleared_at = mgr.Value('d') read-rarely          API 호출 시
+ _stats = mgr.dict()                read-write           emit마다
+ _registry = mgr.dict()             read-mostly          subscribe시 write
+ _queues = mgr.dict()               read-mostly          register시 write
+ _trace_queue = mgr.Queue()         write-mostly         emit마다 (trace on)
+```
+
+### 9.3 마이그레이션 매핑
+
+| 현재 (Manager)                     | 제안 (Shared Memory)            | 이유                           |
+|------------------------------------|---------------------------------|-------------------------------|
+| `mgr.Value('b')` stats_enabled     | `SmValue("sig_stats_en", 'b')`  | 단일 원자 값, near-zero access |
+| `mgr.Value('b')` trace_enabled     | `SmValue("sig_trace_en", 'b')`  | 단일 원자 값, near-zero access |
+| `mgr.Value('d')` stats_cleared_at  | `SmValue("sig_stats_clr", 'd')` | 단일 원자 값                   |
+| `mgr.dict()` _stats                | `SmSignalStats` (고정 크기 SM)   | 시그널명 bounded, 고정 슬롯    |
+| `mgr.dict()` _registry             | `SmSignalRegistry` (고정 크기 SM)| 태스크/시그널 수 bounded       |
+| `mgr.Queue()` _trace_queue         | `SmRingBuffer`                  | Lock-free SPSC 릴레이          |
+| `mgr.Queue()` per-task inbox       | `SmSignalBus` (링버퍼 기반)      | 최대 성능 목표                 |
+
+### 9.4 Phase 1: SmValue로 플래그/카운터 교체
+
+현재 코드에서 `mgr.Value`를 사용하는 3개 필드는 `SmValue`로 1:1 교체가 가능하다.
+
+```python
+# 현재 (task_signal.py, SignalBroker.__init__)
+self._stats_enabled = mgr.Value('b', True)
+self._stats_cleared_at = mgr.Value('d', 0.0)
+self._trace_enabled = mgr.Value('b', False)
+
+# 변경 후
+from .sm_block import SmValue
+self._stats_enabled = SmValue("alaska_sig_stats_en", 'b',
+                               create=True, initial=1)
+self._stats_cleared_at = SmValue("alaska_sig_stats_clr", 'd',
+                                  create=True, initial=0.0)
+self._trace_enabled = SmValue("alaska_sig_trace_en", 'b',
+                               create=True, initial=0)
+```
+
+**기존 접근 코드 호환성:**
+
+SmValue의 `.value` 프로퍼티가 `hasattr(self._trace_enabled, 'value')` 체크를
+통과하므로 기존 분기 로직과 완벽 호환된다.
+
+```python
+# 기존 코드 (변경 없이 동작)
+if hasattr(self._trace_enabled, 'value'):
+    return self._trace_enabled.value
+```
+
+**성능 개선 효과:**
+
+| 연산 | Manager.Value | SmValue    | 개선    |
+|------|--------------|------------|---------|
+| read | ~0.1-0.5ms   | ~0.001ms   | **100-500x** |
+| write| ~0.1-0.5ms   | ~0.001ms   | **100-500x** |
+
+emit() 경로에서 `stats_enabled`와 `trace_enabled`를 매번 읽으므로, emit당 ~0.3ms 절감.
+
+#### SmRingBuffer로 _trace_queue 교체
+
+```python
+# 현재
+self._trace_queue = mgr.Queue()
+
+# 변경 후
+self._trace_queue = SmRingBuffer("alaska_sig_trace", size=65536,
+                                  create=True)
+# 65536 bytes = 64KB, 평균 이벤트 ~200B 기준 약 300개 버퍼
+```
+
+### 9.5 Phase 2: SmSignalStats (통계 공유 메모리)
+
+`mgr.dict()` 기반 `_stats`를 고정 크기 공유 메모리로 교체한다.
+
+```text
+SmSignalStats Memory Layout
+============================
+
+ +── Header (32 bytes) ────────────────────────────────────+
+ │ [max_signals: int32]    4B                              │
+ │ [active_count: int32]   4B                              │
+ │ [version: int64]        8B   (변경 시 증가)              │
+ │ [reserved: 16B]                                         │
+ +── Slot 0 (96 bytes) ───────────────────────────────────-+
+ │ [used: uint8]           1B   (0=free, 1=used)           │
+ │ [padding: 3B]                                           │
+ │ [name: char[64]]        64B  (시그널명)                  │
+ │ [count: int64]          8B                              │
+ │ [last_ts: float64]      8B                              │
+ │ [miss_count: int64]     8B   (deadline miss)            │
+ │ [reserved: 4B]                                          │
+ +── Slot 1 ~ Slot 255 ───────────────────────────────────-+
+ │ ...                                                     │
+ +-────────────────────────────────────────────────────────-+
+
+ MAX_SIGNALS = 256 기준: 32 + (96 × 256) = 24,608 bytes (~24KB)
+```
+
+```python
+class SmSignalStats:
+    """고속 공유 메모리 시그널 통계
+
+    mgr.dict() 대비 접근 속도 100x 이상 개선.
+    시그널 이름별로 고정 슬롯을 할당하여 O(1) 접근.
+    """
+
+    def __init__(self, name: str = "alaska_sig_stats",
+                 max_signals: int = 256,
+                 create: bool = False, lock=None): ...
+
+    def record(self, signal_name: str, timestamp: float):
+        """시그널 발행 통계 기록 (count++, last_ts 갱신)"""
+
+    def record_miss(self, signal_name: str):
+        """데드라인 miss 카운트 증가"""
+
+    def get(self, signal_name: str) -> dict:
+        """특정 시그널 통계 반환"""
+
+    def get_all(self) -> dict:
+        """전체 시그널 통계 반환"""
+
+    def clear(self): ...
+    def close(self): ...
+```
+
+### 9.6 Phase 3: SmSignalRegistry (레지스트리 공유 메모리)
+
+`mgr.dict()` 기반 `_registry`를 공유 메모리로 교체한다.
+
+```text
+SmSignalRegistry Memory Layout
+================================
+
+ +── Header (64 bytes) ────────────────────────────────────+
+ │ [max_signals: int32]        4B                          │
+ │ [max_tasks: int32]          4B                          │
+ │ [max_subs_per_signal: int32] 4B                         │
+ │ [active_signals: int32]     4B                          │
+ │ [active_tasks: int32]       4B                          │
+ │ [version: int64]            8B  (변경 시 증가)           │
+ │ [reserved: 36B]                                         │
+ +── Task Table (64 × 36 bytes = 2,304 bytes) ────────────-+
+ │ [task_id: char[32]]  [status: uint8]  [has_inbox: uint8]│
+ │ ...                                                     │
+ +── Signal Subscription Table (256 × 80 bytes) ──────────-+
+ │ [signal_name: char[64]]  [sub_count: uint8]             │
+ │ [sub_task_indices: uint8[16]]  (0xFF=unused)            │
+ │ ...                                                     │
+ +-────────────────────────────────────────────────────────-+
+
+ 총 크기: 64 + 2,304 + (80 × 256) = 22,848 bytes (~22KB)
+```
+
+#### _broadcast_snapshot() 제거
+
+SmSignalRegistry를 사용하면 모든 프로세스가 동일한 공유 메모리를 직접 참조하므로
+**스냅샷 브로드캐스트(SYNC_REGISTRY)가 불필요**해진다.
+
+```text
+ 현재 (Manager 기반):
+   subscribe() → _registry 갱신 → _broadcast_snapshot()
+                                   → SYNC_REGISTRY 메시지
+                                   → 각 Client._local_subs 갱신
+
+ 변경 후 (Shared Memory 기반):
+   subscribe() → SmSignalRegistry.subscribe() → version++
+   SignalClient.emit():
+     if self._registry_version != registry.version:
+         self._local_cache = registry.get_snapshot()
+         self._registry_version = registry.version
+```
+
+version 체크는 단일 int64 비교로 near-zero cost이다.
+
+### 9.7 Phase 4: SmSignalBus (시그널 전달 버스)
+
+`mgr.Queue()` 기반 태스크별 inbox를 공유 메모리 MPSC 링버퍼로 교체한다.
+
+```text
+SmSignalBus: MPSC Ring Buffer (태스크당 1개)
+=============================================
+
+ +── Bus Header (64 bytes) ────────────────────────────────+
+ │ [task_index: int32]        4B                           │
+ │ [priority_count: int32]    4B  (= 5)                    │
+ │ [slot_size: int32]         4B  (기본 512B)              │
+ │ [write_lock_flag: int32]   4B  (spinlock for MPSC)      │
+ │ [overflow_count: int64]    8B                           │
+ │ [total_written: int64]     8B                           │
+ │ [total_read: int64]        8B                           │
+ │ [reserved: 24B]                                         │
+ +── Priority Ring 0 (CRITICAL) ──────────────────────────-+
+ │ [write_idx: int64] [read_idx: int64] [capacity: int32]  │
+ │ [slot[0~63]: bytes[512]]                     64슬롯     │
+ +── Priority Ring 1 (HIGH) ──────────────────────────────-+
+ │ [slot[0~127]: bytes[512]]                   128슬롯     │
+ +── Priority Ring 2 (NORMAL) ────────────────────────────-+
+ │ [slot[0~511]: bytes[512]]                   512슬롯     │
+ +── Priority Ring 3 (LOW) ───────────────────────────────-+
+ │ [slot[0~255]: bytes[512]]                   256슬롯     │
+ +── Priority Ring 4 (BACKGROUND) ────────────────────────-+
+ │ [slot[0~63]: bytes[512]]                     64슬롯     │
+ +-────────────────────────────────────────────────────────-+
+
+ 태스크당 합계: ~524KB
+ 10 태스크 기준: ~5.2MB
+```
+
+#### 하이브리드 전략
+
+```text
+ emit() 경로:
+
+   payload 크기 측정
+        │
+   ┌────┴────┐
+   │         │
+   ▼         ▼
+ ≤ 512B    > 512B (드묾)
+   │         │
+   ▼         ▼
+ SmSignalBus  Manager.Queue (fallback)
+ (고속 경로)   (기존 경로)
+```
+
+대부분의 시그널(95%+)이 고속 경로를 타면서도, 대형 payload에 대한 안전한 fallback 보장.
+
+### 9.8 직렬화 전략
+
+| 방식          | 속도     | 유연성          | 채택     |
+|---------------|---------|-----------------|----------|
+| **struct.pack** | ~0.005ms | 고정 구조만     | 메타 필드용 |
+| **msgpack**    | ~0.02ms  | dict/list/기본타입 | **data 필드용** |
+| **pickle**     | ~0.05ms  | 모든 Python 객체 | **fallback** |
+
+```python
+def _serialize_payload(payload: dict) -> bytes:
+    """payload를 고정 헤더 + 가변 data로 직렬화"""
+    # 고정 헤더 (struct): name_hash, source_hash, seq, depth,
+    #                      priority, deadline, timestamp, chain_t0
+    header = struct.pack('<QQiiifddQ', ...)
+    # 가변 data (msgpack)
+    data_bytes = msgpack.packb(payload.get('data'))
+    # name, source 등 문자열 메타
+    meta = msgpack.packb({...})
+    return header_len + header + meta_len + meta + data_bytes
+```
+
+### 9.9 SignalBroker 초기화 변경
+
+```python
+class SignalBroker:
+    def __init__(self, mgr=None):
+        self._mode = 'process' if mgr else 'thread'
+        self._mgr = mgr
+
+        if mgr:
+            # Phase 1: SmValue로 교체
+            self._stats_enabled = SmValue("alaska_sig_stats_en", 'b',
+                                           create=True, initial=1)
+            self._trace_enabled = SmValue("alaska_sig_trace_en", 'b',
+                                           create=True, initial=0)
+            self._stats_cleared_at = SmValue("alaska_sig_stats_clr", 'd',
+                                              create=True, initial=0.0)
+            self._trace_queue = SmRingBuffer("alaska_sig_trace",
+                                              size=65536, create=True)
+            # Phase 2: SmSignalStats
+            self._stats = SmSignalStats("alaska_sig_stats",
+                                         create=True, lock=mgr.Lock())
+            # Phase 3: SmSignalRegistry
+            self._registry = SmSignalRegistry("alaska_sig_registry",
+                                               create=True, lock=mgr.Lock())
+            # Phase 4: SmSignalBus (태스크별 생성)
+            self._queues = {}
+            self._fallback_queues = mgr.dict()  # 오버사이즈 fallback
+        else:
+            # thread 모드: 기존 동작 유지 (변경 없음)
+            self._queues = {}
+            self._registry = {}
+            self._stats = {}
+            self._stats_enabled = True
+            self._stats_cleared_at = 0.0
+            self._trace_enabled = False
+            self._trace_queue = None
+```
+
+### 9.10 thread 모드 호환성
+
+thread 모드에서는 Manager 오버헤드가 없으므로(일반 Python dict/Queue 사용),
+**thread 모드는 기존 동작을 유지**하고 process 모드에서만 SM 인프라를 적용한다.
+
+### 9.11 리소스 정리 (Cleanup)
+
+SmBlockHandler.close_all() 패턴과 동일하게, TaskManager 종료 시 SM 리소스 정리:
+
+```python
+# TaskManager.stop_all() 내부
+def _cleanup_signal_sm(self):
+    broker = self._signal_broker
+    if broker and broker._mode == 'process':
+        for attr in ('_stats_enabled', '_stats_cleared_at', '_trace_enabled'):
+            sm = getattr(broker, attr, None)
+            if hasattr(sm, 'close'): sm.close()
+        if hasattr(broker._trace_queue, 'close'):
+            broker._trace_queue.close()
+        if hasattr(broker._stats, 'close'):
+            broker._stats.close()
+        if hasattr(broker._registry, 'close'):
+            broker._registry.close()
+        for bus in broker._queues.values():
+            if hasattr(bus, 'close'): bus.close()
+```
+
+---
+
+## 10. 타당성 검토 (Feasibility Analysis)
+
+### 10.1 현재 성능 기준선 (Baseline)
+
+성능 시험 보고서 기준 (REPORT_PERFORMANCE.txt):
+
+| 항목                       | 평균 지연    | TPS      |
+|----------------------------|-------------|----------|
+| Signal emit                | 0.117ms     | 8,563    |
+| Signal emit→recv 왕복       | 0.238ms     | 4,202    |
+| Signal 브로드캐스트 (5구독자) | 0.467ms     | 2,140    |
+| Signal 처리량 (1000회)      | 0.148ms     | 6,742    |
+| IPC ping 왕복               | 0.605ms     | 1,653    |
+
+### 10.2 우선순위 멀티큐 오버헤드
+
+| 연산                                    | 예상 비용     | 조건                |
+|-----------------------------------------|--------------|---------------------|
+| priority 파라미터 기본값 처리             | ~0.000ms     | 항상                |
+| `_signal_priority` 딕셔너리 조회         | ~0.001ms     | 선언 시에만          |
+| `queue_index` 계산 (max/min)             | ~0.000ms     | 항상                |
+| `target_qs[index].put_nowait()`          | ~0.000ms     | 기존 put과 동일      |
+| _recv_loop: 5큐 순회 get_nowait()       | ~0.003ms     | 최악 시 (모두 비어있을 때) |
+| _recv_loop: 단일 큐 hit                 | ~0.001ms     | 일반적 (첫 번째 큐에서 hit) |
+| **합계 (emit측)**                       | **~0.001ms** | 기존과 동일         |
+| **합계 (recv측, 최악)**                 | **~0.003ms** | 5큐 순회            |
+| **합계 (recv측, 일반)**                 | **~0.001ms** | 첫 큐에서 hit       |
+
+> **결론:** 멀티큐 도입으로 인한 추가 오버헤드는 recv측 최악 시 ~0.003ms로,
+> 기존 `_RECV_TIMEOUT=0.002` 대기시간과 비교하여 무시 가능한 수준이다.
+
+### 10.3 emit() 측 추가 오버헤드 (타이밍/데드라인)
+
+| 연산                                    | 예상 비용     | 조건                |
+|-----------------------------------------|--------------|---------------------|
+| deadline 파라미터 기본값 체크             | ~0.000ms     | 항상                |
+| `payload['_deadline'] = ts + deadline`   | ~0.001ms     | deadline 지정 시만  |
+| `payload['_chain_t0'] = chain_t0`        | ~0.001ms     | 체인 내부 emit 시만 |
+| `sig_id = f"{...}:{...}:{seq}"`         | ~0.001ms     | 항상                |
+| `_record_lifecycle('EMIT')`              | ~0.002ms     | trace 활성화 시     |
+| **합계 (deadline 미사용, trace 비활성화)** | **~0.001ms** | |
+| **합계 (deadline 사용, trace 활성화)**    | **~0.005ms** | |
+
+### 10.4 recv 측 추가 오버헤드
+
+| 연산                                | 예상 비용     | 조건                |
+|-------------------------------------|--------------|---------------------|
+| `time.time()` 호출 (t_dequeue)      | ~0.001ms     | 항상                |
+| `data.get('_deadline')` dict lookup | ~0.000ms     | 항상                |
+| 데드라인 비교 (float)                | ~0.000ms     | deadline 있을 때만  |
+| `time.time()` 호출 (t_handler_start)| ~0.001ms     | 항상                |
+| `time.time()` 호출 (t_handler_end)  | ~0.001ms     | 항상                |
+| `_record_timing()` 호출             | ~0.005ms     | 항상                |
+| `queue.qsize()`                     | ~0.001ms     | 항상                |
+| `_record_lifecycle()` × 2           | ~0.004ms     | trace 활성화 시     |
+| **합계 (타이밍 수집, trace 비활성화)**| **~0.009ms** | |
+| **합계 (타이밍 수집, trace 활성화)** | **~0.013ms** | |
+
+**영향 분석:**
+* 기존 emit→recv 왕복 0.238ms 기준 **약 3.8~5.5% 증가**
+* TPS 기준: 4,202 → ~3,980 (약 5.3% 감소, 최대)
+* 이는 실시간 시그널 기능의 가치 대비 허용 가능한 수준이다.
+
+### 10.5 비활성화 시 오버헤드
+
+타이밍 수집 on/off 플래그를 제공한다:
+```python
+self._timing_enabled = True   # 기본 활성화
+```
+
+| 모드                              | 추가 비용     |
+|-----------------------------------|--------------|
+| timing 활성화 + trace 활성화       | ~0.013ms     |
+| timing 활성화 + trace 비활성화     | ~0.009ms     |
+| timing 비활성화 + trace 비활성화   | ~0.003ms     |
+| 모두 비활성화, deadline도 미사용    | ~0.001ms     |
+
+### 10.6 메모리 영향
+
+| 항목                                    | 크기             | 시그널 100종 기준 |
+|-----------------------------------------|-----------------|-------------------|
+| SignalTimingStats 윈도우 (50개 × 5항목)  | ~2.0KB/시그널    | ~200KB            |
+| 체인 데이터 (50개)                       | ~0.4KB/시그널    | ~40KB             |
+| 라이프사이클 이벤트 (트레이스 버퍼 공유)  | 기존 1000개 제한 | ~100KB            |
+| payload 추가 필드                        | ~80B/시그널      | 무시 가능          |
+| **총 추가 메모리**                       |                 | **~340KB**         |
+
+### 10.7 직렬화 영향 (process 모드)
+
+추가되는 `_deadline`(float), `_chain_t0`(float), `_chain_id`(str), `signal_id`(str)는
+pickle 직렬화에서 기본 타입이므로 추가 오버헤드가 거의 없다.
+
+* 기존 payload: ~200B (평균)
+* 추가 필드: ~80B (키 이름 포함)
+* 증가율: ~40% (직렬화 크기), 소요 시간 영향: ~0.002ms 이하
+
+### 10.8 하위호환성 매트릭스
+
+| 시나리오                          | 동작                                  | 호환성        |
+|-----------------------------------|---------------------------------------|--------------|
+| 기존 emit() 호출 (deadline 없음)   | payload에 _deadline 미포함, 타이밍만 수집 | **100% 호환** |
+| 기존 handler (변경 없음)           | 동일하게 호출됨, 타이밍 측정은 투명     | **100% 호환** |
+| 기존 get_stats() 호출              | cnt/last 필드 유지, 추가 필드 무시 가능 | **100% 호환** |
+| 구 버전 Client → 신 버전 Broker    | _deadline 없으므로 데드라인 체크 스킵   | **100% 호환** |
+| 신 버전 Client → 구 버전 recv      | _deadline 필드 무시 (dict.get 미호출)   | **100% 호환** |
+| 기존 emit() 호출 (priority 없음)   | priority=3(NORMAL), Queue[3]에 전달     | **100% 호환** |
+| register_inbox 반환값 변경         | 단일 큐 → 5큐 튜플 (내부만 변경)        | 내부 변경 필요 |
+| 웹 디버거 기존 UI                  | stats.signals[name].count/.last_time 유지 | **100% 호환** |
+| signal_id 기존 빈 문자열           | 고유 ID로 변경, 기존 코드 영향 없음     | **100% 호환** |
+
+### 10.9 BlackBox 오버헤드 분석
+
+| 연산                                 | 예상 비용     | 조건                     |
+|--------------------------------------|--------------|--------------------------|
+| `blackbox_id` 파라미터 체크            | ~0.000ms     | 항상                     |
+| `create_session()` (SM 슬롯 할당)     | ~0.005ms     | BlackBox emit 시 (depth=1)|
+| `record_event()` (SM 링버퍼 쓰기)     | ~0.003ms     | BlackBox 체인 각 이벤트마다 |
+| `acknowledge()` (SM 슬롯 갱신)        | ~0.002ms     | 완료 ACK 시               |
+| `scan_timeout()` (주기적 스캔)        | ~0.01ms/세션  | BlackBox Task, 100ms 주기 |
+| **emit 측 합계 (BlackBox 미사용)**     | **~0.000ms** |                          |
+| **emit 측 합계 (BlackBox 사용)**       | **~0.008ms** | create + record           |
+| **recv 측 합계 (BlackBox 사용)**       | **~0.006ms** | record × 2                |
+
+### 10.10 BlackBox 메모리 영향
+
+| 항목                             | 크기     |
+|----------------------------------|---------|
+| Session Pool (64 세션)            | ~16KB   |
+| Event Ring Buffer (64세션 × 8KB)  | ~512KB  |
+| BlackBox Task 스레드              | 기존 태스크와 동일 |
+| **총 추가 메모리**                | **~528KB** |
+
+### 10.11 공유 메모리 인프라 오버헤드 분석
+
+#### SmValue 교체 효과
+
+| 접근 패턴                           | Manager.Value | SmValue   | 개선률       |
+|-------------------------------------|-------------|-----------|-------------|
+| stats_enabled read (emit당)          | ~0.15ms     | ~0.001ms  | **150x**    |
+| trace_enabled read (emit당)          | ~0.15ms     | ~0.001ms  | **150x**    |
+| emit당 총 절감                       | ~0.30ms     | ~0.002ms  | **~0.3ms 절감** |
+
+#### SmSignalBus 전체 경로 비교
+
+```text
+ 현재 (Manager Queue 경로):
+   emit → pickle.dumps → mgr.Queue.put_nowait → socket → Manager process
+        → pickle.loads → Queue 내부 저장
+   get  → Manager process → socket → pickle.dumps → 전송
+        → pickle.loads → 반환
+   왕복: ~0.238ms
+
+ 변경 후 (SmSignalBus 경로):
+   emit → msgpack.packb → memcpy to SM slot → write_idx++
+   get  → read_idx check → memcpy from SM slot → msgpack.unpackb
+   예상 왕복: ~0.020-0.050ms
+
+ 예상 개선: 5-12x 속도 향상
+```
+
+### 10.12 공유 메모리 인프라 호환성 매트릭스
+
+| 시나리오                          | 동작                                 | 호환성        |
+|-----------------------------------|--------------------------------------|--------------|
+| `mgr=None` (thread 모드)          | 기존 Python 객체 사용                 | **100% 호환** |
+| `mgr` 전달 (process 모드)         | SM 인프라 자동 활성화                 | **API 100% 호환** |
+| SmValue `.value` 접근              | Manager.Value와 동일 인터페이스       | **100% 호환** |
+| 기존 emit/on/off API              | 변경 없음                            | **100% 호환** |
+| 오버사이즈 payload (>512B data)    | fallback to Manager.Queue            | **100% 호환** |
+| SYNC_REGISTRY 브로드캐스트         | SmSignalRegistry version 체크로 대체  | 내부 변경    |
+| BlackBox 미사용                   | 추가 오버헤드 0                       | **100% 호환** |
+
+### 10.13 총 메모리 영향 종합
+
+| 항목                                    | 크기              |
+|-----------------------------------------|------------------|
+| SignalTimingStats (기존, 섹션 5)         | ~340KB            |
+| SmValue × 3 (플래그)                     | ~30B              |
+| SmRingBuffer (trace)                     | 64KB              |
+| SmSignalStats                            | ~24KB             |
+| SmSignalRegistry                         | ~22KB             |
+| SmSignalBus (10 태스크)                  | ~5.2MB            |
+| SmBlackBox Session Pool + Events         | ~528KB            |
+| **총 추가 메모리 (10 태스크 기준)**       | **~6.2MB**        |
+
+---
+
+## 11. 구현 계획 (Implementation Plan)
+
+### 11.1 구현 단계
+
+| 단계        | 목표                    | 파일                | 예상 작업량 |
+|-------------|-------------------------|---------------------|-------------|
+| **Phase 1** | 우선순위 멀티큐          | task_signal.py      | 대          |
+|             | 5레벨 멀티큐 등록/전달   |                     |             |
+|             | _recv_loop 우선순위 스케줄링 |                  |             |
+|             | _signal_priority 선언 지원 |                   |             |
+| **Phase 2** | 타이밍 측정 기반         | task_signal.py      | 중          |
+|             | SignalTimingStats 클래스 |                     |             |
+|             | _recv_loop 3점 측정     |                     |             |
+|             | _record_timing() 구현   |                     |             |
+| **Phase 3** | 데드라인 메커니즘        | task_signal.py      | 중          |
+|             | emit() deadline 파라미터 |                     |             |
+|             | _recv_loop 데드라인 체크 |                     |             |
+|             | _record_deadline_miss() |                     |             |
+| **Phase 4** | 중첩 시그널 트레이스     | task_signal.py      | 소          |
+|             | _chain_t0/_chain_id 전파 |                     |             |
+|             | record_chain() 구현     |                     |             |
+| **Phase 5** | 라이프사이클 디버그      | task_signal.py      | 중          |
+|             | Signal ID 자동 생성     |                     |             |
+|             | _record_lifecycle() 구현 |                     |             |
+|             | 이벤트 타입별 기록       |                     |             |
+| **Phase 6** | SM 인프라 Phase 1        | task_signal.py      | 소          |
+|             | SmValue/SmRingBuffer 교체 |                     |             |
+| **Phase 7** | SM 인프라 Phase 2        | sm_block.py         | 중          |
+|             | SmSignalStats 구현       |                     |             |
+| **Phase 8** | SM 인프라 Phase 3        | sm_block.py         | 대          |
+|             | SmSignalRegistry 구현    |                     |             |
+|             | _broadcast_snapshot 제거 |                     |             |
+| **Phase 9** | SM 인프라 Phase 4        | sm_block.py         | 대          |
+|             | SmSignalBus 구현         |                     |             |
+|             | 하이브리드 fallback      |                     |             |
+| **Phase 10**| BlackBox 세션 풀         | sm_blackbox.py      | 대          |
+|             | SmBlackBox 클래스 구현   |                     |             |
+| **Phase 11**| BlackBox Task 통합       | task_signal.py      | 중          |
+|             | emit/recv BlackBox 연동  | task_manager.py     |             |
+| **Phase 12**| 웹 디버거 연동           | task_monitor.py     | 중          |
+|             | signal/blackbox API      |                     |             |
+| **Phase 13**| 테스트 및 검증           | tests/              | 대          |
+|             | 전체 기능 테스트         |                     |             |
+|             | 성능 회귀 테스트         |                     |             |
+
+### 11.2 SignalClient.__slots__ 확장
+
+```python
+__slots__ = (
+    '_broker', '_task_id', '_queue', '_handlers', '_running', '_thread',
+    '_local_subs', '_inbox_cache', '_debug', '_emit_seqs', '_recv_seqs', '_depth_ctx',
+    # 신규
+    '_timing_stats',       # SignalTimingStats 인스턴스
+    '_timing_enabled',     # 타이밍 수집 on/off
+    '_deadline_stats',     # 데드라인 위반 로컬 통계
+)
+```
+
+### 11.3 상수 정의
+
+```python
+# task_signal.py 상단에 추가
+_TIMING_WINDOW_SIZE = 50         # 타이밍 통계 윈도우 크기
+_DEFAULT_DEADLINE = None         # 기본 데드라인 (None = 무제한)
+```
+
+### 11.4 테스트 시나리오
+
+| ID    | 시나리오                           | 검증 항목                          |
+|-------|------------------------------------|------------------------------------|
+| RT-01 | emit() deadline=None (기본)        | 기존 동작 동일, 타이밍 통계만 수집  |
+| RT-02 | emit() deadline=0.1 (충분한 시간)  | 정상 처리, deadline_miss 없음       |
+| RT-03 | emit() deadline=0.0001 (매우 짧음) | expired_before_start 발생, 폐기     |
+| RT-04 | handler에서 sleep(0.1), deadline=0.05 | exceeded_after_start 발생        |
+| RT-05 | 타이밍 통계 min/avg/max 정확성     | 알려진 sleep으로 검증               |
+| RT-06 | 큐 길이 통계 수집                  | 다수 emit 후 qlen > 0              |
+| RT-07 | 체인 A→B→C 누적 시간              | chain_elapsed ≈ sum(각 구간)        |
+| RT-08 | _chain_t0/_chain_id 전파 정확성    | depth=3에서 chain_t0 == depth=1 시점 |
+| RT-09 | Signal ID 고유성                   | 동일 시그널 연속 emit 시 ID 다름     |
+| RT-10 | 라이프사이클 이벤트 순서           | EMIT→HANDLE_START→HANDLE_END 순서   |
+| RT-11 | 하위호환 (deadline 없는 emit)      | 기존 테스트 전체 통과               |
+| RT-12 | 성능 회귀                          | emit TPS > 8,000 유지              |
+| RT-13 | process 모드 데드라인              | IPC 직렬화 후에도 정상 동작         |
+| RT-14 | timing_enabled=False               | 오버헤드 최소 확인                  |
+| RT-15 | Chain ID 그룹 조회                 | 동일 chain_id로 체인 시그널 조회     |
+| RT-16 | 우선순위 1(CRITICAL) 우선 처리      | LOW보다 CRITICAL이 먼저 handler 호출 |
+| RT-17 | 우선순위 5단계 순서 검증             | priority 1→5 순서로 처리됨 확인      |
+| RT-18 | 우선순위 기본값(3) 하위호환          | priority 미지정 시 기존 동작 동일     |
+| RT-19 | _signal_priority 클래스 선언 동작   | 선언값 기반 자동 우선순위 적용 확인   |
+| RT-20 | 멀티큐 큐 길이 우선순위별 통계       | priority_qlens 배열 정확성 검증      |
+| RT-21 | BlackBox 세션 생성/ACK/삭제          | 정상 생명주기 (ACTIVE→COMPLETED→FREE)|
+| RT-22 | BlackBox 타임아웃 경보               | timeout 초과 시 _blackbox.alarm emit |
+| RT-23 | BlackBox 완료 후 1초 TTL 삭제        | COMPLETED → 1초 후 FREE 전환         |
+| RT-24 | BlackBox expected_steps 자동/수동    | 단계 카운트 정확성                    |
+| RT-25 | BlackBox 동시 세션 64개              | 풀 가득 참 처리                       |
+| RT-26 | SmValue emit 경로 성능               | Manager.Value 대비 개선 확인          |
+| RT-27 | SmRingBuffer trace relay             | trace 이벤트 손실 없음                |
+| RT-28 | SmSignalStats 통계 정확성            | count/last_ts 정확성                  |
+| RT-29 | SmSignalRegistry 구독/해지           | 동적 태스크 추가/제거                 |
+| RT-30 | SmSignalRegistry version 체크        | 캐시 무효화 정확성                    |
+| RT-31 | SmSignalBus put/get 정확성           | 우선순위 순서 보장                    |
+| RT-32 | SmSignalBus MPSC 동시 쓰기           | 5 producer 동시 emit                  |
+| RT-33 | SmSignalBus 오버사이즈 fallback      | >512B → Manager.Queue                |
+| RT-34 | 전체 SM 인프라 성능                  | emit TPS > 10,000 목표               |
+| RT-35 | SM 리소스 정리 (stop_all)            | 공유 메모리 누수 없음                 |
+
+---
+
+## 12. 결론
+
+본 설계는 ALASKA v2.2 시그널 시스템에 QoS(Quality of Service) 기능을 추가하면서,
+기존 시스템과의 100% 하위호환성을 유지한다.
+
+**핵심 설계 원칙:**
+
+1. **우선순위 기반 스케줄링** — 5단계 멀티큐로 shortterm이 longterm에 의해 지연되지 않도록 보장
+2. **Opt-in 방식** — priority/deadline/blackbox 미지정 시 기존 동작과 동일
+3. **투명한 측정** — handler 코드 변경 없이 타이밍 자동 수집
+4. **점진적 활성화** — timing_enabled 플래그로 운영 중 on/off 가능
+5. **Signal ID 추적** — 개별 시그널의 전체 라이프사이클을 고유 ID로 추적
+6. **Chain ID 연계** — 중첩 시그널 체인 전체를 하나의 ID로 그룹화하여 디버그
+7. **BlackBox 완료 보장** — blackbox_id 기반 세션 감시로 계획된 체인 완료 보장, 미완료 시 경보
+8. **공유 메모리 우선** — Manager 소켓 IPC를 SharedMemory 직접 접근으로 교체, 5-12배 속도 향상
+9. **최소 침습** — 기존 payload dict에 조건부 필드 추가, 기존 API 서명 유지
+
+**예상 성능 영향:**
+
+| 모드                             | emit 추가 | recv 추가 | 왕복 영향 |
+|----------------------------------|-----------|-----------|-----------|
+| 기본 (타이밍만)                   | ~0.001ms  | ~0.009ms  | ~3.8%     |
+| 전체 (데드라인+트레이스+디버그)    | ~0.005ms  | ~0.013ms  | ~5.5%     |
+| BlackBox 사용                     | ~0.008ms  | ~0.006ms  | ~6%       |
+| 비활성화                          | ~0.001ms  | ~0.001ms  | ~0.4%     |
+| **SM 인프라 적용 후 (예상)**       | **-0.1ms**| **-0.15ms**| **5-12x 개선** |
+
+**추가 메모리 영향:** ~6.2MB (10 태스크 기준, SM 인프라 + BlackBox 포함)
+
+================================================================================
+  End of Signal QoS Specification
+================================================================================

@@ -1,0 +1,21 @@
+{
+  "app_info": {
+    "name": "property_rmi_test",
+    "id": "prop-091",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7091,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "device_p/DeviceProc": {
+      "@import": "example.ex091_property_rmi.tasks"
+    },
+    "device_t/DeviceThrd": {
+      "@import": "example.ex091_property_rmi.tasks"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "app_info": {
+    "name": "direct_update_ui_example",
+    "id": "node-score-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "sum_proc/SumProcess": {
+      "@import": "example.ex100_direct_update_ui.tasks"
+    },
+    "score/ScoreTask": {
+      "@import": "example.ex100_direct_update_ui.score_ui"
+    }
+  }
+}

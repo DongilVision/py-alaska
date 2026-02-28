@@ -1,0 +1,19 @@
+{
+  "app_info": {
+    "name": "smblock_example",
+    "id": "smblock-example",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_smblock": {
+      "pool": {"shape": [480, 640, 3], "maxsize": 1000}
+    },
+    "_monitor": {"port": 7000, "exit_hook": true}
+  },
+  "task_config": {
+    "producer1/producer": {"@import": "example.ex110_smblock.task_producer", "smblock": "smblock:pool", "consumer": "client:consumer", "delay": 0.01},
+    "producer2/producer": {"smblock": "smblock:pool", "consumer": "client:consumer", "delay": 0.01},
+    "producer3/producer": {"smblock": "smblock:pool", "consumer": "client:consumer", "delay": 0.01},
+    "consumer/consumer": {"@import": "example.ex110_smblock.task_consumer", "smblock": "smblock:pool", "delay": 1e-05}
+  }
+}

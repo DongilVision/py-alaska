@@ -1,0 +1,224 @@
+ex180 JoyStick - BT 게임패드 CNC Jog 제어 기능설계서
+=====================================================
+Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
+
+
+1. 개요
+-------
+  Bluetooth HID 게임패드(Nintendo Switch Pro Controller 등)를 이용한
+  CNC 6축(X,Y,Z,A,B,C) Jog 제어 시스템.
+  ALASKA v2.3 멀티프로세스 task 프레임워크 기반.
+
+
+2. 시스템 구성
+--------------
+
+  파일                 역할
+  ───────────────      ──────────────────────────────────────
+  main.py              진입점. AlaskaApp.run(config, main_task="ui")
+  config.json          task 등록 (joystick: process, ui: main)
+  task_joystick.py     BT HID 게임패드 입력 → signal 발행 (별도 프로세스)
+  task_ui.py           PySide6 QWidget — signal 수신 → GUI 표시
+
+  실행: python example/ex180_JoyStick/main.py
+
+
+3. 아키텍처
+-----------
+
+  ┌─────────────────────────┐       ┌─────────────────────────┐
+  │  JoyStickTask           │       │  UITask                 │
+  │  mode="process"         │       │  mode="main" (Qt)       │
+  │                         │       │                         │
+  │  BT HID 감지/입력       │ signal│  PySide6 QWidget        │
+  │  축/버튼 파싱           │──────→│  6축 좌표 표시          │
+  │  signal 발행            │       │  증분/샷/연결 표시      │
+  │                         │←──────│  증분 설정 요청         │
+  └─────────────────────────┘ signal└─────────────────────────┘
+
+
+4. Signal 정의
+--------------
+
+  4.1 JoyStickTask → UITask (발행)
+
+  Signal           데이터 타입      설명
+  ───────────      ──────────      ──────────────────────────
+  jog.connect      bool            연결 상태 (True/False)
+  jog.pos          dict            6축 좌표 {x,y,z,a,b,c}
+  jog.shot         int             카메라 샷 카운트
+  jog.inc          float           현재 선택된 증분값
+  jog.raw          str             원시 HID 바이트 변화 문자열
+
+  4.2 UITask → JoyStickTask (요청)
+
+  Signal           데이터 타입      설명
+  ───────────      ──────────      ──────────────────────────
+  jog.set.inc      float           증분 설정 요청 (UI 클릭)
+
+
+5. HID 리포트 바이트 맵 (Nintendo Switch Pro Controller)
+-------------------------------------------------------
+
+  Byte     크기     내용
+  ──────   ──────   ─────────────────────────────────
+  [0]      1B       Report ID
+  [1]      1B       버튼 그룹 1 (Bitmask 적용)
+                      0x40 (Bit 6) → 카메라 샷
+                      0x02 (Bit 1) → C축 양방향 (+inc)
+                      0x04 (Bit 2) → C축 음방향 (-inc)
+  [2]      1B       버튼 그룹 2 → 증분 올림/내림 (Bitmask)
+  [3]      1B       D-pad (idle=0x08, 절대값 0~7)
+                      dz=-8 (상:0) → Z축 +step
+                      dz=-4 (하:4) → Z축 -step
+                      dz=-6 (우:2) → 증분 올림 (idx + 1)
+                      dz=-2 (좌:6) → 증분 내림 (idx - 1)
+
+
+6. 6축 제어 설계
+----------------
+
+  6.1 X축, Y축 — 좌스틱 (아날로그, 누적 적분)
+
+      입력: byte[4:6]=X, byte[6:8]=Y (16bit LE)
+      정규화: rx / 32768.0, -ry / 32768.0
+      데드존: |값| < 0.3 → 0
+      계산: X += nx * inc * dt (매 프레임 누적)
+            Y += ny * inc * dt (매 프레임 누적)
+      특성: 스틱 기울기에 비례한 속도 제어, 입력 누락 방지
+
+  6.2 Z축 — D-pad 상/하 (디지털, 반복)
+
+      입력: byte[3] (D-pad)
+      매핑: dz=-8(상) → +1.0, dz=-4(하) → -1.0
+      계산: Z += zd * inc (매 0.25초, 홀드 시 반복)
+      특성: 고정 방향값 × 증분, 0.25초 주기 반복
+
+  6.3 A축, B축 — 우스틱 (아날로그, 누적 적분)
+
+      입력: byte[8:10]=A, byte[10:12]=B (16bit LE)
+      정규화: ra / 32768.0, -rb / 32768.0
+      데드존: |값| < 0.3 → 0
+      계산: A += na * inc * dt
+            B += nb * inc * dt
+      특성: X,Y와 동일 방식
+
+  6.4 C축 — 버튼 (디지털, 비트 엣지)
+
+      입력: byte[1] (Bit 1, Bit 2)
+      매핑: 0x02 → C + inc, 0x04 → C - inc
+      계산: 비트 변화(Rising Edge) 감지 시 즉시 1회 적용
+      특성: 다른 버튼과 동시 입력 가능, 눌린 순간 1회 반응
+
+
+7. 증분(Increment) 관리
+-----------------------
+
+  7.1 증분 리스트
+
+      _INC_LIST = [0.1, 1.0, 5.0, 10.0]  (mm 단위)
+      인덱스:       0     1     2     3
+
+  7.2 증분 선택 방법 (3가지)
+
+      (A) D-pad 좌/우 (엣지 감지)
+          byte[3] 변화 감지 (이전값과 다를 때만)
+          dz=-6 (우) → idx + 1 (올림, 최대 3)
+          dz=-2 (좌) → idx - 1 (내림, 최소 0)
+          → jog.inc.emit(선택값) 발행
+
+      (B) 게임패드 버튼 [2]
+          byte[2] 비트 변화 감지 (Rising Edge)
+          상향 비트 감지 → idx + 1 (올림)
+          하향 비트 감지 → idx - 1 (내림)
+          → jog.inc.emit(선택값) 발행
+
+      (C) UI 버튼 클릭 (확인 루프)
+          1) UI 클릭 → jog.set.inc.emit(값) 발행
+          2) JoyStickTask.on_jog_set_inc() 수신 및 인덱스 검증
+          3) 구동기에서 확정된 값으로 jog.inc.emit(값) 확인 응답
+          4) UITask.on_jog_inc() 수신 시에만 버튼 Checked 상태 갱신
+
+  7.3 증분 설정 시퀀스 (UI → 구동기 → UI 확정)
+
+      [UI 5.0 클릭]
+           │
+           ▼ (요청)
+      jog.set.inc.emit(5.0)  ──→  JoyStickTask.on_jog_set_inc()
+                                     │ (값 검증 후 _inc_idx = 2 설정)
+                                     ▼ (확정 응답)
+                                   jog.inc.emit(5.0)  ──→  UITask.on_jog_inc()
+                                                             │ [0.1][1.0][*5.0*][10]
+                                                             │ UI 상태 최종 갱신
+                                                             ▼
+                                                           상태 동기화 완료
+
+
+8. 버튼 기능
+-------------
+
+  8.1 카메라 샷
+
+      입력: byte[1] & 0x40 (비트 마스킹)
+      동작: 0x40 비트가 0에서 1로 변하는 순간(Rising Edge) 감지
+      결과: shot_count += 1 → jog.shot.emit(shot_count)
+      특성: 누를 때마다 1회만 증가하며, 계속 누르고 있어도 중복 증가하지 않음
+
+  8.2 C축 제어
+
+      입력: byte[1] & 0x02 (Bit 1), byte[1] & 0x04 (Bit 2)
+      동작: 각 비트의 Rising Edge 감지 시 증분만큼 좌표 이동
+      signal: jog.pos.emit({x,y,z,a,b,c}) 즉시 발행
+
+
+9. 연결 관리
+-------------
+
+  9.1 HID 감지 및 필터링
+
+      1) hidapi 스캔: Usage Page 0x01, Usage 0x05/0x04 필터링
+      2) VID/PID 및 제조사 문자열 확인 (오인식 방지)
+      3) 실패 시 BT 활성화 루틴 수행 (Windows bthprops.cpl)
+      4) 연결 성공 시 jog.connect.emit(True)
+
+  9.2 연결/해제 감지
+
+      HID read 에러 발생 시 즉시 연결 해제 처리 (jog.connect.emit(False))
+
+
+10. UI 설계
+-----------
+
+  10.1 테마 및 스타일 (동일)
+  ... (이하 생략) ...
+
+
+12. 조작 매핑 (Nintendo Switch Pro Controller)
+----------------------------------------------
+
+  입력               기능                    동작 방식
+  ───────────        ──────────────          ──────────
+  좌스틱 좌우        X축 jog                 강도 비례, 누적 업데이트
+  좌스틱 상하        Y축 jog                 강도 비례, 누적 업데이트
+  우스틱 좌우        A축 jog                 강도 비례, 누적 업데이트
+  우스틱 상하        B축 jog                 강도 비례, 누적 업데이트
+  D-pad 상           Z축 +step               홀드 반복, 0.25초 주기
+  D-pad 하           Z축 -step               홀드 반복, 0.25초 주기
+  D-pad 우           증분 올림 (idx+1)       비트 엣지, 1회
+  D-pad 좌           증분 내림 (idx-1)       비트 엣지, 1회
+  버튼 [1] Bit 1     C축 +step               비트 엣지, 1회
+  버튼 [1] Bit 2     C축 -step               비트 엣지, 1회
+  버튼 [1] Bit 6     카메라 샷               비트 엣지, 1회 (홀드 무시)
+  버튼 [2] Bitmask   증분 올림/내림          비트 엣지, 1회
+
+  데드존: 스틱 ±30% 이내 무시, 이상값 발생 시 누적 반영
+
+
+13. 의존성
+----------
+
+  프레임워크: py_alaska (ALASKA v2.3)
+  UI:         PySide6
+  HID:        hidapi (pip install hidapi)
+  BT:         bthprops.cpl (Windows 내장)
+  Python:     3.10+

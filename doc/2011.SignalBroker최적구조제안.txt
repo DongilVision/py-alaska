@@ -1,0 +1,240 @@
+# [ALASKA v2.1] 분산 P2P SignalBroker 최적 설계서
+
+본 문서는 동적 태스크 환경에서 초저지연 성능과 절대적인 안정성을 보장하기 위한 분산 P2P 기반 SignalBroker의 체계적인 설계 및 구현 가이드를 제공합니다.
+
+---
+
+## 1. 시스템 아키텍처 (Architecture Overview)
+
+### 1.1 계층 구조도
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Main Process (Control Plane)                    │
+│   ┌──────────────────┐          ┌───────────────────────────────────┐   │
+│   │   TaskManager    │ ◀──────▶ │      SignalBroker (Registry)      │   │
+│   └──────────────────┘          └───────────────────────────────────┘   │
+│            │                              │ (Snapshot Broadcast)         │
+└────────────┼──────────────────────────────┼──────────────────────────────┘
+             │                              ▼
+┌────────────┼──────────────────────────────┼──────────────────────────────┐
+│            ▼            Task Processes (Data Plane)                      │
+│   ┌──────────────────┐          ┌───────────────────────────────────┐   │
+│   │   TaskRuntime    │          │    SignalRegistry (Local Cache)   │   │
+│   └──────────────────┘          └───────────────────────────────────┘   │
+│            │                              ▲                             │
+│            ▼                              │                             │
+│   ┌──────────────────┐          ┌──────────────────┐   ┌─────────────┐  │
+│   │   SignalClient   │ ───────▶ │   P2P Sender     │ ─▶│ Target Inbox│  │
+│   └──────────────────┘          └──────────────────┘   └─────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 핵심 설계 원칙
+| 항목 | 설계 방침 | 기대 효과 |
+|------|-----------|-----------|
+| **Data Path** | **P2P Direct Push** | 중앙 브로커 병목 제거, 지연시간 20배 단축 |
+| **Control Path** | **COW Registry** | 동적 변경 시 Lock-free 조회 보장 |
+| **Constraint** | **2KB Hard Limit** | IPC 큐 부하 원천 차단 (Large Data 금지) |
+| **Reliability** | **Non-blocking IO** | 특정 태스크 지연의 전체 확산(Cascading) 방지 |
+
+---
+
+## 2. 상세 클래스 설계 (Class Specification)
+
+### 2.1 SignalBroker (Main Registry)
+전체 시스템의 구독 명부와 태스크 생존 상태를 관리하는 컨트롤러입니다.
+
+| Method | 인자 | 설명 |
+|--------|------|------|
+| `register_inbox` | `tid, queue_obj` | 태스크의 수신 큐를 전역 명부에 등록 |
+| `subscribe` | `sig_name, tid` | 특정 시그널에 대한 구독 관계 설정 |
+| `unsubscribe` | `sig_name, tid` | 구독 해제 및 명부 갱신 |
+| `update_snapshot`| - | 변경된 명부를 기반으로 신규 Immutable 스냅샷 생성 |
+| `gc_zombie_tasks`| - | 하트비트 실패 태스크 자동 적출 및 리소스 회수 |
+
+### 2.2 SignalClient (P2P Agent)
+각 태스크에 내장되어 실제로 시그널을 송수신하는 지능형 에이전트입니다.
+
+| Method | 인자 | 설명 |
+|--------|------|------|
+| **`emit`** | `name, data` | **핵심:** 2KB 체크 후 목적지 큐로 직접 P2P 전송 |
+| `on / off` | `name, handler`| 로컬 핸들러 등록 및 브로커에 구독 요청 릴레이 |
+| `sync_registry` | `snapshot` | 브로커로부터 받은 최신 명부 스냅샷 동기화 |
+| `_check_payload`| `data` | 데이터 크기 계산 및 2KB 초과 시 `PayloadTooLargeError` 발생 |
+
+---
+
+## 3. 동작 시퀀스 (Operation Sequences)
+
+### 3.1 시그널 발행 (Emit Sequence)
+발신 태스크가 브로커를 거치지 않고 목적지들에 직접 데이터를 전달하는 과정입니다.
+
+```text
+[SignalClient]        [Local Registry]       [Target Inbox 1]    [Target Inbox 2]
+      │                       │                      │                   │
+      │ 1. emit(name, data)   │                      │                   │
+      │──────────────────────▶│                      │                   │
+      │ 2. Payload Check (<2K)│                      │                   │
+      │ 3. Get Targets        │                      │                   │
+      │◀──────────────────────│                      │                   │
+      │                       │                      │                   │
+      │ 4. put_nowait(data)   │                      │                   │
+      │───────────────────────┼─────────────────────▶│                   │
+      │ 5. put_nowait(data)   │                      │                   │
+      │───────────────────────┼──────────────────────┼──────────────────▶│
+      │ 6. Return Success     │                      │                   │
+      ▼                       ▼                      ▼                   ▼
+```
+
+### 3.2 태스크 동적 추가 (Dynamic Join Sequence)
+새로운 태스크가 실행 중에 시스템 통신망에 안전하게 합류하는 과정입니다.
+
+```text
+[TaskManager]        [New Task]        [SignalBroker]       [Other Clients]
+      │                   │                   │                    │
+      │ 1. start_task()   │                   │                    │
+      │──────────────────▶│                   │                    │
+      │                   │ 2. register(q)    │                    │
+      │                   │──────────────────▶│                    │
+      │                   │                   │ 3. Update Registry │
+      │                   │                   │ 4. Broadcast Snap  │
+      │                   │                   │───────────────────▶│
+      │                   │                   │                    │ 5. Sync New Target
+      ▼                   ▼                   ▼                    ▼
+```
+
+---
+
+## 4. 안정성 제약 조건 상세 (Stability Constraints)
+
+### 4.1 데이터 크기 제한 정책
+| 데이터 크기 | 처리 방식 | 비고 |
+|-------------|-----------|------|
+| **< 2KB** | **P2P Direct Send** | 즉시 전송, 최소 지연 |
+| **>= 2KB** | **Strict Block** | **`PayloadTooLargeError` 발생 및 전송 거부** |
+
+> **Reasoning:** 시그널 망은 시스템의 '신경계'와 같습니다. 대용량 데이터(이미지 등)가 신경계를 점유하면 제어 신호가 지연되어 시스템 전체의 결정론적 성능(Determinism)이 파괴됩니다. 대용량 데이터는 반드시 별도의 데이터 채널을 설계해야 합니다.
+
+### 4.2 꼬임 방지 (Anti-Deadlock) 수치 사양
+* **Non-blocking Timeout:** 목적지 큐가 가득 찼을 때 대기 시간 = `0ms` (즉시 무시).
+* **Circular Depth Limit:** 동일 시퀀스 내 시그널 전파 깊이 최대 `5단계`로 제한.
+* **Registry Refresh Rate:** 명부 변경 전파 지연 시간 최대 `10ms` 이내 보장.
+
+---
+
+## 5. 구현 계획 (Implementation Roadmap)
+
+| 단계 | 목표 | 주요 산출물 |
+|------|------|------------|
+| **Phase 1** | P2P 엔진 구축 | 전역 공유 레지스트리, `SignalClient` 직접 발신 로직 |
+| **Phase 2** | 하드 리미트 적용 | 2KB 체크 로직, `PayloadTooLargeError` 예외 클래스 |
+| **Phase 3** | 동적 안정성 확보 | Auto-GC(사망 태스크 정리), COW 스냅샷 동기화 |
+| **Phase 4** | 검증 및 최적화 | 지연시간 벤치마크 도구, 동적 스트레스 테스트 시나리오 |
+
+---
+
+## 6. 결론
+이 설계는 ALASKA v2.1의 통신 아키텍처를 성능 중심에서 **'성능과 신뢰성의 조화'** 중심으로 재편합니다. P2P 방식의 압도적인 속도와 2KB 하드 리미트의 견고함이 결합되어, 어떠한 부하 상황에서도 시스템의 핵심 제어권이 유지되는 무결한 프레임워크를 제공할 것입니다.
+
+---
+
+## 7. 상세 의사 코드 및 구현 지침 (Pseudo-code & Details)
+
+이 섹션은 위 설계를 실제 파이썬 코드로 이식할 때의 핵심 구조와 논리를 보여줍니다.
+
+### 7.1 SignalBroker (Control Plane)
+```python
+import multiprocessing
+
+class SignalBroker:
+    def __init__(self, mgr):
+        # 전역 명부: 모든 프로세스에서 접근 가능
+        self._registry = mgr.dict() 
+        # 수신 큐 저장소: {task_id: queue_obj}
+        self._inboxes = mgr.dict()
+        self._lock = multiprocessing.Lock()
+        
+    def register_inbox(self, task_id, q_obj):
+        """태스크 생성 시 큐 등록 및 스냅샷 배포"""
+        with self._lock:
+            self._inboxes[task_id] = q_obj
+        self._update_and_broadcast()
+
+    def subscribe(self, signal_name, task_id):
+        """구독 정보 등록 (원자적 갱신)"""
+        with self._lock:
+            # Manager.dict 내부의 set 객체 조작 시 재할당 필요
+            subs = set(self._registry.get(signal_name, []))
+            subs.add(task_id)
+            self._registry[signal_name] = list(subs)
+        self._update_and_broadcast()
+        
+    def _update_and_broadcast(self):
+        """전체 명부의 Immutable 스냅샷을 생성하여 각 태스크에 전달"""
+        snapshot = {k: tuple(v) for k, v in self._registry.items()}
+        inbox_snap = dict(self._inboxes)
+        
+        # 각 태스크의 수신 큐(Inbox)를 통해 제어 메시지로 스냅샷 푸시
+        for tid, q in self._inboxes.items():
+            try:
+                q.put_nowait({'_ctrl': 'SYNC_REGISTRY', 'subs': snapshot, 'inboxes': inbox_snap})
+            except Exception:
+                # 큐 Full 또는 태스크 사망 등 예외 발생 시 무시
+                pass
+```
+
+### 7.2 SignalClient (Data Plane)
+```python
+import sys
+import queue
+
+class PayloadTooLargeError(Exception):
+    pass
+
+class SignalClient:
+    def __init__(self, task_id, inbox_q):
+        self.task_id = task_id
+        self._inbox = inbox_q
+        self._local_subs = {}   # 최신 구독 스냅샷 캐시
+        self._local_inboxes = {} # 최신 큐 스냅샷 캐시
+        self._depth_counter = 0
+
+    def sync_registry(self, snapshot_data):
+        """Control Plane으로부터 스냅샷 수신 시 로컬 캐시 원자적 교체"""
+        self._local_subs = snapshot_data['subs']
+        self._local_inboxes = snapshot_data['inboxes']
+
+    def emit(self, signal_name, data):
+        """P2P 데이터 발신 (Lock-free, Non-blocking)"""
+        # 1. 하드 리미트: 2KB 초과 데이터 원천 차단
+        if sys.getsizeof(data) > 2048:
+            raise PayloadTooLargeError(
+                f"Signal '{signal_name}' payload exceeds 2KB limit. Use an external data channel."
+            )
+            
+        # 2. 순환 깊이 제한 방어 (Max Depth: 5)
+        if self._depth_counter > 5:
+            print(f"[Warning] Circular signal loop detected for '{signal_name}'. Dropping.")
+            return False
+
+        # 3. 로컬 스냅샷 기반 P2P 전송 (Lock 없음)
+        target_tids = self._local_subs.get(signal_name, ())
+        success_count = 0
+        
+        payload = {'name': signal_name, 'data': data, 'source': self.task_id}
+        
+        for tid in target_tids:
+            target_q = self._local_inboxes.get(tid)
+            if target_q:
+                try:
+                    # Non-blocking Put: 목적지 큐 지연이 발신자에 영향을 주지 않음
+                    target_q.put_nowait(payload)
+                    success_count += 1
+                except queue.Full:
+                    # 백프레셔: 목적지 큐가 가득 차면 즉시 버림(Drop)
+                    print(f"[Warning] Inbox full for '{tid}'. Signal '{signal_name}' dropped.")
+                except Exception:
+                    pass
+        
+        return success_count > 0
+```

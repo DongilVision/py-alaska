@@ -1,0 +1,18 @@
+{
+  "app_info": {
+    "name": "hello_world",
+    "id": "hello-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "hello/HelloTask": {
+      "@import": "example.ex010_hello_world.tasks"
+    }
+  }
+}

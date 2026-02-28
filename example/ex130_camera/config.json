@@ -1,0 +1,36 @@
+{
+  "app_info": {
+    "name": "cam_example",
+    "id": "node-cam-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_smblock": {
+      "smblock2048": {
+        "shape": [2048, 2448, 3],
+        "maxsize": 100
+      }
+    },
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true,
+      "measurement": true
+    }
+  },
+  "task_config": {
+    "camera1/imi_cam_driver": {
+      "@import": "py_alaska.drives.imi.imi_camera",
+      "smblock": "smblock:smblock2048",
+      "mac_address": "00:09:7e:24:08:31",
+      "fps": 900,
+      "exposure": 15000,
+      "trigger_source": "hardware",
+      "trigger_mode": false
+    },
+    "viewer/ImiCameraView": {
+      "@import": "example.ex130_camera.task_viewer",
+      "target":"client:camera1",
+      "smblock": "smblock:smblock2048"
+    }
+  }
+}

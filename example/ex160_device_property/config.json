@@ -1,0 +1,18 @@
+{
+  "app_info": {
+    "name": "device_property_demo",
+    "id": "ex160",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7001,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "camera/CameraTask": {
+      "@import": "example.ex160_device_property.tasks"
+    }
+  }
+}

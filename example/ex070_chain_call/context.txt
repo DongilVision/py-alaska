@@ -1,0 +1,6 @@
+
+
+- process - thread가 상호호출은 반드시 되어야 한다.
+- 성능을 0.5ms 이하로 호출성능유지
+- thread - thread 간 성능튜닝은 별도 매커니즘을 사용해도됨.
+- sharedmemory를 사용하여 통신할수 있는 빠른 방법은

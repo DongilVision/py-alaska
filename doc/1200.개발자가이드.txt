@@ -1,0 +1,644 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.0 - 개발자 가이드                                                ║
+║  Developer Guide                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Version : 2.2.0                                                            ║
+║  Date    : 2026-02-16                                                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+1. 시작하기
+================================================================================
+
+1.1 최소 구성
+--------------------------------------------------------------------------------
+
+  프로젝트 구조:
+    my_app/
+    ├── config.json       ← 설정 파일
+    ├── main.py           ← 진입점
+    └── tasks.py          ← Task 클래스
+
+  config.json:
+    {
+      "app_info": {
+        "name": "my_app",
+        "id": "my-app-001",
+        "version": "1.0.0"
+      },
+      "task_config": {
+        "worker/MyTask": {
+          "@import": "tasks"
+        }
+      }
+    }
+
+  tasks.py:
+    from py_alaska import task
+
+    @task(mode="process")
+    class MyTask:
+        def run(self):
+            while self.running:
+                print("working...")
+                time.sleep(1.0)
+
+  main.py:
+    from py_alaska import TaskManager, gconfig
+
+    gconfig.load("config.json")
+    with TaskManager(gconfig) as manager:
+        manager.wait()
+
+
+1.2 실행
+--------------------------------------------------------------------------------
+
+    python main.py
+
+
+2. @task 데코레이터
+================================================================================
+
+2.1 기본 사용법
+--------------------------------------------------------------------------------
+
+    from py_alaska import task
+
+    @task(mode="process", restart=True)
+    class MyTask:
+        def run(self):
+            while self.running:
+                pass
+
+  파라미터:
+  ┌──────────────┬─────────────┬──────────────────────────────────────────────┐
+  │ 파라미터      │ 기본값      │ 설명                                         │
+  ├──────────────┼─────────────┼──────────────────────────────────────────────┤
+  │ name         │ 클래스명     │ Task 이름 (config의 "id/Name"과 매칭)        │
+  │ mode         │ "thread"    │ "thread" 또는 "process"                      │
+  │ restart      │ False       │ 오류 시 자동 재시작                           │
+  │ debug        │ False       │ 디버그 출력 (아래 2.5 참조)                   │
+  └──────────────┴─────────────┴──────────────────────────────────────────────┘
+
+
+2.2 self가 제공하는 것들
+--------------------------------------------------------------------------------
+
+  @task 데코레이터가 자동으로 주입하는 속성:
+
+  ┌──────────────────┬──────────────────────────────────────────────────────────┐
+  │ 속성              │ 설명                                                    │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ self.running     │ bool - Task 실행 중 여부 (종료 시 False)                │
+  │ self.task_name   │ str  - 이 Task의 이름 (config의 id)                     │
+  │ self.signal      │ Signal 체인 객체 (emit/on/off)                          │
+  │ self.runtime     │ TaskRuntime - 내부 런타임 (보통 직접 사용 안 함)        │
+  └──────────────────┴──────────────────────────────────────────────────────────┘
+
+  config.json에서 주입되는 속성:
+
+  ┌──────────────────┬──────────────────────────────────────────────────────────┐
+  │ config 키         │ 주입 결과                                               │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ "client:other"   │ self.other = RmiClient (다른 Task 원격 호출)            │
+  │ "task:other"     │ self.other = 직접 인스턴스 (thread 모드 전용)           │
+  │ "smblock": "cam" │ self.smblock = SmBlock 풀                               │
+  │ "threshold": 128 │ self.threshold = 128  (일반 값)                         │
+  │ "@import"        │ 모듈 자동 로딩 (속성 주입 안 함)                        │
+  └──────────────────┴──────────────────────────────────────────────────────────┘
+
+
+2.3 mode 선택 기준
+--------------------------------------------------------------------------------
+
+  ┌───────────────┬────────────────────────┬────────────────────────────────────┐
+  │               │ thread                 │ process                            │
+  ├───────────────┼────────────────────────┼────────────────────────────────────┤
+  │ 격리          │ 없음 (GIL 공유)        │ 완전 격리 (별도 프로세스)          │
+  │ IPC 방식      │ DirectClient (직접호출)│ RmiClient (Pipe)                   │
+  │ 속도          │ 빠름 (~0.01ms)         │ 보통 (~0.7ms)                      │
+  │ 사용처        │ Qt UI, 가벼운 처리     │ CPU 집약, 카메라, 센서             │
+  │ 오류 영향     │ 메인 프로세스에 영향   │ 메인 프로세스 안전                 │
+  └───────────────┴────────────────────────┴────────────────────────────────────┘
+
+
+2.4 run() 메서드 규칙
+--------------------------------------------------------------------------------
+
+  run()은 @rmi_run이 자동 적용되며, Task의 메인 루프입니다.
+
+    @task(mode="process")
+    class MyTask:
+        def run(self):                    # 자동으로 @rmi_run 적용
+            while self.running:           # 종료 조건 (self.running)
+                # 작업 수행
+                time.sleep(0.1)           # CPU 양보 필수
+
+  주의사항:
+    - run() 안에서 반드시 self.running 체크
+    - time.sleep() 없으면 CPU 100% 점유
+    - run() 없는 Task도 가능 (RMI 전용 서비스)
+
+
+2.5 debug 옵션
+--------------------------------------------------------------------------------
+
+    @task(debug=True)                     # 전체 디버그
+    @task(debug="signal")                 # 시그널만
+    @task(debug="method")                 # RMI 호출만
+    @task(debug="signal,method")          # 시그널 + RMI
+    @task(debug="signal,method,variable") # 전체 (= True)
+
+
+3. Signal (이벤트 통신)
+================================================================================
+
+  Signal은 Task 간 비동기 이벤트 통신 시스템입니다.
+  Pub/Sub 패턴으로 1:N 브로드캐스트를 지원합니다.
+
+  특성:
+    - 비동기 (emit 즉시 반환, 큐에 적재)
+    - 반환값 없음 (Fire-and-Forget)
+    - Task별 큐 크기: 50 (초과 시 drop)
+    - 폴링 주기: 2ms
+
+
+3.1 Signal 발신 (emit)
+--------------------------------------------------------------------------------
+
+  self.signal 체인 문법으로 발신합니다.
+
+    # 기본
+    self.signal.score.update.emit({"value": 42})
+
+    # 단순 값
+    self.signal.count.emit(self.count)
+
+    # 동적 이름
+    name = "a"
+    getattr(self.signal.job, name).emit({"id": 1})
+
+  체인 규칙:
+    self.signal.<이름1>.<이름2>.emit(data)
+    → 시그널명: "이름1.이름2"
+    → data: dict, int, str, list 등 pickle 가능한 값
+
+
+3.2 Signal 수신 - 자동 구독 (on_ 메서드)
+--------------------------------------------------------------------------------
+
+  메서드명이 on_ 으로 시작하면 자동으로 시그널 구독됩니다.
+  이름 변환 규칙: on_<이름1>_<이름2> → 시그널 "이름1.이름2"
+
+    @task(mode="process")
+    class MyTask:
+        def run(self):
+            while self.running:
+                time.sleep(0.1)
+
+        def on_score_update(self, signal):
+            """자동 구독: "score.update" 시그널"""
+            print(signal.data)  # {"value": 42}
+
+  변환 예시:
+  ┌─────────────────────────┬──────────────────────────────────────────────────┐
+  │ 메서드명                 │ 구독 시그널                                      │
+  ├─────────────────────────┼──────────────────────────────────────────────────┤
+  │ on_score_update         │ "score.update"                                   │
+  │ on_job_a                │ "job.a"                                          │
+  │ on_camera_connected     │ "camera.connected"                               │
+  │ on_count                │ "count"                                          │
+  │ on_token_returned       │ "token.returned"                                 │
+  └─────────────────────────┴──────────────────────────────────────────────────┘
+
+  signal 파라미터:
+  ┌──────────────────┬─────────────────────────────────────────────────────────┐
+  │ 속성              │ 설명                                                   │
+  ├──────────────────┼─────────────────────────────────────────────────────────┤
+  │ signal.name      │ 시그널 이름 (예: "score.update")                        │
+  │ signal.source    │ 발신 Task 이름                                          │
+  │ signal.data      │ 전달된 데이터                                           │
+  └──────────────────┴─────────────────────────────────────────────────────────┘
+
+
+3.3 Signal 수신 - 코드 구독 (on/off)
+--------------------------------------------------------------------------------
+
+  run() 안에서 동적으로 구독/해제할 수 있습니다.
+
+    @task(mode="process")
+    class MyTask:
+        def run(self):
+            # 구독
+            self.signal.sensor.temp.on(self._handle_temp)
+
+            while self.running:
+                time.sleep(0.1)
+
+            # 해제
+            self.signal.sensor.temp.off(self._handle_temp)
+
+        def _handle_temp(self, signal):
+            print(f"온도: {signal.data}")
+
+
+3.4 Signal API 요약
+--------------------------------------------------------------------------------
+
+  ┌───────────────────────────────────────────────┬────────────────────────────┐
+  │ API                                           │ 설명                       │
+  ├───────────────────────────────────────────────┼────────────────────────────┤
+  │ self.signal.xxx.emit(data)                    │ 발신                       │
+  │ self.signal.xxx.on(handler)                   │ 구독                       │
+  │ self.signal.xxx.off(handler)                  │ 구독 해제                  │
+  │ def on_xxx(self, signal):                     │ 자동 구독 (선언적)         │
+  └───────────────────────────────────────────────┴────────────────────────────┘
+
+
+4. RMI (원격 메서드 호출)
+================================================================================
+
+  RMI는 Task 간 동기 메서드 호출입니다.
+  다른 Task의 메서드를 마치 로컬 함수처럼 호출합니다.
+
+  특성:
+    - 동기 (결과 반환까지 대기)
+    - 1:1 호출 (요청-응답)
+    - 타임아웃: 2.0초 (config 설정 가능)
+
+
+4.1 config 설정
+--------------------------------------------------------------------------------
+
+  config.json에서 "client:<태스크ID>" 로 RMI 클라이언트를 주입합니다.
+
+    "task_config": {
+      "worker/MyTask": {
+        "@import": "tasks",
+        "camera": "client:cam_driver"     ← cam_driver Task의 클라이언트
+      },
+      "cam_driver/CamDriver": {
+        "@import": "drivers"
+      }
+    }
+
+
+4.2 메서드 호출
+--------------------------------------------------------------------------------
+
+    @task(mode="process")
+    class MyTask:
+        def __init__(self):
+            self.camera = None            # config에서 RmiClient 주입됨
+
+        def run(self):
+            # 메서드 호출 (동기)
+            frame = self.camera.get_frame()
+
+            # 변수 읽기
+            fps = self.camera.fps
+
+            # 인자 전달
+            self.camera.set_exposure(100)
+
+
+4.3 RMI 타임아웃
+--------------------------------------------------------------------------------
+
+  config.json:
+    "platform_config": {
+      "rmi": {
+        "timeout": 5.0               ← 전역 타임아웃 (초)
+      }
+    }
+
+  기본값: 2.0초. 타임아웃 초과 시 RmiTimeoutError 발생.
+
+
+5. config.json 구성
+================================================================================
+
+5.1 전체 구조
+--------------------------------------------------------------------------------
+
+    {
+      "app_info": {                       ← 앱 기본 정보
+        "name": "my_app",
+        "id": "node-001",
+        "version": "1.0.0"
+      },
+      "platform_config": {                ← 플랫폼 설정
+        "rmi": {
+          "timeout": 2.0                  ← RMI 타임아웃 (초)
+        },
+        "_monitor": {                     ← 웹 모니터
+          "port": 7000,
+          "exit_hook": true
+        },
+        "_smblock": {                     ← 공유메모리 풀
+          "camera_frames": {
+            "shape": [480, 640, 3],
+            "maxsize": 10
+          }
+        }
+      },
+      "task_config": {                    ← Task 정의
+        "id/ClassName": {
+          "@import": "module.path",       ← 모듈 자동 임포트
+          "client:other_id": {},          ← RMI 클라이언트 주입
+          "smblock": "pool_name",         ← SmBlock 주입
+          "param_name": value             ← 일반 값 주입
+        }
+      },
+      "user_config": {                    ← 사용자 설정 (자유 구조)
+        "interval": 1.0,
+        "threshold": 128
+      }
+    }
+
+
+5.2 task_config 키 규칙
+--------------------------------------------------------------------------------
+
+  "task_config"의 각 엔트리: "태스크ID/클래스명"
+
+    "worker/MyTask": {                    ← ID="worker", 클래스="MyTask"
+      "@import": "myapp.tasks"            ← MyTask가 정의된 모듈
+    }
+
+  같은 클래스 여러 인스턴스:
+
+    "worker1/MyTask": { "@import": "tasks", "mode": "fast" },
+    "worker2/MyTask": { "@import": "tasks", "mode": "slow" }
+
+
+5.3 의존성 주입 접두사
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────┬─────────────────────────────────────────────────────┐
+  │ config 키             │ 주입 결과                                           │
+  ├──────────────────────┼─────────────────────────────────────────────────────┤
+  │ "client:cam"         │ cam Task의 RmiClient → self.client 또는 키 이름    │
+  │ "task:cam"           │ cam Task의 직접 인스턴스 (thread 전용)             │
+  │ "smblock": "frames"  │ frames SmBlock 풀 → self.smblock                   │
+  │ "threshold": 128     │ 일반 값 → self.threshold = 128                     │
+  │ "@import"            │ 모듈 로딩만 (속성 주입 없음)                       │
+  └──────────────────────┴─────────────────────────────────────────────────────┘
+
+  주의: "client:" 키의 속성명은 콜론 앞 부분입니다.
+
+    "camera": "client:cam_driver"     → self.camera = RmiClient(cam_driver)
+    "client:cam_driver": {}           → self.cam_driver = RmiClient(cam_driver)  (키 사용 안됨, 이 형태는 deprecated)
+
+
+6. GConfig (설정 읽기/쓰기)
+================================================================================
+
+  프로세스 안전한 설정 파일 접근. 파일 잠금 기반.
+
+    from py_alaska import gconfig
+
+    # 읽기 (캐시됨, mtime 기반 갱신)
+    name = gconfig.data_get("app_info.name")
+    interval = gconfig.data_get("user_config.interval", 1.0)  # 기본값
+
+    # 쓰기 (파일 잠금 → 저장)
+    gconfig.data_set("user_config.interval", 2.0)
+
+
+7. SmBlock (공유메모리)
+================================================================================
+
+  프로세스 간 이미지/데이터 공유를 위한 고정 크기 메모리 풀.
+  O(1) 할당/해제 (Free-List).
+
+  config.json:
+    "platform_config": {
+      "_smblock": {
+        "camera_frames": {
+          "shape": [480, 640, 3],         ← H x W x C
+          "maxsize": 10                   ← 버퍼 개수
+        }
+      }
+    }
+
+  task_config:
+    "processor/ImgProcessor": {
+      "@import": "tasks",
+      "smblock": "camera_frames"          ← SmBlock 풀 주입
+    }
+
+  Task 코드:
+    @task(mode="process")
+    class ImgProcessor:
+        def __init__(self):
+            self.smblock = None           # config에서 주입
+
+        def process(self, frame_idx):
+            buf = self.smblock.get_buffer(frame_idx)  # numpy 뷰 (Zero-Copy)
+            # buf로 이미지 처리
+            self.smblock.mfree(frame_idx)             # 사용 후 반환
+
+
+8. 실전 패턴
+================================================================================
+
+8.1 센서 → 처리 → UI (전형적 파이프라인)
+--------------------------------------------------------------------------------
+
+  config.json:
+    "task_config": {
+      "sensor/SensorTask": {
+        "@import": "tasks"
+      },
+      "processor/ProcessorTask": {
+        "@import": "tasks"
+      },
+      "ui/UiTask": {
+        "@import": "tasks"
+      }
+    }
+
+  tasks.py:
+    @task(mode="process", restart=True)
+    class SensorTask:
+        def run(self):
+            while self.running:
+                data = read_sensor()
+                self.signal.sensor.data.emit(data)
+                time.sleep(0.01)
+
+    @task(mode="process")
+    class ProcessorTask:
+        def run(self):
+            while self.running:
+                time.sleep(0.1)
+
+        def on_sensor_data(self, signal):
+            """sensor.data 자동 구독"""
+            result = process(signal.data)
+            self.signal.result.ready.emit(result)
+
+    @task(mode="thread")
+    class UiTask:
+        def run(self):
+            while self.running:
+                time.sleep(0.1)
+
+        def on_result_ready(self, signal):
+            """result.ready 자동 구독"""
+            update_display(signal.data)
+
+
+8.2 RMI 체인 호출 (A → B → C → ... → 결과)
+--------------------------------------------------------------------------------
+
+  config.json:
+    "task_config": {
+      "source/SourceTask": {
+        "@import": "tasks",
+        "relay": "client:mid"
+      },
+      "mid/RelayTask": {
+        "@import": "tasks",
+        "next": "client:dest"
+      },
+      "dest/DestTask": {
+        "@import": "tasks"
+      }
+    }
+
+  tasks.py:
+    @task(mode="process")
+    class SourceTask:
+        def __init__(self):
+            self.relay = None
+
+        def run(self):
+            result = self.relay.process({"value": 42})
+            print(f"최종 결과: {result}")
+
+    @task(mode="process")
+    class RelayTask:
+        def __init__(self):
+            self.next = None
+
+        def process(self, data):
+            data["value"] *= 2
+            return self.next.process(data)
+
+    @task(mode="process")
+    class DestTask:
+        def process(self, data):
+            data["value"] += 1
+            return data
+
+
+8.3 Signal + RMI 조합 (이벤트 → 상태 조회)
+--------------------------------------------------------------------------------
+
+    @task(mode="process")
+    class Monitor:
+        def __init__(self):
+            self.sensor = None            # RmiClient
+
+        def on_sensor_alert(self, signal):
+            """sensor.alert 자동 구독"""
+            # Signal로 알림 받고, RMI로 상세 정보 조회
+            detail = self.sensor.get_status()
+            print(f"경고: {signal.data}, 상태: {detail}")
+
+
+9. 웹 모니터
+================================================================================
+
+  config.json:
+    "platform_config": {
+      "_monitor": {
+        "port": 7000,
+        "exit_hook": true                 ← Ctrl+C 종료 훅
+      }
+    }
+
+  접속: http://localhost:7000
+
+  기능:
+    - Task 상태 실시간 모니터링
+    - Signal 통계 확인
+    - RMI 호출 통계
+    - 시스템 HW 정보
+
+
+10. RMI vs Signal 선택 기준
+================================================================================
+
+  ┌────────────────────┬─────────────────────────┬─────────────────────────────┐
+  │ 상황                │ RMI                     │ Signal                      │
+  ├────────────────────┼─────────────────────────┼─────────────────────────────┤
+  │ "값 가져와"        │ O  count = t.get()      │ X                           │
+  │ "이것 처리해"      │ O  t.process(data)      │ X                           │
+  │ "상태 변했어"      │ X                       │ O  signal.emit(data)        │
+  │ "모두에게 알려"    │ X                       │ O  signal.emit(data) (1:N)  │
+  │ "결과 기다려"      │ O  (동기, 반환값)       │ X  (비동기, 반환값 없음)    │
+  │ "느슨한 결합"      │ X  (호출자가 대상 앎)   │ O  (이름만 알면 됨)         │
+  └────────────────────┴─────────────────────────┴─────────────────────────────┘
+
+
+11. 주의사항
+================================================================================
+
+11.1 process 모드 제약
+--------------------------------------------------------------------------------
+  - 모든 데이터는 pickle 가능해야 함 (lambda, 소켓 객체 등 불가)
+  - 클래스 인스턴스 직접 공유 불가 → RmiClient 또는 SmBlock 사용
+  - __init__에서 self.runtime = None 초기화 필요 (직접 runtime 접근 시)
+
+11.2 Signal 주의점
+--------------------------------------------------------------------------------
+  - Queue 크기 제한: 50 (초과 시 시그널 유실)
+  - on_ 메서드명에 주의: on_init, on_error 등 의도치 않은 구독 가능
+  - process 모드에서 data는 반드시 pickle 가능해야 함
+
+11.3 RMI 주의점
+--------------------------------------------------------------------------------
+  - 타임아웃 기본 2초 → 오래 걸리는 작업은 설정 변경 필요
+  - 순환 호출 불가 (A→B→A): 데드락 방지를 위해 Exception 발생
+  - process 모드에서만 IPC 오버헤드 존재 (~0.7ms)
+
+11.4 run() 메서드 주의점
+--------------------------------------------------------------------------------
+  - while self.running 패턴 필수
+  - time.sleep() 반드시 포함 (최소 0.001초)
+  - run()에서 예외 발생 시 restart=True면 자동 재시작
+
+
+12. 성능 참고
+================================================================================
+
+  측정 환경: Windows 11 / Python 3.13 / 로컬 단일 머신
+  측정 일시: 2026-02-17
+
+  ┌──────────────────────────────┬────────────┬────────────────────────────────┐
+  │ 항목                         │ 평균       │ TPS                            │
+  ├──────────────────────────────┼────────────┼────────────────────────────────┤
+  │ RMI ping (process)           │ 0.63ms     │ 1,598/sec                      │
+  │ RMI add 연산 (process)       │ 0.63ms     │ 1,576/sec                      │
+  │ Signal emit                  │ 0.001ms    │ 984,445/sec                    │
+  │ Signal emit→recv 왕복        │ 0.105ms    │ 9,513/sec                      │
+  │ Signal 5구독자 브로드캐스트   │ 0.013ms    │ 76,923/sec                     │
+  │ 중첩호출 1단                  │ 15.6ms     │ 64/sec                         │
+  │ 중첩호출 2단                  │ 31.1ms     │ 32/sec                         │
+  │ 5 프로세스 동시호출           │ 0.48ms     │ 2,100/sec                      │
+  └──────────────────────────────┴────────────┴────────────────────────────────┘
+
+  Signal 성능 개선 내역 (v2.1 → v2.2):
+    - _queues: mgr.dict() IPC 프록시 → local dict (메모리 직접 접근)
+    - Queue: mgr.Queue() IPC → process: mp.Queue(pipe), thread: queue.Queue(메모리)
+    - emit 지연: 0.54ms → 0.001ms (540x 개선)
+    - 5구독자 broadcast: 12.8ms → 0.013ms (985x 개선)
+
+
+================================================================================
+  End of Developer Guide
+================================================================================

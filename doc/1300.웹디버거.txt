@@ -1,0 +1,616 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.0 - Web Debugger 설계서                                          ║
+║  Zero-Based Runtime Debugging via Web UI                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Version : 1.0.0                                                            ║
+║  Date    : 2026-02-16                                                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+1. 개요
+================================================================================
+
+1.1 목적
+--------------------------------------------------------------------------------
+
+  기존 TaskMonitor(모니터링 전용)를 확장하여, 런타임 디버깅 도구를 제공한다.
+  웹 브라우저에서 실행 중인 ALASK 시스템을 제어/분석할 수 있다.
+
+  핵심 차별점:
+  ┌──────────────────┬────────────────────────┬──────────────────────────────┐
+  │                  │ 기존 Monitor           │ 신규 Debugger                │
+  ├──────────────────┼────────────────────────┼──────────────────────────────┤
+  │ 방향             │ 읽기 전용 (조회)       │ 읽기 + 쓰기 (제어)          │
+  │ 목적             │ 상태 확인              │ 문제 추적 및 해결            │
+  │ 대상             │ 운영자                 │ 개발자                       │
+  │ debug 모드       │ 코드 수정 필요         │ 런타임 토글                  │
+  │ 변수 접근        │ config 값만            │ 모든 인스턴스 변수           │
+  │ Signal 추적      │ 통계만                 │ 실시간 흐름 추적             │
+  │ RMI 추적         │ 통계만                 │ 호출 체인 시각화             │
+  └──────────────────┴────────────────────────┴──────────────────────────────┘
+
+
+1.2 활성화
+--------------------------------------------------------------------------------
+
+  config.json:
+    "platform_config": {
+      "_monitor": {
+        "port": 7000,
+        "exit_hook": true,
+        "debugger": true             ← 디버거 활성화
+      }
+    }
+
+  접속: http://localhost:7000/debug
+
+
+1.3 보안 고려
+--------------------------------------------------------------------------------
+
+  - localhost (127.0.0.1) 접속만 허용
+  - 운영 환경에서는 debugger: false (기본값)
+  - 변수 쓰기 시 원본 값/타입 보존 (타입 캐스팅)
+
+
+2. 기능 구성
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Web Debugger UI                                                        │
+  │                                                                         │
+  │  ┌─────────┐  ┌──────────────────────────────────────────────────────┐  │
+  │  │ 사이드바 │  │  메인 패널                                           │  │
+  │  │         │  │                                                      │  │
+  │  │ ● Tasks │  │  선택한 탭의 내용                                    │  │
+  │  │ ● Debug │  │                                                      │  │
+  │  │ ● Signal│  │                                                      │  │
+  │  │ ● RMI   │  │                                                      │  │
+  │  │ ● Vars  │  │                                                      │  │
+  │  │ ● Perf  │  │                                                      │  │
+  │  │         │  │                                                      │  │
+  │  └─────────┘  └──────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  탭 구성:
+  ┌──────────────┬──────────────────────────────────────────────────────────┐
+  │ 탭            │ 기능                                                    │
+  ├──────────────┼──────────────────────────────────────────────────────────┤
+  │ Tasks        │ 전체 Task 상태 대시보드 (alive, mode, restart 횟수)     │
+  │ Debug Mode   │ Task별 debug 플래그 런타임 토글                         │
+  │ Signal Trace │ 실시간 Signal 흐름 추적                                 │
+  │ RMI Trace    │ RMI 호출 체인 시각화                                    │
+  │ Variables    │ Task 인스턴스 변수 조회/수정                            │
+  │ Performance  │ 카운터 및 타이밍 상세                                   │
+  └──────────────┴──────────────────────────────────────────────────────────┘
+
+
+3. Tasks 탭 - 전체 상태 대시보드
+================================================================================
+
+  표시 항목 (각 Task 카드):
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  [●] source (SensorTask)                         mode: process         │
+  │                                                   restart: 0           │
+  │  RMI   rx: 142     tx: 89      fail: 0           avg: 0.62ms          │
+  │  Signal emit: 284   recv: 0     queue: 3/50                           │
+  │                                                                        │
+  │  [Debug: signal ○  method ○  variable ○]         [▶ Pause] [⟲ Restart]│
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  데이터 소스: 기존 /api/status + /api/subscriptions 조합
+
+  기존 API 활용:
+    GET /api/status          → alive, rmi_rx, rmi_tx, rmi_fail, rmi_avg
+    GET /api/subscriptions   → signal emit/recv 통계
+    GET /api/cpu             → CPU%, Memory 사용량
+
+
+4. Debug Mode 탭 - 런타임 디버그 토글
+================================================================================
+
+4.1 UI
+--------------------------------------------------------------------------------
+
+  Task별 debug 플래그 토글 스위치:
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Task: source (SensorTask)                                              │
+  │  ┌──────────┬────────┬─────────────────────────────────────────────┐   │
+  │  │ Flag     │ 상태    │ 설명                                       │   │
+  │  ├──────────┼────────┼─────────────────────────────────────────────┤   │
+  │  │ signal   │ [ON]   │ Signal emit/recv 로그                      │   │
+  │  │ method   │ [OFF]  │ RMI 메서드 호출 로그                       │   │
+  │  │ variable │ [OFF]  │ RMI 변수 접근 로그                         │   │
+  │  └──────────┴────────┴─────────────────────────────────────────────┘   │
+  │                                                                         │
+  │  Task: dashboard (DashboardTask)                                        │
+  │  ┌──────────┬────────┬─────────────────────────────────────────────┐   │
+  │  │ signal   │ [OFF]  │ Signal emit/recv 로그                      │   │
+  │  │ method   │ [ON]   │ RMI 메서드 호출 로그                       │   │
+  │  │ variable │ [OFF]  │ RMI 변수 접근 로그                         │   │
+  │  └──────────┴────────┴─────────────────────────────────────────────┘   │
+  │                                                                         │
+  │  [전체 ON]  [전체 OFF]  [signal 전체 ON]  [method 전체 ON]              │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+4.2 구현 방식
+--------------------------------------------------------------------------------
+
+  현재 debug 플래그는 TaskRuntime 초기화 시 고정:
+    self._debug_signal = True/False
+    self._debug_method = True/False
+    self._debug_variable = True/False
+
+  변경 방안: RMI로 debug 플래그를 동적 변경
+
+  신규 API:
+
+    GET  /api/debug/flags
+    응답: {
+      "source": {"signal": true, "method": false, "variable": false},
+      "dashboard": {"signal": false, "method": true, "variable": false}
+    }
+
+    POST /api/debug/flags
+    요청: {"task_id": "source", "flag": "signal", "value": true}
+    응답: {"status": "ok"}
+
+  내부 구현:
+    TaskRuntime에 __set_debug__ RMI 핸들러 추가:
+
+    # task_manager.py - TaskRuntime._rmi_handler 내부
+    elif m == '__set_debug__':
+        flag, value = a[0], a[1]
+        if flag == 'signal':
+            self._debug_signal = value
+            if self._signal_client:
+                self._signal_client._debug = value
+        elif flag == 'method':
+            self._debug_method = value
+        elif flag == 'variable':
+            self._debug_variable = value
+        res = {'r': True}
+
+    elif m == '__get_debug__':
+        res = {'r': {
+            'signal': self._debug_signal,
+            'method': self._debug_method,
+            'variable': self._debug_variable,
+        }}
+
+
+5. Signal Trace 탭 - 실시간 시그널 흐름
+================================================================================
+
+5.1 UI
+--------------------------------------------------------------------------------
+
+  실시간 시그널 이벤트 스트림 (최근 100건):
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Signal Trace                              [● Recording] [Clear] [Pause]│
+  │                                                                         │
+  │  필터: [signal 이름 ___________] [source task ▼] [포함/제외 ◆]         │
+  │                                                                         │
+  │  ┌──────────┬────────────┬──────────┬──────────┬──────────────────────┐ │
+  │  │ 시간      │ Signal     │ Source   │ → Dest   │ Data                 │ │
+  │  ├──────────┼────────────┼──────────┼──────────┼──────────────────────┤ │
+  │  │ 14:23:01 │ sensor.alert│ sensor  │ dashboard│ {value: 38.2}       │ │
+  │  │ 14:23:01 │ sensor.temp │ sensor  │ monitor  │ 38.2                │ │
+  │  │ 14:23:00 │ sensor.hum  │ sensor  │ monitor  │ 65.3                │ │
+  │  │ 14:22:59 │ sensor.temp │ sensor  │ (dropped)│ 25.1  ← 큐 초과     │ │
+  │  │ ...      │            │          │          │                      │ │
+  │  └──────────┴────────────┴──────────┴──────────┴──────────────────────┘ │
+  │                                                                         │
+  │  통계: emit 284건 | recv 271건 | drop 13건 (4.6%)                       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+5.2 구현 방식
+--------------------------------------------------------------------------------
+
+  SignalBroker에 trace 버퍼 추가:
+
+  신규 API:
+
+    GET  /api/debug/signal/trace?limit=100&filter=sensor
+    응답: {
+      "recording": true,
+      "events": [
+        {
+          "ts": 1708070581.234,
+          "signal": "sensor.alert",
+          "source": "sensor",
+          "dest": ["dashboard"],
+          "data_preview": "{value: 38.2}",
+          "dropped": []
+        }
+      ],
+      "stats": {"emit": 284, "recv": 271, "drop": 13}
+    }
+
+    POST /api/debug/signal/trace
+    요청: {"action": "start"|"stop"|"clear"}
+
+  내부 구현:
+    SignalBroker._dispatch() 에서 trace 기록:
+
+    # task_signal.py - SignalBroker._dispatch() 내부
+    if self._trace_enabled:
+        delivered = []
+        dropped = []
+        for tid in subscribers:
+            q = self._queues.get(tid)
+            if q and q.full():
+                dropped.append(tid)
+            else:
+                delivered.append(tid)
+        self._trace_buffer.append({
+            'ts': time.time(),
+            'signal': signal_name,
+            'source': source_id,
+            'dest': delivered,
+            'dropped': dropped,
+            'data_preview': str(data)[:200],
+        })
+        # 최대 500건 유지
+        if len(self._trace_buffer) > 500:
+            self._trace_buffer = self._trace_buffer[-500:]
+
+
+6. RMI Trace 탭 - 호출 체인 시각화
+================================================================================
+
+6.1 UI
+--------------------------------------------------------------------------------
+
+  최근 RMI 호출 이력 + 체인 시각화:
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  RMI Trace                                 [● Recording] [Clear] [Pause]│
+  │                                                                         │
+  │  필터: [메서드명 ___________] [caller ▼] [callee ▼]                     │
+  │                                                                         │
+  │  ┌──────────┬──────────────────────┬────────┬──────┬──────┬──────────┐ │
+  │  │ 시간      │ 호출                  │ IPC    │ FUNC │ Total│ 결과     │ │
+  │  ├──────────┼──────────────────────┼────────┼──────┼──────┼──────────┤ │
+  │  │ 14:23:01 │ dashboard→sensor     │ 0.31ms │0.02ms│0.33ms│ ok       │ │
+  │  │          │  .get_status()       │        │      │      │          │ │
+  │  │ 14:23:00 │ source→mid1→mid2→mid3│ 0.95ms │0.51ms│1.46ms│ ok      │ │
+  │  │          │  .chain_call({...})  │        │      │      │          │ │
+  │  │ 14:22:58 │ watcher→unstable     │  --    │  --  │  --  │ timeout  │ │
+  │  │          │  .run_count           │        │      │      │          │ │
+  │  └──────────┴──────────────────────┴────────┴──────┴──────┴──────────┘ │
+  │                                                                         │
+  │  호출 체인 시각화 (선택한 행):                                           │
+  │  ┌──────────────────────────────────────────────────────────────┐       │
+  │  │ dashboard ──0.31ms──→ sensor.get_status() ──0.02ms──→ 응답   │       │
+  │  └──────────────────────────────────────────────────────────────┘       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+6.2 구현 방식
+--------------------------------------------------------------------------------
+
+  RmiClient._call()에서 trace 기록:
+
+  신규 API:
+
+    GET  /api/debug/rmi/trace?limit=100
+    응답: {
+      "recording": true,
+      "events": [
+        {
+          "ts": 1708070581.234,
+          "caller": "dashboard",
+          "callee": "sensor",
+          "method": "get_status",
+          "args_preview": "()",
+          "ipc_ms": 0.31,
+          "func_ms": 0.02,
+          "total_ms": 0.33,
+          "result": "ok",
+          "chain": ["dashboard", "sensor"]
+        }
+      ]
+    }
+
+    POST /api/debug/rmi/trace
+    요청: {"action": "start"|"stop"|"clear"}
+
+  내부 구현:
+    TaskManager에 _rmi_trace_buffer (공유 리스트) 추가.
+    RmiClient._call() 완료 시 trace 기록.
+
+
+7. Variables 탭 - 인스턴스 변수 조회/수정
+================================================================================
+
+7.1 UI
+--------------------------------------------------------------------------------
+
+  Task 선택 → 인스턴스 변수 트리:
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Variables                                                [Auto ● 3s]   │
+  │                                                                         │
+  │  Task: [sensor ▼]                                                       │
+  │                                                                         │
+  │  ┌─────────────────┬────────┬──────────────┬─────────────────────────┐ │
+  │  │ 변수             │ 타입    │ 값            │ 조작                    │ │
+  │  ├─────────────────┼────────┼──────────────┼─────────────────────────┤ │
+  │  │ value           │ float  │ 38.2         │ [수정] ← 입력 필드      │ │
+  │  │ threshold       │ float  │ 35.0         │ [수정]                  │ │
+  │  │ count           │ int    │ 142          │ (읽기전용)              │ │
+  │  │ running         │ bool   │ true         │ (시스템)                │ │
+  │  │ task_name       │ str    │ "sensor"     │ (시스템)                │ │
+  │  └─────────────────┴────────┴──────────────┴─────────────────────────┘ │
+  │                                                                         │
+  │  ※ runtime, signal 등 시스템 객체는 조회만 표시                         │
+  │  ※ 수정 가능: int, float, str, bool, list, dict (pickle 가능 타입)     │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+7.2 구현 방식
+--------------------------------------------------------------------------------
+
+  기존 __getvar__ / __setvar__ RMI를 확장:
+
+  신규 API:
+
+    GET  /api/debug/vars/{task_id}
+    응답: {
+      "task_id": "sensor",
+      "class": "SensorTask",
+      "variables": [
+        {"name": "value",     "type": "float", "value": 38.2,    "editable": true},
+        {"name": "threshold", "type": "float", "value": 35.0,    "editable": true},
+        {"name": "count",     "type": "int",   "value": 142,     "editable": true},
+        {"name": "running",   "type": "bool",  "value": true,    "editable": false},
+        {"name": "task_name", "type": "str",   "value": "sensor","editable": false},
+        {"name": "signal",    "type": "object","value": "<_SignalEmitter>","editable": false}
+      ]
+    }
+
+    POST /api/debug/vars/{task_id}
+    요청: {"name": "threshold", "value": 40.0}
+    응답: {"status": "ok", "old": 35.0, "new": 40.0}
+
+  내부 구현:
+    TaskRuntime에 __list_vars__ RMI 핸들러 추가:
+
+    elif m == '__list_vars__':
+        result = []
+        for name in vars(job):
+            if name.startswith('_'):
+                continue
+            val = getattr(job, name)
+            vtype = type(val).__name__
+            editable = isinstance(val, (int, float, str, bool, list, dict))
+            # 시스템 속성은 수정 불가
+            if name in ('running', 'task_name', 'runtime', 'signal'):
+                editable = False
+            try:
+                preview = repr(val) if editable else f"<{vtype}>"
+            except:
+                preview = f"<{vtype}>"
+            result.append({
+                'name': name, 'type': vtype,
+                'value': val if editable else preview,
+                'editable': editable,
+            })
+        res = {'r': result}
+
+
+8. Performance 탭 - 카운터 및 타이밍 상세
+================================================================================
+
+8.1 UI
+--------------------------------------------------------------------------------
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Performance                                          [Auto ● 1s]       │
+  │                                                                         │
+  │  ┌── System Overview ─────────────────────────────────────────────────┐ │
+  │  │ Total RMI:  1,247    Fail: 3 (0.2%)    Avg: 0.65ms               │ │
+  │  │ Total Signal: 2,891  Drop: 42 (1.5%)   Queue Usage: 12/50 avg    │ │
+  │  │ Uptime: 00:42:15     Tasks: 6/6 alive                            │ │
+  │  └───────────────────────────────────────────────────────────────────┘ │
+  │                                                                         │
+  │  ┌── Per-Task Counters ───────────────────────────────────────────────┐ │
+  │  │ Task      │ RMI rx │ RMI tx │ Fail │ Avg ms │ Sig emit│ Sig recv │ │
+  │  │ sensor    │   142  │    89  │   0  │  0.62  │   284   │     0    │ │
+  │  │ dashboard │    89  │   142  │   0  │  0.58  │     0   │   271    │ │
+  │  │ ...       │        │        │      │        │         │          │ │
+  │  └───────────────────────────────────────────────────────────────────┘ │
+  │                                                                         │
+  │  ┌── Method Timing (sensor) ──────────────────────────────────────────┐ │
+  │  │ Method       │ Count │ IPC min/avg/max  │ FUNC min/avg/max        │ │
+  │  │ get_status   │   89  │ 0.28/0.31/0.45  │ 0.01/0.02/0.05         │ │
+  │  │ get_frame    │   53  │ 0.25/0.30/0.52  │ 0.10/0.15/0.31         │ │
+  │  └───────────────────────────────────────────────────────────────────┘ │
+  │                                                                         │
+  │  [Reset Counters]  [Export JSON]                                        │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+8.2 데이터 소스
+--------------------------------------------------------------------------------
+
+  기존 API 활용 (신규 개발 불필요):
+    GET /api/status               → Task별 RMI 카운터
+    GET /api/rmi_methods          → 메서드별 타이밍
+    GET /api/subscriptions        → Signal 통계
+    GET /api/performance/system   → 시스템 종합
+    GET /api/performance/tasks    → Task별 성능
+    GET /api/cpu                  → CPU/Memory
+
+
+9. 구현 계획
+================================================================================
+
+9.1 변경 파일
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────┬──────────────────────────────────┐
+  │ 파일                                  │ 변경 내용                        │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ task_manager.py                      │ __set_debug__, __list_vars__     │
+  │                                      │ RMI 핸들러 추가                  │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ task_signal.py                       │ SignalBroker trace 버퍼 추가     │
+  │                                      │ _trace_enabled, _trace_buffer    │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ task_monitor.py                      │ /api/debug/* 라우트 추가         │
+  │                                      │ debugger 모드 분기               │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ task_monitor_debug_html.py (신규)    │ 디버거 전용 HTML/JS/CSS          │
+  └──────────────────────────────────────┴──────────────────────────────────┘
+
+
+9.2 신규 API 요약
+--------------------------------------------------------------------------------
+
+  ┌────────────────────────────────────┬────────┬──────────────────────────┐
+  │ 엔드포인트                          │ Method │ 설명                     │
+  ├────────────────────────────────────┼────────┼──────────────────────────┤
+  │ /api/debug/flags                   │ GET    │ 전체 debug 플래그 조회   │
+  │ /api/debug/flags                   │ POST   │ debug 플래그 변경        │
+  │ /api/debug/vars/{task_id}          │ GET    │ 변수 목록 조회           │
+  │ /api/debug/vars/{task_id}          │ POST   │ 변수 값 변경             │
+  │ /api/debug/signal/trace            │ GET    │ Signal trace 조회        │
+  │ /api/debug/signal/trace            │ POST   │ trace 시작/중지/초기화   │
+  │ /api/debug/rmi/trace               │ GET    │ RMI trace 조회           │
+  │ /api/debug/rmi/trace               │ POST   │ trace 시작/중지/초기화   │
+  └────────────────────────────────────┴────────┴──────────────────────────┘
+
+
+9.3 구현 순서 (Phase)
+--------------------------------------------------------------------------------
+
+  Phase 1 - 기반 (1일):
+    ● /debug 라우트 및 HTML 프레임
+    ● Tasks 탭 (기존 API 조합)
+    ● Performance 탭 (기존 API 조합)
+
+  Phase 2 - Debug Mode 제어 (1일):
+    ● __set_debug__ / __get_debug__ RMI 핸들러
+    ● /api/debug/flags API
+    ● Debug Mode 탭 UI
+
+  Phase 3 - Variables (1일):
+    ● __list_vars__ RMI 핸들러
+    ● /api/debug/vars API
+    ● Variables 탭 UI (조회 + 수정)
+
+  Phase 4 - Signal Trace (1일):
+    ● SignalBroker trace 버퍼
+    ● /api/debug/signal/trace API
+    ● Signal Trace 탭 UI
+
+  Phase 5 - RMI Trace (1일):
+    ● RmiClient trace 기록
+    ● /api/debug/rmi/trace API
+    ● RMI Trace 탭 UI + 체인 시각화
+
+
+10. RMI 핸들러 추가 상세
+================================================================================
+
+10.1 __set_debug__ / __get_debug__
+--------------------------------------------------------------------------------
+
+  task_manager.py - TaskRuntime._rmi_handler() 에 추가:
+
+    elif m == '__get_debug__':
+        res = {'r': {
+            'signal': self._debug_signal,
+            'method': self._debug_method,
+            'variable': self._debug_variable,
+        }}
+
+    elif m == '__set_debug__':
+        flag, value = a[0], bool(a[1])
+        if flag == 'signal':
+            self._debug_signal = value
+            if self._signal_client:
+                self._signal_client._debug = value
+        elif flag == 'method':
+            self._debug_method = value
+        elif flag == 'variable':
+            self._debug_variable = value
+        res = {'r': True}
+
+
+10.2 __list_vars__
+--------------------------------------------------------------------------------
+
+  task_manager.py - TaskRuntime._rmi_handler() 에 추가:
+
+    elif m == '__list_vars__':
+        _SYS_ATTRS = {'running', 'task_name', 'runtime', 'signal'}
+        result = []
+        for name in sorted(vars(job)):
+            if name.startswith('_'):
+                continue
+            val = getattr(job, name, None)
+            if callable(val):
+                continue
+            vtype = type(val).__name__
+            editable = (
+                isinstance(val, (int, float, str, bool, list, dict))
+                and name not in _SYS_ATTRS
+            )
+            try:
+                preview = val if editable else f"<{vtype}>"
+            except:
+                preview = f"<{vtype}>"
+            result.append({
+                'name': name,
+                'type': vtype,
+                'value': preview,
+                'editable': editable,
+            })
+        res = {'r': result}
+
+
+10.3 SignalBroker trace
+--------------------------------------------------------------------------------
+
+  task_signal.py - SignalBroker 에 추가:
+
+    def __init__(self, ...):
+        ...
+        self._trace_enabled = False
+        self._trace_buffer = []         # list of trace dicts
+        self._trace_lock = threading.Lock()
+
+    def set_trace(self, enabled: bool):
+        self._trace_enabled = enabled
+        if not enabled:
+            with self._trace_lock:
+                self._trace_buffer.clear()
+
+    def get_trace(self, limit: int = 100) -> list:
+        with self._trace_lock:
+            return self._trace_buffer[-limit:]
+
+    # _dispatch() 내 emit 처리 부분에 추가:
+    if self._trace_enabled:
+        delivered, dropped = [], []
+        for tid in subs:
+            q = self._queues.get(tid)
+            if q is not None and q.full():
+                dropped.append(tid)
+            else:
+                delivered.append(tid)
+        with self._trace_lock:
+            self._trace_buffer.append({
+                'ts': time.time(),
+                'signal': name,
+                'source': source,
+                'dest': delivered,
+                'dropped': dropped,
+                'data_preview': repr(data)[:200],
+            })
+            if len(self._trace_buffer) > 500:
+                self._trace_buffer = self._trace_buffer[-500:]
+
+
+================================================================================
+  End of Document - 1300.웹디버거
+================================================================================

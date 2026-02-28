@@ -1,0 +1,27 @@
+{
+  "app_info": {
+    "name": "ExampleApp",
+    "version": "1.0.0",
+    "id": "example_001"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    },
+    "_log/log_task": {
+      "console_level": "INFO",
+      "file_level": "DEBUG"
+    }
+  },
+  "task_config": {
+    "process1/aaa": {
+      "nextTask": "client:process2",
+      "counter": 120000
+    },
+    "process2/aaa": {
+      "nextTask": "client:process1",
+      "counter": 120000
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "app_info": {
+    "name": "dynamic_task_example",
+    "id": "dynamic-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "rmi": {
+      "timeout": 3.0
+    },
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "manager_task/ManagerTask": {
+      "@import": "example.ex150_dynamic_task.tasks"
+    }
+  }
+}

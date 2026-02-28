@@ -1,0 +1,28 @@
+{
+  "app_info": {
+    "name": "ex170_complex_sim",
+    "version": "2.1.0",
+    "id": "complex_demo"
+  },
+  "platform_config": {
+    "monitor_port": 7000,
+    "log_level": "INFO"
+  },
+  "task_config": {
+    "monitor/TaskMonitor": {
+      "@import": "py_alaska.task_monitor",
+      "port": 7000
+    },
+    "sensor_node/SensorTask": {
+      "@import": "tasks",
+      "sensor_count": 5
+    },
+    "analytics_node/AnalyticsTask": {
+      "@import": "tasks"
+    },
+    "controller_node/ControllerTask": {
+      "@import": "tasks",
+      "sensor_proxy": "task:sensor_node"
+    }
+  }
+}

@@ -1,0 +1,370 @@
+===========================================
+SmBlock 공유 메모리 예제 설계서
+===========================================
+예제명: sm_1228
+버전: 1.0
+작성일: 2026-02-01
+
+1. 개요
+=======
+
+1.1 목적
+--------
+SmBlock(공유 메모리 블록 풀)을 활용한 프로세스 간 이미지 데이터 교환 예제.
+생산자(Producer)가 이미지를 공유 메모리에 할당하고,
+소비자(Consumer)가 이를 소모하는 Producer-Consumer 패턴 구현.
+
+1.2 구성 요소
+-------------
+┌─────────────────────────────────────────────────────────────────┐
+│                    SmBlock 예제 시스템                           │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐         ┌─────────────────┐               │
+│  │    Producer     │         │    Consumer     │               │
+│  │  (task_producer)│         │  (task_consumer)│               │
+│  │                 │         │                 │               │
+│  │  - 이미지 생성   │         │  - 이미지 소비   │               │
+│  │  - malloc()     │         │  - get() + mfree()│              │
+│  └────────┬────────┘         └────────┬────────┘               │
+│           │                           │                         │
+│           │      ┌───────────┐        │                         │
+│           └─────►│  SmBlock  │◄───────┘                         │
+│                  │ (sm_1228) │                                  │
+│                  │           │                                  │
+│                  │ 공유메모리 │                                  │
+│                  │ 이미지 풀  │                                  │
+│                  └───────────┘                                  │
+│                        │                                        │
+│              ┌─────────┴─────────┐                              │
+│              │  Index Queue      │                              │
+│              │ (할당된 인덱스 전달)│                              │
+│              └───────────────────┘                              │
+└─────────────────────────────────────────────────────────────────┘
+
+
+2. 설정 파일 (config.json)
+==========================
+
+2.1 구조
+--------
+{
+    "app_info": {
+        "name": "sm_1228",
+        "id": "smblock-example",
+        "version": "1.0.0"
+    },
+    "task_config": {
+        "sm_1228/_smblock": {
+            "shape": "(480,640,3)x100"
+        },
+        "producer/task_producer": {
+            "smblock": "smblock:sm_1228",
+            "delay": 0.1
+        },
+        "consumer/task_consumer": {
+            "smblock": "smblock:sm_1228",
+            "delay": 0.05
+        },
+        "_monitor": {
+            "port": 7100,
+            "exit_hook": true
+        }
+    }
+}
+
+2.2 설정 항목 설명
+------------------
+┌────────────────────────────┬───────────────────────────────────────────┐
+│ 항목                        │ 설명                                       │
+├────────────────────────────┼───────────────────────────────────────────┤
+│ sm_1228/_smblock           │ SmBlock 공유 메모리 정의                    │
+│   - shape                  │ "(H,W,C)xN" 형식, 이미지 크기 x 최대 블록수 │
+├────────────────────────────┼───────────────────────────────────────────┤
+│ producer/task_producer     │ 생산자 TASK 설정                           │
+│   - smblock                │ "smblock:<name>" 형식으로 SmBlock 참조     │
+│   - delay                  │ 이미지 생성 간격 (초)                       │
+├────────────────────────────┼───────────────────────────────────────────┤
+│ consumer/task_consumer     │ 소비자 TASK 설정                           │
+│   - smblock                │ "smblock:<name>" 형식으로 SmBlock 참조     │
+│   - delay                  │ 이미지 소비 간격 (초)                       │
+└────────────────────────────┴───────────────────────────────────────────┘
+
+
+3. 클래스 설계
+==============
+
+3.1 SmBlock (공유 메모리 블록 풀)
+---------------------------------
+┌─────────────────────────────────────────────────────────────────┐
+│ SmBlock                                                         │
+├─────────────────────────────────────────────────────────────────┤
+│ - _name: str                # 공유 메모리 이름 (시스템 전역)     │
+│ - _shape: Tuple[int,...]    # 이미지 형태 (H, W, C)             │
+│ - _maxsize: int             # 최대 블록 수                      │
+│ - _lock: Lock               # 동시성 제어용 Lock                │
+├─────────────────────────────────────────────────────────────────┤
+│ + malloc(image) -> int      # 이미지 할당, 인덱스 반환 (O(1))   │
+│ + mfree(index)              # 블록 해제 (O(1))                  │
+│ + get(index) -> ndarray     # 이미지 데이터 조회                │
+│ + count() -> int            # 사용 가능한 블록 수               │
+│ + size() -> int             # 전체 블록 수                      │
+│ + close()                   # 공유 메모리 정리                  │
+└─────────────────────────────────────────────────────────────────┘
+
+메모리 레이아웃:
+┌─────────────────┬─────────────────────────────┬───────────┐
+│  Index Buffer   │       Data Buffer           │ Free Head │
+│  int16[N]       │   uint8[N][H][W][C]         │  int16    │
+│  (2*N bytes)    │   (N*H*W*C bytes)           │ (2 bytes) │
+└─────────────────┴─────────────────────────────┴───────────┘
+
+3.2 ProducerJob (생산자)
+------------------------
+┌─────────────────────────────────────────────────────────────────┐
+│ @rmi_class(name="task_producer", mode="process")                │
+│ class ProducerJob                                               │
+├─────────────────────────────────────────────────────────────────┤
+│ - task: TaskWorker          # TASK 워커 참조 (자동 주입)        │
+│ - smblock: SmBlock          # 공유 메모리 블록 풀               │
+│ - index_queue: Queue        # Consumer에게 인덱스 전달용        │
+│ - delay: float              # 생성 간격                         │
+├─────────────────────────────────────────────────────────────────┤
+│ + task_loop()               # 메인 루프                         │
+│ + produce_image() -> ndarray # 이미지 생성                      │
+└─────────────────────────────────────────────────────────────────┘
+
+task_loop 로직:
+    while not self.runtime.should_stop():
+        1. produce_image()로 이미지 생성
+        2. smblock.malloc(image)로 공유 메모리에 할당
+        3. 할당된 인덱스를 index_queue에 넣기
+        4. delay만큼 대기
+
+3.3 ConsumerJob (소비자)
+------------------------
+┌─────────────────────────────────────────────────────────────────┐
+│ @rmi_class(name="task_consumer", mode="process")                │
+│ class ConsumerJob                                               │
+├─────────────────────────────────────────────────────────────────┤
+│ - task: TaskWorker          # TASK 워커 참조 (자동 주입)        │
+│ - smblock: SmBlock          # 공유 메모리 블록 풀               │
+│ - index_queue: Queue        # Producer로부터 인덱스 수신용      │
+│ - delay: float              # 소비 간격                         │
+├─────────────────────────────────────────────────────────────────┤
+│ + task_loop()               # 메인 루프                         │
+│ + consume_image(image)      # 이미지 처리                       │
+└─────────────────────────────────────────────────────────────────┘
+
+task_loop 로직:
+    while not self.runtime.should_stop():
+        1. index_queue에서 인덱스 가져오기 (timeout 적용)
+        2. smblock.get(index)로 이미지 데이터 조회
+        3. consume_image(image)로 처리
+        4. smblock.mfree(index)로 블록 해제
+        5. delay만큼 대기
+
+
+4. 데이터 흐름
+==============
+
+4.1 시퀀스 다이어그램
+---------------------
+Producer         SmBlock          Queue           Consumer
+   │               │               │                 │
+   │ 이미지 생성    │               │                 │
+   │───────────────│               │                 │
+   │               │               │                 │
+   │ malloc(image) │               │                 │
+   │──────────────>│               │                 │
+   │     index     │               │                 │
+   │<──────────────│               │                 │
+   │               │               │                 │
+   │               │  put(index)   │                 │
+   │──────────────────────────────>│                 │
+   │               │               │                 │
+   │               │               │  get()          │
+   │               │               │<────────────────│
+   │               │               │  index          │
+   │               │               │────────────────>│
+   │               │               │                 │
+   │               │   get(index)  │                 │
+   │               │<─────────────────────────────────│
+   │               │     image     │                 │
+   │               │──────────────────────────────────>│
+   │               │               │                 │
+   │               │  mfree(index) │                 │
+   │               │<─────────────────────────────────│
+   │               │               │                 │
+
+4.2 메모리 상태 변화
+--------------------
+초기 상태 (maxsize=5):
+  Index Buffer: [1, 2, 3, 4, -1]  (Free List: 0→1→2→3→4)
+  Free Head: 0
+  사용 가능: 5개
+
+Producer가 3개 할당 후:
+  Index Buffer: [-1, -1, -1, 4, -1]  (Free List: 3→4)
+  Free Head: 3
+  사용 가능: 2개
+
+Consumer가 1개 해제 후 (index=1):
+  Index Buffer: [-1, 3, -1, 4, -1]  (Free List: 1→3→4)
+  Free Head: 1
+  사용 가능: 3개
+
+
+5. 파일 구조
+============
+
+example/ex110_smblock/
+├── context.txt           # 예제 설명
+├── 설계서.txt            # 본 문서
+├── config.json           # 설정 파일
+├── task_producer.py      # Producer Job 클래스
+├── task_consumer.py      # Consumer Job 클래스
+└── main.py               # 실행 진입점
+
+
+6. 사용 예제
+============
+
+6.1 task_producer.py
+--------------------
+from src import rmi_class
+import numpy as np
+import time
+
+@rmi_class(name="task_producer", mode="process", restart=True)
+class ProducerJob:
+    def __init__(self):
+        self.runtime = None
+        self.smblock = None
+        self.consumer = None  # RmiClient로 Consumer 참조
+        self.delay = 0.1
+        self.count = 0
+
+    def task_loop(self):
+        while not self.runtime.should_stop():
+            # 테스트용 이미지 생성
+            image = np.random.randint(0, 255, self.smblock.shape, dtype=np.uint8)
+
+            # 공유 메모리에 할당
+            index = self.smblock.malloc(image)
+            if index >= 0:
+                # Consumer에게 인덱스 전달 (RMI 호출)
+                self.consumer.on_image(index)
+                self.count += 1
+                print(f"[Producer] Produced #{self.count}, index={index}")
+            else:
+                print("[Producer] Pool full, waiting...")
+
+            time.sleep(self.delay)
+
+6.2 task_consumer.py
+--------------------
+from src import rmi_class
+import time
+
+@rmi_class(name="task_consumer", mode="process", restart=True)
+class ConsumerJob:
+    def __init__(self):
+        self.runtime = None
+        self.smblock = None
+        self.delay = 0.05
+        self.pending_indices = []
+        self.count = 0
+
+    def on_image(self, index):
+        """Producer로부터 호출됨 (RMI)"""
+        self.pending_indices.append(index)
+        return True
+
+    def task_loop(self):
+        while not self.runtime.should_stop():
+            if self.pending_indices:
+                index = self.pending_indices.pop(0)
+
+                # 공유 메모리에서 이미지 조회
+                image = self.smblock.get(index)
+
+                # 이미지 처리 (예: 평균값 계산)
+                avg = image.mean()
+                self.count += 1
+                print(f"[Consumer] Consumed #{self.count}, index={index}, avg={avg:.2f}")
+
+                # 블록 해제
+                self.smblock.mfree(index)
+
+            time.sleep(self.delay)
+
+6.3 config.json
+---------------
+{
+    "app_info": {
+        "name": "sm_1228",
+        "id": "smblock-example",
+        "version": "1.0.0"
+    },
+    "task_config": {
+        "sm_1228/_smblock": {
+            "shape": "(480,640,3)x100"
+        },
+        "producer/task_producer": {
+            "smblock": "smblock:sm_1228",
+            "consumer": "task:consumer",
+            "delay": 0.1
+        },
+        "consumer/task_consumer": {
+            "smblock": "smblock:sm_1228",
+            "delay": 0.05
+        },
+        "_monitor": {
+            "port": 7100,
+            "exit_hook": true
+        }
+    }
+}
+
+6.4 main.py
+-----------
+from src import TaskManager, gconfig
+import task_producer  # rmi_class 등록
+import task_consumer  # rmi_class 등록
+
+def main():
+    gconfig.load("example/ex110_smblock/config.json").dump()
+
+    with TaskManager(gconfig) as manager:
+        manager.start_all()
+        # 웹 모니터링: http://localhost:7100
+        input("Press Enter to stop...")
+
+if __name__ == "__main__":
+    main()
+
+
+7. 시험 항목
+============
+
+┌────────┬──────────────────────────┬────────────────────────────────────┐
+│ TC번호 │ 테스트 항목               │ 테스트 내용                         │
+├────────┼──────────────────────────┼────────────────────────────────────┤
+│ SM-001 │ SmBlock 생성              │ 공유 메모리 정상 생성 확인          │
+│ SM-002 │ 블록 할당                 │ malloc() 정상 동작, 인덱스 반환     │
+│ SM-003 │ 블록 해제                 │ mfree() 정상 동작, 재사용 가능      │
+│ SM-004 │ 풀 가득 참                │ malloc() -1 반환                   │
+│ SM-005 │ Producer-Consumer 통신   │ 이미지 데이터 정상 전달              │
+│ SM-006 │ 다중 프로세스 접근        │ Lock을 통한 동시성 제어             │
+│ SM-007 │ 장시간 실행 안정성        │ 메모리 누수 없이 안정 동작          │
+└────────┴──────────────────────────┴────────────────────────────────────┘
+
+
+8. 문서 이력
+============
+
+┌────────────┬────────────┬─────────────────────────────────────┐
+│ 버전       │ 날짜       │ 변경 내용                           │
+├────────────┼────────────┼─────────────────────────────────────┤
+│ 1.0        │ 2026-02-01 │ 최초 작성                           │
+└────────────┴────────────┴─────────────────────────────────────┘

@@ -1,0 +1,38 @@
+{
+  "app_info": {
+    "name": "selective_signal_example",
+    "id": "node-selective-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_monitor": {
+      "port": 7000,
+      "exit_hook": true
+    }
+  },
+  "task_config": {
+    "source/SourceTask": {
+      "@import": "example.ex050_select_signal.tasks",
+      "interval": 0.5
+    },
+    "worker_a/WorkerTask": {
+      "@import": "example.ex050_select_signal.tasks",
+      "job_type": "a"
+    },
+    "worker_b/WorkerTask": {
+      "@import": "example.ex050_select_signal.tasks",
+      "job_type": "b"
+    },
+    "worker_c/WorkerTask": {
+      "@import": "example.ex050_select_signal.tasks",
+      "job_type": "c"
+    },
+    "worker_d/WorkerTask": {
+      "@import": "example.ex050_select_signal.tasks",
+      "job_type": "d"
+    },
+    "dest/DestTask": {
+      "@import": "example.ex050_select_signal.dest_ui"
+    }
+  }
+}

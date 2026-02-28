@@ -1,0 +1,7 @@
+
+smblock을 시험하는 예제이다.
+이름:sm_1228
+
+- config.json생성
+- task_proceduer.py, consumer 생성
+- 생산자가 메모리를 만들어 consumer가 소모하는 형태

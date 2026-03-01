@@ -38,7 +38,7 @@
   │           - job 인스턴스 생성                                             │
   │           - SignalClient 시작 + 자동 구독                                │
   │           - _inject_dependencies() → RmiClient/SmBlock 주입              │
-  │           - _rmi_handler 스레드 시작                                     │
+  │           - InvokeDispenser 스레드 시작                                     │
   │           - _run_main_loop() 실행                                       │
   │    8. Monitor 시작                                                      │
   └──────────────────────────────────────────────────────────────────────────┘
@@ -224,7 +224,7 @@
 
         ti.request_q.put({'m': '__removed__'})
 
-    _rmi_handler가 종료되면서 대기 중인 response_q에 에러 응답 push
+    InvokeDispenser가 종료되면서 대기 중인 response_q에 에러 응답 push
 
     장점: 기존 RmiClient 수정 불필요
     단점: 이미 put된 요청에 대해서만 처리 가능
@@ -270,7 +270,7 @@
 
   해결:
     Process 모드 Task는 기존과 동일하게 request_q를 통해 RMI 호출.
-    _rmi_handler에서 caller_id 기반으로 response 라우팅.
+    InvokeDispenser에서 caller_id 기반으로 response 라우팅.
     tasks dict가 아닌 Queue 참조만 필요하므로, 동적 추가된 Task의
     Queue를 기존 Process에 전달할 방법이 필요.
 
@@ -389,7 +389,7 @@
     │                  │                    │ SignalClient.start()│
     │                  │                    │ _auto_subscribe()  │
     │                  │                    │ _inject_deps()     │
-    │                  │                    │ _rmi_handler.start()│
+    │                  │                    │ InvokeDispenser.start()│
     │                  │  ready_event.set() │                    │
     │                  │<───────────────────│                    │
     │  return True     │                    │ _run_main_loop()   │
@@ -447,9 +447,9 @@
   │  ─────────────────────────────────────────────────────────────────────  │
   │                                                                        │
   │  [RMI 핫 경로 - Worker 내부]                                            │
-  │  _rmi_handler              매 RMI 호출     X (불필요)   영향 없음       │
-  │   └ tasks.get(caller_id)   ~1600 TPS       X            영향 없음       │
-  │   └ caller_ti.response_q   ~1600 TPS       X            영향 없음       │
+  │  InvokeDispenser              매 RMI 호출     X (불필요)   영향 없음       │
+  │   └ tasks.get(caller_id)   ~18000 TPS      X            영향 없음       │
+  │   └ caller_ti.response_q   ~18000 TPS      X            영향 없음       │
   │  _create_rmi_client        Task 시작 1회   X            영향 없음       │
   │  _inject_dependencies      Task 시작 1회   X            영향 없음       │
   │                                                                        │
@@ -474,7 +474,7 @@
 
   이유:
     - TaskRuntime(Worker)은 시작 시 self.tasks 참조를 로컬 변수로 보유
-    - _rmi_handler의 tasks.get(caller_id)는 Worker 로컬 참조 → lock 불필요
+    - InvokeDispenser의 tasks.get(caller_id)는 Worker 로컬 참조 → lock 불필요
     - Signal의 _queues, _sub_snapshot은 SignalBroker 내부 관리 → lock 불필요
     - lock이 필요한 경로는 TaskManager 외부 API (get_status, get_client 등)뿐
     - 이들은 호출 빈도가 낮아 (1초/회 이하) 경합 발생 확률 ≈ 0
@@ -490,8 +490,8 @@
     - dict 크기 100개: ~0.04μs
     - dict 크기 1000개: ~0.05μs
 
-  현재 RMI 1건 = ~600μs (Queue put + get + 처리)
-  추가 오버헤드 = ~0.04μs = 전체의 0.007%
+  현재 RMI 1건 = ~50μs (v2.6 SmRingBuffer + Kernel Wait)
+  추가 오버헤드 = ~0.04μs = 전체의 0.08%
 
   결론: 무시 가능
 
@@ -537,7 +537,7 @@
   stop_flag = True                  ~10μs        mgr.Value 쓰기
   signal_broker.unregister()        ~10μs        dict delete + snapshot 갱신
   worker.join(timeout)              ~2ms         run_main_loop 종료 대기
-    └ _rmi_handler 종료 대기         ~1ms         Queue.get timeout 1회분
+    └ InvokeDispenser 종료 대기         ~1ms         Queue.get timeout 1회분
   Queue drain                       ~100μs       잔여 메시지 소비
   del _tasks[tid] (with lock)       ~1μs         dict delete + lock
   ──────────────────────────────────────────────────────────────────────
@@ -551,12 +551,12 @@
   ┌──────────────────────────────────────────────────────────────────────┐
   │  항목                    현재 성능      동적 생성 후    차이          │
   │  ────────────────────────────────────────────────────────────────── │
-  │  IPC ping 왕복           0.59ms        0.59ms         0% (무변경)  │
-  │  IPC add 연산            0.58ms        0.58ms         0% (무변경)  │
-  │  중첩호출 1단             0.99ms        0.99ms         0% (무변경)  │
-  │  중첩호출 2단             1.14ms        1.14ms         0% (무변경)  │
-  │  Signal emit             0.001ms       0.001ms        0% (무변경)  │
-  │  Signal broadcast 5구독  0.013ms       0.013ms        0% (무변경)  │
+  │  IPC ping 왕복           0.056ms       0.056ms        0% (무변경)  │
+  │  IPC add 연산            0.047ms       0.047ms        0% (무변경)  │
+  │  중첩호출 1단             0.104ms       0.104ms        0% (무변경)  │
+  │  중첩호출 2단             0.141ms       0.141ms        0% (무변경)  │
+  │  Signal emit             0.006ms       0.006ms        0% (무변경)  │
+  │  Signal broadcast 5구독  0.165ms       0.165ms        0% (무변경)  │
   │  Monitor get_status()    ~0.5ms        ~0.503ms       +0.5% (스냅샷)│
   │  get_client()            ~0.1ms        ~0.1003ms      +0.03%       │
   │  ──────────────────────────────────────────────────────────────────│
@@ -571,7 +571,7 @@
   - 동적 생성/삭제: 3ms/회 (1회성 작업, 빈도 극히 낮음)
 
   _task_lock은 핫 경로를 보호하지 않으므로,
-  기존 TPS(1,600+)와 Signal 처리량(900,000+)에 영향 없음.
+  기존 TPS(18,000+)와 Signal 처리량(170,000+)에 영향 없음.
 
 
 9. 제약 사항 (Phase 1)

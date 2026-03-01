@@ -1,10 +1,127 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  ALASKA v2.0 - 수정이력                                                      ║
+║  ALASKA - 수정이력                                                           ║
 ║  Modification History                                                        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Version : 2.2.0                                                             ║
-║  Date    : 2026-02-18                                                        ║
+║  Version : 2.6.0                                                             ║
+║  Date    : 2026-03-01                                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+================================================================================
+[v2.6.0] 2026-03-01
+================================================================================
+
+■ InvokeDispenser CPU 절감 최적화 (4대 최적화)
+
+1. RMI 응답 대기 — Spin-wait → Kernel Event (task_manager.py)
+   - 변경 전: RmiClient._call()이 response_q.read()를 폴링 (CPU 1코어 점유)
+   - 변경 후: response_event.wait(timeout)로 커널 대기 (CPU 0%)
+   - 추가 자원: 태스크당 response_event (SmKernelEvent)
+   - InvokeDispenser: 응답 기록 후 caller_ti.response_event.set()
+   - 수정 파일: task_manager.py (TaskInfo, RmiClient, InvokeDispenser, TaskRuntime)
+
+2. Signal Direct Emit — SEND 위임 제거 (task_signal.py)
+   - 변경 전: emit() → send_queue → InvokeDispenser ① SEND → broker.emit()
+   - 변경 후: emit() → broker.emit() (caller 스레드에서 직접)
+   - SEND 단계 삭제. send_queue 제거. 디스패처 루프 4단계 → 3단계
+   - 수정 파일: task_signal.py (SignalClient), task_manager.py (InvokeDispenser)
+
+3. 조건부 notify — is_sleeping 플래그 (task_manager.py, task_signal.py)
+   - 변경 전: 모든 시그널/RMI 전송마다 notify_event.set() (커널 syscall)
+   - 변경 후: is_sleeping == 1일 때만 set() 호출 (메모리 읽기 ~50ns)
+   - 추가 자원: 태스크당 is_sleeping (SmValue 'B', 1바이트)
+   - 수정 파일: task_manager.py, task_signal.py (SignalBroker._notify_task)
+
+4. 시간 호출 간소화 (task_manager.py)
+   - 변경 전: RECV burst guard에 perf_counter() 호출 (최대 38회/cycle)
+   - 변경 후: 카운트 기반 burst guard (50건/cycle, 시간 호출 0회)
+
+■ 성능 검증 중 발견·수정 사항
+
+   (a) get_client() — notify_event 미전달 → 외부 RmiClient에 notify_event 전달 추가
+   (b) restart_task() — response_event pickle 누락 → clean_ti.response_event = None 추가
+   (c) 자식 프로세스 — 타 태스크 response_event 미재연결 → 모든 태스크 재연결
+   (d) _sm_registry_name None 방어 → (... or '') 방어 코드 추가
+
+■ 성능 개선 결과 (v2.0 대비)
+
+   - IPC ping: 0.605ms → 0.056ms (11x 빠름)
+   - 중첩호출 1단: 1.046ms → 0.104ms (10x 빠름)
+   - Signal emit→recv: 0.238ms → 0.115ms (2x 빠름)
+   - 42개 성능 시험 전수 통과
+
+■ 테스트 보고서: tests/REPORT_PERFORMANCE.txt
+■ 설계서: doc/2016.InvokeDispenser설계.txt (section 11)
+
+   전체 테스트 결과: 130 passed, 0 failed (2026-03-01 기준)
+   (88 기능 + 42 성능)
+
+
+================================================================================
+[v2.5.0] 2026-02-28
+================================================================================
+
+■ InvokeDispenser — IPC/Signal 통합 단일 스레드 디스패처
+
+1. InvokeDispenser 도입 (task_manager.py)
+   - 기존 _rmi_handler(RMI 전용 스레드) + SignalClient._recv_loop(시그널 수신 스레드)
+     → InvokeDispenser 단일 스레드로 통합
+   - Signal 우선 → IPC 후순 → Kernel Wait 3단계 루프
+   - 태스크당 스레드 2개 (Dispenser + Main) — 기존 3개에서 절감
+   - Deadlock-Free: chain 기반 순환 호출 감지, Self-call 감지
+
+2. SmKernelEvent 기반 커널 대기 (sm_kernel_event.py)
+   - Win32 CreateEventW/WaitForSingleObject 래퍼
+   - CPU 0% 대기, 20~50μs 반응 속도
+   - notify_event: 태스크당 1개, 모든 Signal/RMI 수신 통지 공유
+
+3. SignalClient headless 모드 (task_signal.py)
+   - InvokeDispenser가 시그널 수신을 담당하므로 _recv_loop 스레드 미시작
+   - emit() → send_queue 위임 (InvokeDispenser ① SEND 단계에서 처리)
+
+4. PriorityScheduler — QoS 기반 스케줄링 (task_manager.py)
+   - Weighted Fair Queuing + Starvation Guard
+   - CYCLE_QUOTAS = [20, 10, 5, 2, 1] (P1~P5)
+
+■ 설계서: doc/2016.InvokeDispenser설계.txt
+
+   전체 테스트 결과: 88 passed, 0 failed
+
+
+================================================================================
+[v2.3.0] 2026-02-25
+================================================================================
+
+■ Signal QoS 및 SmInfra 통합
+
+1. QoS 5단계 우선순위 (task_signal.py)
+   - P1(CRITICAL), P2(REALTIME), P3(NORMAL), P4(LOW), P5(BACKGROUND)
+   - Deadline 위반 감지 및 자동 폐기
+   - QoS 프로필: 딕셔너리 또는 문자열로 지정
+
+2. SmSignalRegistry — 공유 메모리 구독 레지스트리 (sm_signal_registry.py)
+   - Manager.dict IPC 프록시 제거 → SharedMemory 비트맵 직접 접근
+   - O(1) 구독자 조회 (sub_mask 비트 연산)
+   - emit() hot-path에서 Manager IPC 호출 0회
+
+3. SmSignalQueue — MPSC 시그널 큐 (sm_infra/sm_queue.py)
+   - SmRingBuffer + Named Mutex (WinMutex)
+   - 다중 Producer 안전, pickle 기반 메시지 전달
+
+4. SmSignalStats — 실시간 통계소 (sm_signal_stats.py)
+   - 시그널별 Transit/Proc Latency EMA 집계
+   - 웹 디버거 실시간 차트 연동
+
+5. SmBlackBox — 시그널 체인 세션 감시 (sm_blackbox.py)
+   - 체인(A→B→C) 완료 보장, 타임아웃 시 경보 발생
+
+6. Watchdog 자가 치유 (task_manager.py)
+   - 하트비트 기반 태스크 정지/좀비 감지
+   - 자동 재시작 (restart=True 설정 시)
+
+■ 설계서: doc/2013.시그널QOS기능V2.txt, doc/2014.SmInfra설계.txt
+
+   전체 테스트 결과: 88 passed, 0 failed
 
 
 ================================================================================

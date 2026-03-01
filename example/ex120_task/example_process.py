@@ -23,8 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import time
 import os
-from src import TaskManager
-from src import gconfig
+from py_alaska import TaskManager, gconfig
 
 import example.task_aaa as task_aaa  # noqa: F401 - rmi_class 등록용
 
@@ -45,4 +44,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

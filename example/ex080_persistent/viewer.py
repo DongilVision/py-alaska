@@ -5,7 +5,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QSlider, QHBoxLayout
 from PySide6.QtCore import Qt, QObject
 from PySide6.QtGui import QFont
 from py_alaska import task, gconfig
-from py_alaska.qt import ui_thread
+from py_alaska import ui_thread
 
 _window = None
 

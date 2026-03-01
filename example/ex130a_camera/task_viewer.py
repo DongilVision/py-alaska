@@ -17,7 +17,7 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "src"))
 
 from py_alaska import task
-from py_alaska.qt import ui_thread
+from py_alaska import ui_thread
 import numpy as np
 import time
 

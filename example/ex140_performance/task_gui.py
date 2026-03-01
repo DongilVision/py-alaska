@@ -12,8 +12,8 @@ from datetime import datetime
 from typing import Dict, List, Any
 from threading import Thread
 
-from py_alaska import task, rmi_signal
-from py_alaska.qt import ui_thread
+from py_alaska import task
+from py_alaska import ui_thread
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -24,7 +24,7 @@ from PySide6.QtCore import Qt, Signal as QtSignal
 from PySide6.QtGui import QColor, QFont
 
 
-@task(name="PerformanceGui")
+@task(name="PerformanceGui", signal_subscribe=["awake"])
 class PerformanceGui(QWidget):
     """Performance Test GUI Widget"""
 
@@ -399,7 +399,6 @@ class PerformanceGui(QWidget):
             "count": n
         }
 
-    @rmi_signal("awake")
     def on_awake(self, signal):
         """Receive signal response"""
         data = signal.data

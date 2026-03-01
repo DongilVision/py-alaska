@@ -10,6 +10,6 @@ sys.path.insert(0, str(ROOT / "src"))
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    from py_alaska.qt import AlaskaApp
+    from py_alaska import AlaskaApp
 
     AlaskaApp.run(Path(__file__).parent / "config.json", main_task="ui")

@@ -3,7 +3,7 @@
 =================================
 목적: @property getter/setter가 process/thread 모드 프록시에서 올바르게 동작하는지 검증
   - process 모드 → RmiClient / _RmiProxy
-  - thread  모드 → RmiClient (외부) / DirectClient (내부) / _DirectProxy
+  - thread  모드 → DirectClient / _DirectProxy
 """
 import sys
 import time
@@ -14,23 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from py_alaska import TaskManager, gconfig, RmiClient
-
-
-def create_rmi_client(manager, task_id: str) -> RmiClient:
-    """외부에서 RmiClient 생성 (test_ipc 패턴)"""
-    ti = manager._tasks.get(task_id)
-    response_q = manager._mgr.Queue()
-    return RmiClient(task_id, ti.request_q, response_q)
-
-
-def create_direct_client(manager, task_id: str):
-    """Thread 모드 전용 DirectClient 생성"""
-    from py_alaska import DirectClient
-    ti = manager._tasks.get(task_id)
-    def job_getter():
-        return ti.job_instance
-    return DirectClient(task_id, job_getter)
+from py_alaska import TaskManager, gconfig
 
 
 def run_tests(label, target):
@@ -137,16 +121,10 @@ if __name__ == "__main__":
     total_fail = 0
 
     # 1. Process 모드 (RmiClient → _RmiProxy)
-    proc_client = create_rmi_client(manager, "device_p")
-    total_fail += run_tests("PROCESS", proc_client)
+    total_fail += run_tests("PROCESS", manager.get_client("device_p"))
 
-    # 2. Thread 모드 - RmiClient 경유 (외부 호출)
-    thrd_rmi = create_rmi_client(manager, "device_t")
-    total_fail += run_tests("THRD_RMI", thrd_rmi)
-
-    # 3. Thread 모드 - DirectClient 경유 (내부 호출 시뮬레이션)
-    thrd_direct = create_direct_client(manager, "device_t")
-    total_fail += run_tests("THRD_DIR", thrd_direct)
+    # 2. Thread 모드 (DirectClient → _DirectProxy)
+    total_fail += run_tests("THREAD", manager.get_client("device_t"))
 
     print(f"\n{'='*60}")
     if total_fail == 0:

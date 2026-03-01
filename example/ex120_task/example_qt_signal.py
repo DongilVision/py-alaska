@@ -2,11 +2,11 @@
 """
 ALASKA v2.0 - Qt Signal 예제
 ============================
-main_thread=True, @rmi_signal, signal_bridge, self.signal 체인 문법 데모
+main_thread=True, signal_subscribe+on_, signal_bridge, self.signal 체인 문법 데모
 
 주요 기능:
 1. main_thread=True: 메인 스레드에서 Task 인스턴스 생성 (QObject 지원, 자동 감지)
-2. @rmi_signal: RMI Signal 핸들러 데코레이터 (수동 emit)
+2. signal_subscribe + on_ 메서드: 시그널 자동 구독 및 핸들러 매핑
 3. signal_bridge: @task 파라미터로 RMI Signal → Qt Signal 자동 매핑
 4. self.signal.xxx.emit(): 체인 문법으로 Signal 발신
 """
@@ -20,19 +20,21 @@ sys.path.insert(0, str(ROOT))
 import time
 from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout
 from PySide6.QtCore import Signal, QObject
-from src import TaskManager, gconfig, task, rmi_run, rmi_signal
+from py_alaska import TaskManager, gconfig, task, rmi_run
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  방법 1: main_thread=True + @rmi_signal (수동 emit)
+#  방법 1: main_thread=True + signal_subscribe + on_ 메서드
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@task(name="sensor_ui", mode="thread", main_thread=True)
+@task(name="sensor_ui", mode="thread", main_thread=True,
+      signal_subscribe=["sensor.temperature", "sensor.humidity", "sensor.alert"])
 class SensorUI(QObject):
     """센서 UI Task - main_thread=True로 QObject 직접 사용
 
     main_thread=True 옵션으로 인스턴스가 메인 스레드에서 생성되어
     QObject를 상속하고 Qt Signal을 직접 emit할 수 있습니다.
+    signal_subscribe + on_ 메서드 네이밍으로 자동 연결됩니다.
     """
 
     # Qt Signals
@@ -45,20 +47,17 @@ class SensorUI(QObject):
         self.temperature = 25.0
         self.humidity = 50.0
 
-    # @rmi_signal: RMI Signal 수신 시 Qt Signal로 변환
-    @rmi_signal("sensor.temperature")
-    def _on_temperature(self, signal):
+    # on_ 메서드: signal_subscribe에 등록된 시그널 자동 매핑
+    def on_sensor_temperature(self, signal):
         """RMI Signal 수신 → Qt Signal emit"""
         self.temperature = signal.data
         self.temperature_changed.emit(signal.data)
 
-    @rmi_signal("sensor.humidity")
-    def _on_humidity(self, signal):
+    def on_sensor_humidity(self, signal):
         self.humidity = signal.data
         self.humidity_changed.emit(signal.data)
 
-    @rmi_signal("sensor.alert")
-    def _on_alert(self, signal):
+    def on_sensor_alert(self, signal):
         self.alert_triggered.emit(signal.data)
 
     @rmi_run
@@ -83,7 +82,6 @@ class DeviceUI(QObject):
     """디바이스 UI Task - signal_bridge 파라미터로 자동 매핑
 
     @task의 signal_bridge 파라미터로 RMI Signal → Qt Signal을 선언적으로 매핑합니다.
-    @rmi_signal 데코레이터 없이 자동으로 연결됩니다.
     (QObject 상속 시 main_thread=True 자동 설정)
     """
 
@@ -194,7 +192,7 @@ class DemoWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # 센서 UI 영역
-        layout.addWidget(QLabel("=== Sensor (@rmi_signal) ==="))
+        layout.addWidget(QLabel("=== Sensor (signal_subscribe + on_) ==="))
         self.temp_label = QLabel("Temperature: --")
         self.humidity_label = QLabel("Humidity: --")
         self.alert_label = QLabel("Alert: None")
@@ -288,7 +286,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("  ALASKA Qt Signal Demo")
-    print("  - SensorUI: @rmi_signal → Qt Signal (수동 emit)")
+    print("  - SensorUI: signal_subscribe + on_ → Qt Signal")
     print("  - DeviceUI: signal_bridge 파라미터 (자동 매핑)")
     print("  - Monitor: http://localhost:7100")
     print("=" * 60 + "\n")

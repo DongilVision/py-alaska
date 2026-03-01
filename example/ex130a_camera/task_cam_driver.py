@@ -24,10 +24,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from py_alaska import task, rmi_signal, rmi_run
+from py_alaska import task
 
 try:
-    from py_alaska.sm_memory import SmBlock
+    from py_alaska import SmBlock
     from py_alaska import gconfig
     from py_alaska.drives.imi.Neptune_API import *
 except ImportError:
@@ -35,7 +35,7 @@ except ImportError:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-    from py_alaska.sm_memory import SmBlock
+    from py_alaska import SmBlock
     from py_alaska import gconfig
     from py_alaska.drives.imi.Neptune_API import *
 
@@ -272,7 +272,6 @@ class imi_cam_dp:
         if self.rx_cmdq is not None:
             self.rx_cmdq.put({"action": action, "source": source})
 
-    @rmi_run()
     def run(self):
         self.rx_cmdq = multiprocessing.Queue()
         self.handle = ctypes.c_void_p(0)

@@ -5,10 +5,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import time
-from py_alaska import task, rmi_signal
+from py_alaska import task
 
 
-@task(name="Thread1", mode="thread", restart=True)
+@task(name="Thread1", mode="thread", restart=True, signal_subscribe=["wakeup"])
 class Thread1:
     """Thread 1 - IPC Chain Start"""
     def __init__(self):
@@ -27,7 +27,6 @@ class Thread1:
             return self.next_task.chain_call(data)
         return data
 
-    @rmi_signal("wakeup")
     def on_wakeup(self, signal):
         """Signal broadcast response"""
         recv_time = time.perf_counter()
@@ -41,7 +40,7 @@ class Thread1:
         })
 
 
-@task(name="Thread2", mode="thread", restart=True)
+@task(name="Thread2", mode="thread", restart=True, signal_subscribe=["wakeup"])
 class Thread2:
     """Thread 2 - IPC Chain Middle"""
     def __init__(self):
@@ -60,7 +59,6 @@ class Thread2:
             return self.next_task.chain_call(data)
         return data
 
-    @rmi_signal("wakeup")
     def on_wakeup(self, signal):
         """Signal broadcast response"""
         recv_time = time.perf_counter()
@@ -74,7 +72,7 @@ class Thread2:
         })
 
 
-@task(name="Thread3", mode="thread", restart=True)
+@task(name="Thread3", mode="thread", restart=True, signal_subscribe=["wakeup"])
 class Thread3:
     """Thread 3 - IPC Chain End"""
     def __init__(self):
@@ -93,7 +91,6 @@ class Thread3:
             return self.next_task.on_chain_result(data)
         return data
 
-    @rmi_signal("wakeup")
     def on_wakeup(self, signal):
         """Signal broadcast response"""
         recv_time = time.perf_counter()

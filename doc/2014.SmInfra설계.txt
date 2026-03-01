@@ -1,7 +1,7 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  ALASKA v2.4 — SmInfra (공유 메모리 자원) 설계서                              ║
+║  ALASKA v2.6 — SmInfra (공유 메모리 자원) 설계서                              ║
 ║  고속 IPC, 실시간 통계, 세션 감시를 위한 SharedMemory 인프라 통합 설계        ║
-║  문서 버전: 2026-02-28 (v2.4 개정 - 안정성 강화)                              ║
+║  문서 버전: 2026-03-01 (v2.6 개정 - CPU 절감 자원 추가)                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -313,14 +313,15 @@
   TaskManager (task_manager.py)
   ├── SmBlockHandler  ─── creation() → injection() → close_all()
   ├── SmRingBuffer    ─── RMI request_q / response_q 채널
-  ├── SmValue         ─── _measurement 플래그, stop_flag
+  ├── SmValue         ─── _measurement 플래그, stop_flag, is_sleeping (v2.6)
   ├── SmSignalRegistry─── 태스크 등록, 구독 조회 (O(1))
-  └── SmKernelEvent   ─── 태스크별 notify_event 생성
+  ├── SmKernelEvent   ─── 태스크별 notify_event 생성
+  └── SmKernelEvent   ─── 태스크별 response_event 생성 (v2.6, RMI 응답 깨움)
 
   SignalBroker (task_signal.py)
   ├── SmSignalRegistry─── emit() 시 구독자 비트맵 조회
   ├── SmQueue         ─── 우선순위별 시그널 전달 큐 P1~P5
-  ├── SmKernelEvent   ─── 수신 태스크 깨우기 (set)
+  ├── SmKernelEvent   ─── 수신 태스크 깨우기 (set, 조건부: is_sleeping)
   ├── SmSignalStats   ─── 시그널 처리 시간 기록 (선택)
   └── SmBlackBox      ─── 시그널 체인 세션 추적 (선택)
 
@@ -626,7 +627,7 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  8. 메모리 예산 요약 (v2.3 기준)
+  8. 메모리 예산 요약 (v2.6 기준)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ┌────────────────────────┬──────────────────────────────┬────────────────┐
@@ -638,11 +639,18 @@
   │ SmBlock (이미지)       │ 480×640×3 × 10블록           │ ~8.8 MB        │
   │ SmRingBuffer (RMI)     │ 64KB × 2 (req+resp) / 태스크 │ ~128 KB/태스크 │
   │ SmQueue (시그널)       │ 16~32KB × 5 (P1~P5) / 태스크 │ ~112 KB/태스크 │
-  │ SmKernelEvent          │ OS 커널 핸들 / 태스크        │ ~0 (OS 관리)   │
+  │ SmKernelEvent (notify) │ OS 커널 핸들 / 태스크        │ ~0 (OS 관리)   │
+  │ SmKernelEvent (resp)   │ OS 커널 핸들 / 태스크 (v2.6) │ ~0 (OS 관리)   │
+  │ SmValue (is_sleeping)  │ 1B + header / 태스크 (v2.6)  │ ~24B/태스크    │
   ├────────────────────────┼──────────────────────────────┼────────────────┤
   │ 공유 합계              │                              │ ~9.0 MB        │
-  │ 태스크당 합계          │                              │ ~240 KB        │
+  │ 태스크당 합계          │                              │ ~240 KB + α    │
   └────────────────────────┴──────────────────────────────┴────────────────┘
+
+  v2.6 추가 자원 (태스크당):
+    - response_event (SmKernelEvent): RMI 응답 커널 이벤트 (이름: al_rmi_resp_{pid}_{sid})
+    - is_sleeping (SmValue 'B'): InvokeDispenser 대기 상태 플래그 (1바이트)
+    메모리 증가량 미미 (~24B/태스크 + 커널 핸들 1개)
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -810,5 +818,5 @@
 
 
 ──────────────────────────────────────────────────────────────────────────────
-  문서 버전: 2026-02-28 / ALASKA v2.4 SmInfra Spec (Robustness Updated)
+  문서 버전: 2026-03-01 / ALASKA v2.6 SmInfra Spec (CPU 절감 자원 추가)
 ──────────────────────────────────────────────────────────────────────────────

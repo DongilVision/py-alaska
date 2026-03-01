@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QGroupBox
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from py_alaska import task
-from py_alaska.qt import ui_thread
+from py_alaska import ui_thread
 
 
 @task(debug="signal")

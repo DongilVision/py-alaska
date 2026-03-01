@@ -6,7 +6,6 @@
 """
 import time
 from py_alaska import task
-from py_alaska import rmi_signal
 
 
 @task(name="ManagerTask", mode="thread", restart=False)
@@ -24,7 +23,7 @@ class ManagerTask:
             time.sleep(0.1)
 
 
-@task(name="WorkerTask", mode="thread", restart=False)
+@task(name="WorkerTask", mode="thread", restart=False, signal_subscribe=["notify"])
 class WorkerTask:
     """동적 생성 대상 Task"""
 
@@ -43,7 +42,6 @@ class WorkerTask:
     def get_counter(self) -> int:
         return self.counter
 
-    @rmi_signal("notify")
     def on_notify(self, sig):
         print(f"[{self.runtime.name}] signal received: {sig.data}")
 

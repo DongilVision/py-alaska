@@ -10,7 +10,7 @@ class SourceTask:
     """랜덤 job 타입(a,b,c,d) 생성 및 signal 발행"""
 
     def __init__(self):
-        self.interval = 0.5
+        self.interval = 0.1
         self.job_count = 0
 
     def run(self):

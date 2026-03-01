@@ -1,0 +1,963 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.6 - InvokeDispenser 설계서                                      ║
+║  IPC / Signal 통합 단일 디스패처 + CPU 절감 최적화                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Version : 2.6.0                                                           ║
+║  Date    : 2026-03-01                                                      ║
+║  Ref     : 1101.구조설명서, 2014.SmAsset설계                               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+1. 개요
+================================================================================
+
+1.1 설계 원칙
+--------------------------------------------------------------------------------
+
+  1. Signal이 IPC보다 우선순위 높음
+  2. IPC와 Signal은 동시에 처리되어서는 안 됨 (단일 스레드 직렬화)
+  3. Deadlock-Free — 발생 가능하면 감지 → 자동 예외 발생
+  4. 모든 대기에 bounded timeout — 무한 hang 원천 차단
+  5. Manager.dict 의존 제거 — emit() hot-path에서 IPC 0회
+  6. API 완전 호환 — _call(), _call_nowait(), emit() 시그니처 유지
+
+
+1.2 용어 정의
+--------------------------------------------------------------------------------
+
+  ┌──────────────────┬─────────────────────────────────────────────────────────┐
+  │ 용어             │ 역할                                                    │
+  ├──────────────────┼─────────────────────────────────────────────────────────┤
+  │ Target           │ 사용자 Task 클래스의 인스턴스 (job).                    │
+  │                  │ 비즈니스 로직(run, method, on_* handler) 보유.          │
+  │                  │ InvokeDispenser가 호출하는 유일한 대상.                 │
+  ├──────────────────┼─────────────────────────────────────────────────────────┤
+  │ TaskRuntime      │ Target의 생명주기 관리 컨테이너.                        │
+  │                  │ InvokeDispenser 스레드 소유 및 시작.                    │
+  │                  │ Main 스레드에서 Target.run() 실행.                      │
+  │                  │ SmRingBuffer, QoS Queue, notify_event 등 자원 소유.     │
+  ├──────────────────┼─────────────────────────────────────────────────────────┤
+  │ InvokeDispenser  │ 단일 스레드 통합 디스패처.                              │
+  │                  │ IPC(RMI)와 Signal을 동일 스레드에서 직렬 처리.          │
+  │                  │ Signal 우선 → IPC 후순 → 커널 대기 루프.               │
+  │                  │ Target의 method/handler를 호출(invoke)하고              │
+  │                  │ 분배(dispense)하는 유일한 진입점.                       │
+  ├──────────────────┼─────────────────────────────────────────────────────────┤
+  │ QoS Queue        │ P1~P5 우선순위 큐 (SmRingBuffer 기반).                 │
+  │                  │ Signal + Nowait RMI 메시지 보관.                        │
+  │                  │ InvokeDispenser의 Signal RECV 입력원.                   │
+  │                  │ PriorityScheduler가 예산 기반으로 소비.                 │
+  └──────────────────┴─────────────────────────────────────────────────────────┘
+
+
+1.3 아키텍처
+--------------------------------------------------------------------------------
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  TaskRuntime (태스크당 1개)                                      │
+  │                                                                  │
+  │  ┌────────────────────────────────────────────┐  ┌───────────┐  │
+  │  │           InvokeDispenser                   │  │Main Thread│  │
+  │  │              (단일 스레드)                   │  │           │  │
+  │  │                                              │  │ job.run() │  │
+  │  │  입력:                                       │  │ emit()    │  │
+  │  │  ┌──────────┐  ┌────────────────────────┐   │  │ 사용자    │  │
+  │  │  │request_q │  │  QoS Queue [P1..P5]    │   │  │ 로직      │  │
+  │  │  │(RMI IPC) │  │  Signal+Nowait         │   │  │           │  │
+  │  │  └────┬─────┘  └──────────┬─────────────┘   │  │           │  │
+  │  │       │                    │                  │  │           │  │
+  │  │  ┌────┴──────────┐  ┌─────┴──────────────┐  │  │           │  │
+  │  │  │ send_queue    │  │ notify_event       │  │  │           │  │
+  │  │  │(emit()→위임)  │  │(커널 대기 깨움)    │  │  │           │  │
+  │  │  └────┬──────────┘  └─────┬──────────────┘  │  │           │  │
+  │  │       │                    │                  │  │           │  │
+  │  │  ┌────▼────────────────────▼──────────────┐  │  │           │  │
+  │  │  │          처리 루프                       │  │  │           │  │
+  │  │  │  ① Signal SEND (send_queue drain)      │  │  │           │  │
+  │  │  │  ② Signal RECV (P1→P5)  ← ★ 우선     │  │  │           │  │
+  │  │  │  ③ IPC/RMI (request_q)  ← 후순        │  │  │           │  │
+  │  │  │  ④ Kernel Wait (idle시)               │  │  │           │  │
+  │  │  └────────────────┬───────────────────────┘  │  │           │  │
+  │  │                    ▼                          │  │           │  │
+  │  │  ┌────────────────────────────────────────┐  │  │           │  │
+  │  │  │           Target (job)                  │  │  │           │  │
+  │  │  │  method() — RMI에 의한 실행             │  │  │           │  │
+  │  │  │  on_*()   — Signal handler 실행         │  │  │           │  │
+  │  │  └────────────────────────────────────────┘  │  │           │  │
+  │  └────────────────────────────────────────────┘  └───────────┘  │
+  └─────────────────────────────────────────────────────────────────┘
+
+  스레드 구성: InvokeDispenser(1) + Main(1) = 태스크당 2스레드
+
+
+2. InvokeDispenser 동작
+================================================================================
+
+2.1 메시지 흐름
+--------------------------------------------------------------------------------
+
+  ┌────────────────┬──────────────────┬─────────────────────────────────┐
+  │ 입력원          │ 큐               │ InvokeDispenser 처리 단계       │
+  ├────────────────┼──────────────────┼─────────────────────────────────┤
+  │ 외부 Signal    │ sig_q[P1..P5]    │ ① Signal RECV (우선)          │
+  │ 외부 Nowait    │ sig_q[P4]        │ ① Signal RECV (P4)            │
+  │ 외부 RMI       │ request_q        │ ② IPC/RMI (후순)              │
+  └────────────────┴──────────────────┴─────────────────────────────────┘
+  v2.6: Main emit()는 caller 스레드에서 직접 broker.emit() 호출 (SEND 제거)
+
+
+2.2 루프 알고리즘
+--------------------------------------------------------------------------------
+
+  _invoke_dispenser():
+
+    while not stop:
+      any_work = False
+
+      # v2.6: ① Signal SEND 제거 — emit()이 caller 스레드에서 직접 처리
+      #   SignalClient.emit() → broker.emit() 직접 호출
+      #   CPU 절감: 큐 홉 제거 + 디스패처 부하 경감
+
+      # ═══════════════════════════════════════════════════════════
+      # ① Signal RECV — QoS P1→P5 우선순위 스캔 (★ 우선 처리)
+      # ═══════════════════════════════════════════════════════════
+      #   PriorityScheduler 예산 기반 소비.
+      #   Signal + Nowait RMI 모두 이 단계에서 처리.
+      #   v2.6: 카운트 기반 burst guard (perf_counter 제거)
+      scheduler.new_cycle()
+      burst_count = 0
+      BURST_LIMIT = 50
+
+      for p in range(5):
+          quota = CYCLE_QUOTAS[p]            # [20, 10, 5, 2, 1]
+          for _ in range(quota):
+              try:
+                  data = qs[p].get_nowait()
+              except Empty: break
+
+              # ★ Dispatch (Target 호출)
+              _dispatch(data)
+
+              scheduler.consume(p)
+              any_work = True
+              burst_count += 1
+
+              # v2.6: 카운트 기반 Burst Guard (시간 호출 제거)
+              if burst_count >= BURST_LIMIT:
+                  break
+          if burst_count >= BURST_LIMIT:
+              break
+
+      # ═══════════════════════════════════════════════════════════
+      # ② IPC/RMI — request_q 폴링 (Signal 처리 후 실행)
+      # ═══════════════════════════════════════════════════════════
+      #   외부 태스크의 blocking RMI 요청을 처리.
+      #   최대 5건/cycle (Signal 우선 보장).
+      for _ in range(RMI_BATCH=5):
+          data = request_q.read()
+          if data is None: break
+
+          req = pickle.loads(data)
+          m, a, kw = req['m'], req.get('a',()), req.get('kw',{})
+          chain = req.get('chain', set())
+          rq = get_response_queue(req)
+
+          # ★ 순환 호출 감지 → CircularRmiError
+          if task_id in chain:
+              if rq: rq.write(pickle.dumps({'e': "Circular RMI"}))
+              continue
+
+          # Target.method() 호출
+          try:
+              res = dispatch_method(job, m, a, kw)
+          except Exception as e:
+              res = {'e': str(e)}
+
+          # Response 전송 (bounded retry)
+          if rq:
+              resp = pickle.dumps(res, protocol=5)
+              for _ in range(MAX_WRITE_RETRY):
+                  if rq.write(resp): break
+                  time.sleep(0)
+              # v2.6: Caller의 response_event 깨움 (spin-wait → kernel wait)
+              if caller_resp_evt:
+                  caller_resp_evt.set()
+
+          any_work = True
+
+      # ═══════════════════════════════════════════════════════════
+      # ③ Kernel Wait — 모든 큐 비어있으면 CPU 0% 대기
+      # ═══════════════════════════════════════════════════════════
+      #
+      #   ★ Idle 체크에 request_q.read() 사용 금지:
+      #     SmRingBuffer.read()는 데이터를 소비(읽기 포인터 전진)하므로
+      #     Idle 확인용으로 호출하면 RMI 요청이 증발한다.
+      #     반드시 _used() > 0 (비소비 존재 확인)을 사용.
+      #
+      #   ★ Level-triggered 이벤트 사용 원칙:
+      #     notify_event는 manual_reset(Level-triggered) 방식.
+      #     clear() 후 wait() 진입 직전 시그널 도착 시
+      #     set()이 호출되어 wait()가 즉시 반환 → 안전.
+      #
+      #   v2.6: is_sleeping 플래그 (조건부 notify)
+      #     잠들기 전 is_sleeping = 1, 깨어나면 0.
+      #     송신측은 is_sleeping == 1일 때만 notify_event.set() 호출.
+      #     이미 깨어있는 디스패처에게 불필요한 syscall 제거.
+      #
+      if not any_work:
+          is_sleeping.value = 1              # ★ 잠들기 전 플래그 설정
+          notify_event.clear()               # Level-triggered: 안전
+
+          # Double-Check (Race Condition 방지)
+          still_idle = all(qs[p].empty() for p in range(5))
+                       and request_q._used() == 0   # ★ 비소비 확인
+          if still_idle:
+              notify_event.wait(timeout=NOTIFY_WAIT_TIMEOUT)
+          is_sleeping.value = 0              # ★ 깨어남
+
+
+2.3 우선순위 정책
+--------------------------------------------------------------------------------
+
+  ┌────────┬──────────────────┬────────────┬───────────────────────────┐
+  │ 순서   │ 단계              │ 최대 처리  │ 근거                      │
+  ├────────┼──────────────────┼────────────┼───────────────────────────┤
+  │ ★ 1   │ Signal RECV P1   │ 20건/cycle │ CRITICAL 최우선           │
+  │   1    │ Signal RECV P2   │ 10건/cycle │ REALTIME                  │
+  │   1    │ Signal RECV P3   │  5건/cycle │ NORMAL                    │
+  │   1    │ Signal RECV P4   │  2건/cycle │ LOW + Nowait RMI          │
+  │   1    │ Signal RECV P5   │  1건/cycle │ BACKGROUND                │
+  │   2    │ IPC/RMI          │  5건/cycle │ Signal 처리 후            │
+  │   3    │ Kernel Wait      │  —         │ idle 시 CPU 0%            │
+  └────────┴──────────────────┴────────────┴───────────────────────────┘
+
+  Signal RECV 최대 38건(+burst 50건 제한) : RMI 5건 비율로 Signal 우선.
+  v2.6: Signal SEND 제거 — emit()이 caller 스레드에서 직접 처리.
+  v2.6: Burst Guard를 카운트 기반(50건/cycle)으로 변경 (perf_counter 제거).
+
+
+2.4 notify_event 공유 (Signal + RMI) + 조건부 호출
+--------------------------------------------------------------------------------
+
+  InvokeDispenser의 커널 대기를 깨우는 이벤트:
+
+  ┌───────────────────┬──────────────────────────────────────────────┐
+  │ 시점               │ notify_event.set() 호출자                   │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ Signal 도착        │ broker._notify_task(tid)                    │
+  │ RMI 요청 도착      │ RmiClient._call()                          │
+  └───────────────────┴──────────────────────────────────────────────┘
+
+  v2.6: 조건부 notify (is_sleeping 플래그):
+    태스크 헤더에 is_sleeping (SmValue 'B', 1바이트) 플래그.
+    디스패처가 wait() 전에 is_sleeping = 1, 깨어나면 0.
+    송신측은 is_sleeping == 1일 때만 set() 호출.
+    이미 깨어있으면 메모리 큐에 데이터만 넣고 진행 (syscall 제거).
+
+    ┌─────────────────────────────────────────────────────────┐
+    │ Sender:                                                  │
+    │   data.write()                                           │
+    │   if target.is_sleeping.value != 0:                      │
+    │       target.notify_event.set()   # syscall              │
+    │                                                          │
+    │ Dispenser (idle):                                        │
+    │   is_sleeping = 1                                        │
+    │   notify_event.clear()                                   │
+    │   Double-Check: still_idle?                              │
+    │   if yes: notify_event.wait()                            │
+    │   is_sleeping = 0                                        │
+    └─────────────────────────────────────────────────────────┘
+
+  v2.6: RMI 응답 이벤트 (response_event):
+    태스크마다 response_event (SmKernelEvent) 추가.
+    RmiClient._call()이 spin-wait 대신 response_event.wait() 호출.
+    InvokeDispenser가 응답 기록 후 caller.response_event.set().
+    Caller CPU 사용량 90% 이상 절감.
+
+
+2.5 TaskRuntime.run() 흐름
+--------------------------------------------------------------------------------
+
+  def run(self):
+      job = create_target()               # Target 인스턴스 생성
+      job.runtime = self                   # runtime 주입
+
+      signal_client = SignalClient(...)    # 초기화만 (스레드 시작 안 함)
+      signal_client._job = job
+      auto_subscribe_signals()             # @rmi_signal 핸들러 등록
+
+      # ★ InvokeDispenser 시작 (RMI + Signal 통합)
+      th = Thread(target=self._invoke_dispenser, daemon=True)
+      th.start()
+
+      _run_main_loop()                     # Main: job.run() 실행
+
+      signal_client.stop()                 # 정리
+
+
+3. QoS 큐 관리
+================================================================================
+
+3.1 QoS 매핑
+--------------------------------------------------------------------------------
+
+  ┌───────────────────┬─────────────┬──────────┬──────────────────┐
+  │ 메시지 타입       │ Priority     │ Deadline │ 위반 시 동작     │
+  ├───────────────────┼─────────────┼──────────┼──────────────────┤
+  │ Signal CRITICAL   │ P1          │ 10ms     │ HALT             │
+  │ Signal REALTIME   │ P2          │ 30ms     │ LOG              │
+  │ Signal NORMAL     │ P3          │ 100ms    │ LOG              │
+  │ Signal LOW        │ P4          │ 500ms    │ IGNORE           │
+  │ Signal BACKGROUND │ P5          │ 2000ms   │ IGNORE           │
+  │ Nowait RMI        │ P4          │ 500ms    │ IGNORE           │
+  │ System (_system.*)│ P1          │ 10ms     │ HALT             │
+  │ RMI blocking      │ request_q   │ caller   │ RmiTimeoutError  │
+  │                   │ (별도 큐)   │ timeout  │                  │
+  └───────────────────┴─────────────┴──────────┴──────────────────┘
+
+
+3.2 큐 계층
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  sig_q[0] — P1 CRITICAL (16KB)                              │
+  │  오버플로: Back Pressure (3.5절) — 재시도, 드롭 불가        │
+  ├──────────────────────────────────────────────────────────────┤
+  │  sig_q[1] — P2 REALTIME (16KB)                              │
+  │  오버플로: Back Pressure — 재시도, 드롭 불가                │
+  ├──────────────────────────────────────────────────────────────┤
+  │  sig_q[2] — P3 NORMAL (32KB)                                │
+  │  오버플로: Back Pressure — 재시도, 드롭 불가                │
+  ├──────────────────────────────────────────────────────────────┤
+  │  sig_q[3] — P4 LOW (32KB)                                   │
+  │  오버플로: Back Pressure — 재시도, 드롭 불가                │
+  ├──────────────────────────────────────────────────────────────┤
+  │  sig_q[4] — P5 BACKGROUND (16KB)                            │
+  │  오버플로: Back Pressure — 재시도, 드롭 불가                │
+  └──────────────────────────────────────────────────────────────┘
+
+  ★ Signal 무손실 원칙: 모든 우선순위에서 드롭 없음.
+     큐 full 시 Back Pressure로 생산자 측 재시도 (3.5절).
+
+  InvokeDispenser가 유일한 소비자 (Single Consumer).
+  외부 프로세스가 Producer (MPSC — Named Mutex 보호).
+
+
+3.3 Back Pressure (Signal 무손실 보장)
+--------------------------------------------------------------------------------
+
+  ★ 핵심 원칙: Signal은 절대 손실되어서는 안 된다.
+     구독자 큐가 full이면 emit이 성공해서는 안 된다 (Back Pressure).
+
+  ■ 배치 경로 (broker.emit → 구독자 큐):
+
+    broker.emit(signal):
+      for tid in subs:
+          for _retry in range(BP_RETRIES):     # 기본 50회 (~5ms)
+              try:
+                  qs[q_idx].put_nowait(payload)
+                  notify_event.set()
+                  break                         # 성공 → 다음 구독자
+              except queue.Full:
+                  time.sleep(0)                 # yield → 소비자 drain 기회
+          else:
+              return False                      # ★ 전달 실패 → caller에 전파
+
+  ■ 송신 경로 (InvokeDispenser ① SEND):
+
+    while True:
+        sig = sq.get_nowait()
+        if not broker.emit(sig):               # ★ Back Pressure 발생
+            sq.put_nowait(sig)                  # 재삽입 → 다음 사이클 재시도
+            break                               # ②③④ 먼저 처리 (소비자 drain)
+        any_work = True
+
+  ■ Back Pressure 체인:
+
+    ┌─────────────┐   queue.Full   ┌──────────────┐   re-queue   ┌──────────────┐
+    │ 구독자 큐   │ ─────────────→ │ broker.emit()│ ──────────→ │ InvokeDisp.  │
+    │ (sig_q full)│                │ returns False│              │ ① SEND 재시도│
+    └─────────────┘                └──────────────┘              └──────┬───────┘
+                                                                        │
+                                   ②③④ 처리 → 소비자 큐 drain ←───────┘
+
+    결과: 소비자가 큐를 비울 때까지 생산자가 자연스럽게 대기.
+    Signal은 send_queue에 보존 → 무손실 보장.
+
+  ■ 안전장치:
+    - send_queue는 unbounded queue.Queue → 메모리 한도까지 보존
+    - broker.emit() 재시도 50회(~5ms) 내 실패 시에만 Back Pressure 발동
+    - InvokeDispenser ② RECV가 소비자 역할 → 자연스럽게 큐 공간 확보
+
+
+3.4 PriorityScheduler
+--------------------------------------------------------------------------------
+
+  알고리즘: Weighted Fair Queuing + Starvation Guard
+
+  CYCLE_QUOTAS    = [20, 10, 5, 2, 1]    # P1~P5 사이클당 처리량
+  STARVATION_LIMIT = 50                   # 연속 미처리 시 강제 1회
+
+  new_cycle():
+      budgets[:] = CYCLE_QUOTAS           # 매 사이클 예산 리필
+
+  next_priority() → int:
+      for p in range(5):
+          if budgets[p] > 0: return p     # 예산 남은 최상위
+          starvation[p] += 1
+          if starvation[p] > LIMIT:
+              starvation[p] = 0
+              return p                     # 기아 방지
+      return 2                             # fallback: NORMAL
+
+  consume(priority):
+      budgets[priority] -= 1
+      starvation[priority] = 0
+
+
+3.4 request_q 와 QoS Queue 비교
+--------------------------------------------------------------------------------
+
+  ┌──────────────────┬─────────────────────┬──────────────────────┐
+  │                  │ QoS Queue (sig_q)    │ request_q            │
+  ├──────────────────┼─────────────────────┼──────────────────────┤
+  │ 용도             │ Signal + Nowait RMI │ Blocking RMI         │
+  │ 우선순위         │ ★ 높음 (먼저 처리) │ 낮음 (Signal 후)     │
+  │ 큐 개수          │ 5개 (P1~P5)        │ 1개                  │
+  │ 데드라인 체크    │ 있음               │ caller timeout       │
+  │ 응답             │ 없음 (단방향)      │ 있음 (response_q)    │
+  │ 스케줄링         │ PriorityScheduler  │ FIFO                 │
+  └──────────────────┴─────────────────────┴──────────────────────┘
+
+
+4. 통신 알고리즘
+================================================================================
+
+4.1 RMI Blocking Call
+--------------------------------------------------------------------------------
+
+  호출측 (RmiClient._call):
+
+    1. req = pickle({m, a, kw, chain, caller})
+    2. deadline = perf_counter() + timeout
+
+    Phase 1 — Request Write (bounded):
+      for _ in range(500):
+          if request_q.write(req): break
+          if perf_counter() >= deadline: raise RmiTimeoutError
+          time.sleep(0)
+
+    ★ 조건부 notify (v2.6):
+      if target.is_sleeping.value != 0:
+          target.notify_event.set()        # 잠든 디스패처만 깨움
+
+    Phase 2 — Response Wait (v2.6: Kernel Event 대기):
+      response_event.clear()
+      while True:
+          resp = response_q.read()
+          if resp: return pickle.loads(resp)
+          remaining = deadline - perf_counter()
+          if remaining <= 0: raise RmiTimeoutError
+          response_event.wait(timeout=min(remaining, 0.05))
+                                            # ★ CPU 0% 대기 (spin-wait 제거)
+
+  수신측 (InvokeDispenser ②단계):
+    request_q.read() → dispatch_method() → response_q.write()
+    → caller.response_event.set()          # ★ Caller 깨움
+
+  소요시간 (정상):
+    write ~0.005ms + dispatch ~0.020ms + read ~0.005ms = ~0.03ms
+
+
+4.2 RMI Nowait (Fire-and-Forget)
+--------------------------------------------------------------------------------
+
+  RmiClient._call_nowait():
+    msg = {'name': '_rmi.nowait', 'data': {m, a, kw}, 'qos': P4}
+    target_sig_q[3].put_nowait(msg)        # P4 큐에 non-blocking
+    notify_event.set()                     # InvokeDispenser 깨움
+
+  InvokeDispenser ②단계에서 P4 큐 스캔 시 처리.
+
+
+4.3 Signal emit
+--------------------------------------------------------------------------------
+
+  SignalBroker.emit(signal):
+    1. subs = SmSignalRegistry.get_subscribers(signal.name)
+       ← 공유 메모리 비트맵 (~0.001ms, Manager IPC 0회)
+    2. if not subs: return False
+    3. q_idx = priority_to_index(signal.qos)
+    4. payload = serialize(signal)
+    5. for tid in subs:
+         qs = _q_cache[tid]                # 로컬 dict (~0.0001ms)
+         # ★ Back Pressure: bounded retry (50회 ~5ms)
+         for _retry in range(BP_RETRIES):
+             try:
+                 qs[q_idx].put_nowait(payload)
+                 break
+             except queue.Full:
+                 time.sleep(0)             # yield → 소비자 drain 기회
+         else:
+             return False                  # ★ 전달 실패 → 무손실 재시도
+         notify_event.set()                # 수신 InvokeDispenser 깨움
+
+
+4.4 Signal 수신 (InvokeDispenser ②단계)
+--------------------------------------------------------------------------------
+
+  1. qs[p].get_nowait()
+  2. Deadline 만료 체크 → 초과 시 드롭 + violation 보고
+  3. _rmi.nowait 분기 → dispatch_rmi_nowait() → Target.method()
+     ★ 응답 생략: 반환값 pickle/response_q.write() 불필요 (fire-and-forget)
+  4. 일반 Signal 분기 → dispatch_signal() → Target.on_*()
+  5. Burst Guard: 5ms 초과 시 다음 사이클로 양보
+
+
+5. SM(Shared Memory) 자원
+================================================================================
+
+5.1 태스크당 할당
+--------------------------------------------------------------------------------
+
+  ┌──────────────────┬───────────────┬──────────┬──────────────────────┐
+  │ 자원             │ 타입          │ 크기     │ 용도                 │
+  ├──────────────────┼───────────────┼──────────┼──────────────────────┤
+  │ request_q        │ SmRingBuffer  │ 64KB     │ RMI 요청 수신        │
+  │ response_q       │ SmRingBuffer  │ 64KB     │ RMI 응답 수신        │
+  │ sig_q[0..4]      │ SmSignalQueue│ 16~32KB  │ QoS P1~P5 시그널    │
+  │ notify_event     │ SmKernelEvent │ 커널객체 │ InvokeDispenser 알림 │
+  │ stop_flag        │ SmValue('b')  │ 1B+hdr   │ 정지 플래그          │
+  │ rmi_counters     │ SmValue       │ ~24B     │ RMI 통계             │
+  ├──────────────────┼───────────────┼──────────┼──────────────────────┤
+  │ 태스크당 합계    │               │ ~240KB   │ + 커널 이벤트 핸들   │
+  └──────────────────┴───────────────┴──────────┴──────────────────────┘
+
+  Process 모드 시그널 큐: SmSignalQueue (SmRingBuffer + Named Mutex)
+  Thread 모드 시그널 큐: queue.Queue (로컬, 동일 프로세스)
+
+  notify_event:
+    Win32:  SmKernelEvent — kernel32 WaitForSingleObject (CPU 0%, ~50μs 반응)
+    Linux:  multiprocessing.Event — OS futex 기반 (CPU 0%, ~100μs 반응)
+
+
+5.2 공유 자원
+--------------------------------------------------------------------------------
+
+  ┌────────────────────┬─────────────────────┬──────────┬─────────────────┐
+  │ 자원               │ 타입                │ 크기     │ 용도            │
+  ├────────────────────┼─────────────────────┼──────────┼─────────────────┤
+  │ signal_registry    │ SmSignalRegistry    │ ~36KB    │ 구독 비트맵     │
+  │                    │ (SharedMemory)      │          │ O(1) 조회       │
+  │ heartbeat_map      │ Manager.dict        │ ~1KB/task│ 워치독 심박     │
+  │                    │ (유지 — 저빈도)     │          │ 1초 주기        │
+  └────────────────────┴─────────────────────┴──────────┴─────────────────┘
+
+
+5.3 SmSignalRegistry 메모리 레이아웃
+--------------------------------------------------------------------------------
+
+  Total: HEADER(64B) + TASK_TABLE(64×64B) + SIGNAL_TABLE(256×128B) ≈ 36KB
+
+  ┌── Header (64B) ────────────────────────────────────────────────┐
+  │ [max_signals: i4] [max_tasks: i4] [active_signals: i4]        │
+  │ [active_tasks: i4] [version: i8] [reserved: 40B]              │
+  ├── Task Table (64 slots × 64B) ────────────────────────────────┤
+  │ [task_id: char[32]] [status: u1] [last_alive: f8]             │
+  │ [inbox_ptr: u8] [reserved: 15B]                                │
+  ├── Signal Table (256 slots × 128B) ────────────────────────────┤
+  │ [sig_name: char[64]] [sub_mask: u8] [last_seq: i8]            │
+  │ [reserved: 48B]                                                │
+  └────────────────────────────────────────────────────────────────┘
+
+  sub_mask 비트맵:
+    sub_mask = 0b_0000_0101 → Task[0]과 Task[2]가 구독 중
+    O(1) 조회: mask & (1 << task_idx)
+
+  emit() hot-path:
+    SmSignalRegistry.get_subscribers() — 공유 메모리 직접 (~0.001ms)
+    _q_cache.get(tid)                  — 로컬 dict (~0.0001ms)
+    Manager.dict 접근 0회 → 서브프로세스 hang 원천 차단
+
+
+5.4 SmRingBuffer 레이아웃 (64KB)
+--------------------------------------------------------------------------------
+
+  Offset 0x0000: write_idx (int64, 8B)
+  Offset 0x0008: read_idx  (int64, 8B)
+  Offset 0x0010: data[65520B]
+
+  ★ API 사용 주의:
+    read()   — 데이터 반환 + 읽기 포인터 전진 (소비)
+    _used()  — 미소비 바이트 수 반환 (비소비, 포인터 불변)
+    Idle 체크 시 반드시 _used() == 0 사용. read() 사용 금지.
+
+
+5.5 SmSignalQueue 구성
+--------------------------------------------------------------------------------
+
+  SmSignalQueue = SmRingBuffer + _WinMutex(Named Mutex)
+    SmRingBuffer: 데이터 전송 (SharedMemory memcpy)
+    _WinMutex: 다중 Producer 보호 (커널 직접 호출, Manager IPC 0회)
+    pickle: 메시지 직렬화
+
+  MPSC 패턴:
+    - write: Named Mutex 보호 (다중 emitter)
+    - read: Lock 불필요 (InvokeDispenser 단일 소비자)
+
+
+5.6 메모리 계산 방법
+--------------------------------------------------------------------------------
+
+  ■ 태스크당 메모리 (Per-Task)
+
+  ┌──────────────────┬──────────┬──────────────────────────────────────────┐
+  │ 자원             │ 크기     │ 산출                                     │
+  ├──────────────────┼──────────┼──────────────────────────────────────────┤
+  │ request_q        │ 64KB     │ SmRingBuffer(size=65536)                 │
+  │ response_q       │ 64KB     │ SmRingBuffer(size=65536)                 │
+  │ sig_q[0] P1      │ 16KB     │ SmRingBuffer(size=16384)                 │
+  │ sig_q[1] P2      │ 16KB     │ SmRingBuffer(size=16384)                 │
+  │ sig_q[2] P3      │ 32KB     │ SmRingBuffer(size=32768)                 │
+  │ sig_q[3] P4      │ 32KB     │ SmRingBuffer(size=32768)                 │
+  │ sig_q[4] P5      │ 16KB     │ SmRingBuffer(size=16384)                 │
+  │ notify_event     │ ~0       │ SmKernelEvent (커널 핸들, 유저 메모리 0) │
+  │ stop_flag        │ ~24B     │ SmValue header(16B) + data(1B)           │
+  │ rmi_counters     │ ~24B     │ SmValue header(16B) + data(8B)           │
+  ├──────────────────┼──────────┼──────────────────────────────────────────┤
+  │ 합계             │ ~240KB   │ 64+64+16+16+32+32+16 = 240KB + α        │
+  └──────────────────┴──────────┴──────────────────────────────────────────┘
+
+  SmRingBuffer 내부 레이아웃:
+    SharedMemory 할당 = header(16B) + data_area(size 파라미터)
+    header = write_idx(int64, 8B) + read_idx(int64, 8B)
+    OS 페이지 단위 반올림으로 실제 할당량은 약간 증가 가능.
+
+  ■ 시스템 공유 메모리 (전체 1회 할당)
+
+  ┌──────────────────────┬──────────┬─────────────────────────────────────┐
+  │ 자원                 │ 크기     │ 산출                                │
+  ├──────────────────────┼──────────┼─────────────────────────────────────┤
+  │ SmSignalRegistry     │ ~36KB    │ Header(64B)                         │
+  │                      │          │ + TaskTable(64 × 64B = 4,096B)      │
+  │                      │          │ + SignalTable(256 × 128B = 32,768B) │
+  │                      │          │ = 36,928B                           │
+  │ SmSignalStats        │ ~4KB     │ Header(64B)                         │
+  │                      │          │ + StatsSlot(64 × 64B = 4,096B)      │
+  │                      │          │ = 4,160B                            │
+  └──────────────────────┴──────────┴─────────────────────────────────────┘
+
+  ■ 총 메모리 계산식
+
+    Total_SM = SmSignalRegistry(36KB)
+             + SmSignalStats(4KB)
+             + N × PerTask(240KB)
+
+    ┌──────────┬──────────────────────────────────┬──────────┐
+    │ 태스크 수│ 계산                             │ 합계     │
+    ├──────────┼──────────────────────────────────┼──────────┤
+    │  5       │ 36 + 4 + 5 × 240 = 1,240KB      │ ~1.2MB   │
+    │ 10       │ 36 + 4 + 10 × 240 = 2,440KB     │ ~2.4MB   │
+    │ 30       │ 36 + 4 + 30 × 240 = 7,240KB     │ ~7.1MB   │
+    │ 50       │ 36 + 4 + 50 × 240 = 12,040KB    │ ~11.8MB  │
+    │ 64 (MAX) │ 36 + 4 + 64 × 240 = 15,400KB    │ ~15.0MB  │
+    └──────────┴──────────────────────────────────┴──────────┘
+
+    ★ 64 태스크(시스템 최대)에서도 ~15MB — 현대 시스템에서 무시 가능.
+    ★ Manager.Queue 대비: 프로세스당 socket 연결 제거 → OS 핸들 절약.
+
+
+6. Deadlock-Free 보장
+================================================================================
+
+  ★ 핵심: 데드락 발생 가능 경로는 모두 감지 → 예외 자동 발생
+
+6.1 감지 대상
+--------------------------------------------------------------------------------
+
+  ┌─────┬─────────────────────────────┬──────────────────────────────────┐
+  │Case │ 시나리오                     │ 감지 → 예외                      │
+  ├─────┼─────────────────────────────┼──────────────────────────────────┤
+  │  1  │ 순환 RMI: A→B→C→A         │ chain set에 A 발견               │
+  │     │                             │ → CircularRmiError               │
+  ├─────┼─────────────────────────────┼──────────────────────────────────┤
+  │  2  │ 자기 호출: A의 handler가   │ target_id == caller_id           │
+  │     │ A에게 blocking RMI         │ → InvokeDeadlockError            │
+  ├─────┼─────────────────────────────┼──────────────────────────────────┤
+  │  3  │ 교차 데드락: A↔B 상호     │ A→B chain={A}, B→A chain={A,B} │
+  │     │ blocking RMI               │ A ∈ chain → CircularRmiError     │
+  ├─────┼─────────────────────────────┼──────────────────────────────────┤
+  │  4  │ Head-of-Line Blocking:     │ 데드락 아님 (시간 제한)          │
+  │     │ handler/method 장시간      │ 외부 호출자 → RmiTimeoutError    │
+  ├─────┼─────────────────────────────┼──────────────────────────────────┤
+  │  5  │ Signal handler 내          │ 설계상 허용 (단일 스레드)        │
+  │     │ blocking RMI               │ timeout으로 hang 방지            │
+  │     │                             │ 순환 시 chain 감지               │
+  └─────┴─────────────────────────────┴──────────────────────────────────┘
+
+
+6.2 감지 메커니즘
+--------------------------------------------------------------------------------
+
+  (1) Chain-based Detection:
+      RmiClient._call() 시 chain set에 caller 추가.
+      InvokeDispenser에서 target ∈ chain → CircularRmiError 즉시 발생.
+
+  (2) Self-call Detection (★ 신규):
+      RmiClient._call() 진입 시:
+        if target_id == caller_id:
+            raise InvokeDeadlockError(
+                f"Self-RMI deadlock: {caller_id} → {target_id}")
+
+  (3) Timeout-based:
+      모든 spin-wait에 bounded retry + perf_counter() deadline.
+      초과 시 RmiTimeoutError 발생.
+
+
+6.3 Signal handler 내 blocking RMI — 동작 분석
+--------------------------------------------------------------------------------
+
+  InvokeDispenser가 Signal handler 디스패치 중
+  handler 내에서 다른 태스크에 blocking RMI 호출:
+
+    ① handler → other._call("method") → other.request_q.write()
+    ② handler 스레드(= InvokeDispenser) 차단 (response 대기)
+    ③ 이 동안 자신의 Signal RECV, IPC/RMI 처리 모두 중단
+    ④ other 태스크가 응답 반환 → handler 재개
+    ⑤ InvokeDispenser 루프 계속
+
+  위험도: 중간
+    - 차단 시간 = other 태스크의 메서드 실행 시간
+    - timeout으로 최대 차단 시간 보장 (기본 2초)
+    - 순환 호출은 chain으로 즉시 감지
+
+  설계 근거: "ipc와 signal은 동시에 처리되어서는 안 된다"
+    → 단일 스레드이므로 handler 실행 중 다른 처리 불가는 의도된 동작.
+
+
+6.4 개발자 가이드라인 (Head-of-Line Blocking 방지)
+--------------------------------------------------------------------------------
+
+  InvokeDispenser는 단일 스레드이므로, 하나의 핸들러가 장시간 점유하면
+  모든 Signal과 RMI 처리가 차단된다 (Case 4).
+
+  ★ 규칙: 핸들러(on_*) / 메서드(method) 내 Heavy Compute 금지
+
+  ┌──────┬──────────────────────────────────┬──────────────────────────────┐
+  │ 금지 │ 설명                             │ 대안                         │
+  ├──────┼──────────────────────────────────┼──────────────────────────────┤
+  │  ×   │ time.sleep() / 동기 I/O         │ emit()으로 비동기 위임       │
+  │  ×   │ 대용량 연산 (>10ms)             │ Main Thread에서 run() 처리   │
+  │  ×   │ 무한 루프                        │ 상태 머신 + emit() 패턴      │
+  │  ×   │ 외부 API 호출 (HTTP 등)         │ Main Thread에 위임           │
+  └──────┴──────────────────────────────────┴──────────────────────────────┘
+
+  핸들러 목표 실행시간: < 1ms (권장), < 10ms (최대 허용)
+  초과 시 Telemetry의 max_handler_time_us에서 감지 가능 (10절 참고).
+
+
+7. 성능 목표
+================================================================================
+
+  ┌──────────────────────────┬────────────┬──────────────────────────────┐
+  │ 작업                     │ 목표       │ 구현 방법                    │
+  ├──────────────────────────┼────────────┼──────────────────────────────┤
+  │ RMI 왕복 (blocking)     │ < 0.1ms    │ Bounded spin-wait            │
+  │ Signal emit (구독조회)  │ < 0.001ms  │ SmSignalRegistry 비트맵      │
+  │ Signal emit (큐배치)    │ < 0.01ms   │ _q_cache + put_nowait        │
+  │ Nowait RMI 전송         │ < 0.05ms   │ Signal P4 큐 직접 put        │
+  │ 프로세스 통지           │ < 0.05ms   │ SmKernelEvent.set()          │
+  │ 프로세스 대기 (idle)    │ CPU 0%     │ SmKernelEvent.wait()         │
+  │ Hang 복구               │ < 2초      │ Bounded retry + timeout      │
+  └──────────────────────────┴────────────┴──────────────────────────────┘
+
+
+8. 변경 파일
+================================================================================
+
+  ┌────────────────────────────────────┬────────────────────────────────────┐
+  │ 파일                               │ 변경 내용                          │
+  ├────────────────────────────────────┼────────────────────────────────────┤
+  │ task_signal.py (SignalClient)      │ start() headless 모드 추가         │
+  │                                    │ emit() → send_queue 위임 유지      │
+  ├────────────────────────────────────┼────────────────────────────────────┤
+  │ task_manager.py (TaskRuntime)      │ _invoke_dispenser() 메서드 신규    │
+  │                                    │ _rmi_handler() 제거                │
+  │                                    │ run()에서 InvokeDispenser 시작     │
+  ├────────────────────────────────────┼────────────────────────────────────┤
+  │ task_manager.py (RmiClient)        │ _notify_event 참조 추가            │
+  │                                    │ _call() 후 notify_event.set()      │
+  ├────────────────────────────────────┼────────────────────────────────────┤
+  │ task_manager.py (exceptions)       │ InvokeDeadlockError 추가           │
+  └────────────────────────────────────┴────────────────────────────────────┘
+
+  API 변경 없음:
+    - _call(), _call_nowait(), emit(), on(), off() 시그니처 무변경
+    - @task, @rmi_run, @rmi_signal 데코레이터 무변경
+    - 사용자 Task 코드 수정 불필요
+
+
+9. Cooperative Yield API
+================================================================================
+
+  긴 작업을 수행해야 하는 핸들러를 위한 협력적 양보 API.
+  self.runtime.yield_now()로 InvokeDispenser에 제어를 반환하여
+  대기 중인 P1 CRITICAL 시그널을 즉시 처리 가능.
+
+
+9.1 사용법
+--------------------------------------------------------------------------------
+
+  class MyTask(Task):
+      @rmi_signal('on_large_batch')
+      def handle_batch(self, sig):
+          for i, item in enumerate(sig.data['items']):
+              process(item)
+              if i % 100 == 0:
+                  self.runtime.yield_now()   # 매 100건마다 양보
+
+
+9.2 동작 원리
+--------------------------------------------------------------------------------
+
+  yield_now() 호출 시:
+    1. 현재 핸들러 실행을 일시 중단
+    2. InvokeDispenser가 ①~③ 단계 한 사이클 실행
+       → P1 CRITICAL 시그널 즉시 처리 가능
+    3. 사이클 완료 후 핸들러 재개
+
+  구현 방식:
+    콜백 분할 + 큐 재삽입 (Continuation Passing)
+    - yield_now() 호출 시 현재 상태를 클로저로 캡처
+    - 자신의 P1 큐에 재삽입 → 다음 사이클에서 재개
+    - 단순하고 기존 루프 알고리즘 변경 불필요
+
+  ★ 제약:
+    - InvokeDispenser 스레드에서만 유효 (Main Thread에서 호출 시 no-op)
+    - yield 빈도가 높으면 오버헤드 증가 → 100건 단위 권장
+
+
+10. Dispenser Telemetry
+================================================================================
+
+  InvokeDispenser 상태를 SmSignalStats에 기록하여
+  웹 디버거(task_monitor)에서 실시간 모니터링.
+
+
+10.1 기록 항목
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────┬──────────┬────────────────────────────────────────┐
+  │ 항목                 │ 타입     │ 설명                                   │
+  ├──────────────────────┼──────────┼────────────────────────────────────────┤
+  │ cycle_time_us        │ uint32   │ 루프 1주기 소요시간 (μs)              │
+  │ any_work             │ bool     │ 이번 주기에서 처리 발생 여부           │
+  │ signal_recv_count    │ uint32   │ ① RECV 처리 건수 (누적)              │
+  │ rmi_count            │ uint32   │ ② RMI 처리 건수 (누적)               │
+  │ idle_wait_count      │ uint32   │ ③ Kernel Wait 진입 횟수 (누적)       │
+  │ max_handler_time_us  │ uint32   │ 최장 핸들러 실행시간 (μs)             │
+  │ deadline_violations  │ uint32   │ 데드라인 초과 드롭 건수 (누적)         │
+  └──────────────────────┴──────────┴────────────────────────────────────────┘
+
+
+10.2 기록 위치 및 방법
+--------------------------------------------------------------------------------
+
+  SmSignalStats.task_slots[task_idx] 내에 Telemetry 영역 할당.
+
+  InvokeDispenser 루프 끝에서 매 사이클 갱신:
+
+    cycle_end = perf_counter()
+    stats.cycle_time_us = int((cycle_end - cycle_start) * 1_000_000)
+    stats.any_work = any_work
+    stats.signal_recv_count += recv_count
+    stats.rmi_count += rmi_count
+    if not any_work:
+        stats.idle_wait_count += 1
+
+  Lock 불필요: 단일 writer per slot (InvokeDispenser 1스레드).
+  task_monitor는 폴링으로 읽기 (공유 메모리 직접 접근).
+
+  ★ max_handler_time_us 활용:
+    6.4절 가이드라인 위반 감지 — 10ms 초과 시 웹 디버거에서 경고 표시.
+
+
+11. v2.6 CPU 절감 최적화 (Change Log)
+================================================================================
+
+11.1 최적화 1: RMI 응답 대기 — Spin-wait → Kernel Event
+--------------------------------------------------------------------------------
+
+  변경 전: RmiClient._call()이 response_q.read()를 200회 폴링 후 sleep(0)
+  변경 후: response_event.wait(timeout)로 커널 대기 (CPU 0%)
+
+  추가 자원: 태스크당 response_event (SmKernelEvent, al_rmi_resp_{pid}_{sid})
+  InvokeDispenser: 응답 기록 후 caller_ti.response_event.set()
+
+  ┌───────────────┬──────────────────┬──────────────────────┐
+  │ 항목          │ 변경 전          │ 변경 후              │
+  ├───────────────┼──────────────────┼──────────────────────┤
+  │ CPU (대기 중) │ 코어 1개 점유    │ 0%                   │
+  │ 응답 지연     │ ~0.03ms          │ ~0.05ms (커널 왕복)  │
+  │ 추가 자원     │ 없음             │ SmKernelEvent × N    │
+  └───────────────┴──────────────────┴──────────────────────┘
+
+
+11.2 최적화 2: Signal Direct Emit — SEND 위임 제거
+--------------------------------------------------------------------------------
+
+  변경 전: emit() → send_queue → InvokeDispenser ① SEND → broker.emit()
+  변경 후: emit() → broker.emit() (caller 스레드에서 직접)
+
+  broker.emit()은 MPSC-safe (SmSignalQueue = SmRingBuffer + WinMutex).
+  디스패처 루프 3단계 → 3단계 (RECV → RMI → Wait).
+  send_queue 제거. Back Pressure는 caller에게 False 반환.
+
+
+11.3 최적화 3: 조건부 notify — is_sleeping 플래그
+--------------------------------------------------------------------------------
+
+  변경 전: 모든 시그널/RMI 전송마다 notify_event.set() (커널 syscall)
+  변경 후: is_sleeping == 1일 때만 set() 호출
+
+  추가 자원: 태스크당 is_sleeping (SmValue 'B', 1바이트)
+  레이스 안전: Double-Check 패턴으로 보장
+
+  절감 효과:
+    고빈도 시그널 시 불필요한 syscall (~5μs/건) 제거.
+    메모리 읽기 (~50ns)로 대체.
+
+
+11.4 최적화 4: 시간 호출 간소화
+--------------------------------------------------------------------------------
+
+  변경 전: RECV burst guard에 perf_counter() 호출 (최대 38회/cycle)
+  변경 후: 카운트 기반 burst guard (50건/cycle, 시간 호출 0회)
+
+  루프 시작의 now_perf 재활용으로 heartbeat 체크도 추가 호출 없음.
+
+
+11.5 성능 검증 중 발견·수정 사항
+--------------------------------------------------------------------------------
+
+  (a) get_client() — notify_event 미전달
+      외부 RmiClient가 notify_event 없이 생성되어 InvokeDispenser를 깨울 수 없었음.
+      100ms _NOTIFY_TIMEOUT 만큼 불필요 대기. → notify_event + target_sleeping 전달 추가.
+
+  (b) restart_task() — response_event pickle 누락
+      Watchdog 재시작 시 clean_tasks에서 response_event = None 설정 누락.
+      프로세스 모드 복구 실패 (ctypes pickle 불가). → clean_ti.response_event = None 추가.
+
+  (c) 자식 프로세스 — 타 태스크 response_event 미재연결
+      자식 프로세스에서 자기 자신의 response_event만 재연결하고 다른 태스크는 None 유지.
+      중첩호출 시 caller의 response_event.set() 불가 → 50ms 대기 발생.
+      → TaskRuntime.run()에서 모든 태스크의 response_event를 이름 기반으로 재연결.
+
+  (d) _sm_registry_name None 방어
+      getattr(broker, '_sm_registry_name', '') 반환값이 None일 때 .replace() 에러.
+      → (... or '') 방어 코드 추가.
+
+
+================================================================================
+  End of Document - 2016.InvokeDispenser설계 v2.6
+================================================================================

@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import time
-from src import TaskManager, RecursiveCallError
+from py_alaska import TaskManager
 
 
 # === Job 함수 정의 ===
@@ -314,8 +314,6 @@ def task_a_job(task):
     try:
         result = task.call_b_which_calls_a()
         print(f"[{task.name}] Recursive call result: {result}")
-    except RecursiveCallError as e:
-        print(f"[{task.name}] RecursiveCallError caught: {e}")
     except Exception as e:
         print(f"[{task.name}] Error: {e}")
 
@@ -431,6 +429,8 @@ def main_with_monitor():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     # main()
     # main_mutual_call()
     # main_with_context_manager()

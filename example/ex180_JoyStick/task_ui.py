@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
 from PySide6.QtCore import Qt, QProcess
 from PySide6.QtGui import QFont
 from py_alaska import task
-from py_alaska.qt import ui_thread
+from py_alaska import ui_thread
 
 _INC_LIST = [0.1, 1.0, 5.0, 10.0]
 

@@ -1,21 +1,28 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  ALASKA v2.3 - 구조설명서                                                    ║
+║  ALASKA v2.6 - 구조설명서                                                    ║
 ║  System Architecture Specification                                          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Version : 2.3.0                                                             ║
-║  Date    : 2026-02-28                                                        ║
+║  Version : 2.6.0                                                             ║
+║  Date    : 2026-03-01                                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 
 1. 시스템 개요
 ================================================================================
 
-ALASKA v2.3은 초저지연(Ultra-low latency) 실시간 제어를 위한 멀티프로세스 태스크 
-관리 프레임워크이다. v2.3에서는 모든 핵심 인프라(통신, 통계, 구독, 감시)를 
-공유 메모리 자원(SmAsset)으로 통합하여 성능을 극대화하였다.
+ALASKA v2.6은 초저지연(Ultra-low latency) 실시간 제어를 위한 멀티프로세스 태스크
+관리 프레임워크이다. v2.6에서는 모든 핵심 인프라(통신, 통계, 구독, 감시)를
+공유 메모리 자원(SmAsset)으로 통합하고, InvokeDispenser(단일 스레드 통합 디스패처)
+기반의 CPU 절감 최적화를 완성하였다.
+
+v2.6 주요 최적화:
+  - RMI 응답 대기: spin-wait → Kernel Event (response_event)
+  - Signal 발신: send_queue 위임 → caller 스레드 직접 emit (Direct Emit)
+  - 조건부 notify: is_sleeping 플래그 기반 불필요 syscall 제거
+  - 시간 호출 간소화: perf_counter() → 카운트 기반 burst guard
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          ALASKA v2.3 Architecture                           │
+│                          ALASKA v2.6 Architecture                           │
 │                                                                             │
 │  ┌──────────┐    ┌─────────────────┐    ┌──────────┐    ┌──────────┐        │
 │  │  GConfig  │    │  SmAsset Family │    │  Signal   │    │  Monitor  │        │
@@ -29,9 +36,10 @@ ALASKA v2.3은 초저지연(Ultra-low latency) 실시간 제어를 위한 멀티
 │                          └──────┬──────┘                                    │
 │                    ┌────────────┼────────────┐                              │
 │              ┌─────┴─────┐ ┌───┴────┐ ┌─────┴─────┐                       │
-│              │TaskRuntime│ │  RMI   │ │TaskRuntime│                        │
-│              │ (thread)  │ │ Client │ │ (process) │                        │
-│              └───────────┘ └────────┘ └───────────┘                        │
+│              │TaskRuntime│ │Invoke  │ │TaskRuntime│                        │
+│              │ (thread)  │ │Dispenser│ │ (process) │                        │
+│              └───────────┘ │(단일TH)│ └───────────┘                        │
+│                            └────────┘                                      │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 
@@ -44,11 +52,16 @@ ALASKA v2.3은 초저지연(Ultra-low latency) 실시간 제어를 위한 멀티
 목적: 태스크 간 원격 메서드 호출 (RMI) 및 초저지연 동기화
 
 핵심 클래스:
-  - RmiClient      : 프로세스 간 RMI 호출 (Pipe 기반)
-  - DirectClient   : 스레드 간 직접 호출 (Zero-IPC)
-  - SmLockFreeEvent: 공유 메모리 스핀락 기반 초저지연 프로세스 통지 (New)
+  - RmiClient        : 프로세스 간 RMI 호출 (SmRingBuffer 기반)
+  - DirectClient     : 스레드 간 직접 호출 (Zero-IPC)
+  - InvokeDispenser  : 단일 스레드 IPC+Signal 통합 디스패처 (v2.5~)
 
-파일: task_manager.py, sm_lock_free_event.py
+v2.6 변경:
+  - RMI 응답 대기: spin-wait → response_event (SmKernelEvent) 커널 대기
+  - InvokeDispenser 응답 후 caller.response_event.set() 호출
+  - 조건부 notify: target.is_sleeping == 1일 때만 notify_event.set()
+
+파일: task_manager.py
 
 
 2.2 Signal (이벤트 통신 및 QoS)
@@ -56,15 +69,19 @@ ALASKA v2.3은 초저지연(Ultra-low latency) 실시간 제어를 위한 멀티
 
 목적: Pub/Sub 패턴 기반 이벤트 브로드캐스트 및 실시간성 보장(QoS)
 
-QoS 기능 (v2.3):
+QoS 기능 (v2.3~):
   - Priority       : 5단계 우선순위 멀티 큐 스케줄링
   - Deadline       : 처리 기한 초과 시 자동 폐기 및 에러 보고
   - Chain Trace    : 시그널 체인(A->B->C) 전체 지연 시간 추적
 
+v2.6 변경:
+  - Direct Emit: emit() → broker.emit() 직접 호출 (send_queue 위임 제거)
+  - 조건부 notify: is_sleeping 플래그 기반 불필요 syscall 제거
+
 핵심 클래스:
   - SignalBroker     : 중앙 브로커 (SmSignalRegistry 연동)
   - SignalClient     : 태스크별 송수신 및 QoS 엔진
-  - SmSignalRegistry : 전역 구독 비트맵 레지스트리 (O(1) 조회) (New)
+  - SmSignalRegistry : 전역 구독 비트맵 레지스트리 (O(1) 조회)
 
 파일: task_signal.py, sm_signal_registry.py
 
@@ -74,9 +91,13 @@ QoS 기능 (v2.3):
 
 목적: 태스크 생명주기 관리 및 하트비트 기반 자가 치유
 
-자가 치유 (v2.3):
+자가 치유:
   - Watchdog       : SmSignalRegistry의 하트비트 감시
   - Auto-Restart   : 태스크 정지/좀비 감지 시 자동 재시작
+
+동적 생성:
+  - add_task()     : 런타임 중 Thread 모드 Task 동적 추가
+  - remove_task()  : 런타임 중 Task 동적 삭제
 
 파일: task_manager.py, task_decoration.py
 
@@ -90,22 +111,40 @@ QoS 기능 (v2.3):
 │  SmAsset Family                                                             │
 │                                                                             │
 │  1. 데이터 전달: SmBlock(이미지), SmRingBuffer(메시지), SmQueue(IPC)        │
-│  2. 상태 제어: SmValue(스칼라), SmSignalRegistry(구독), SmLockFreeEvent(신호)│
+│  2. 상태 제어: SmValue(스칼라), SmSignalRegistry(구독), SmKernelEvent(통지) │
 │  3. 감시 통계: SmSignalStats(성능), SmBlackBox(세션 감시)                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 핵심 클래스:
   - SmBlock         : 이미지 버퍼 풀 (Free-List, O(1))
-  - SmSignalStats   : 실시간 시그널 성능 통계소 (New)
-  - SmBlackBox      : 시그널 체인 세션 완료 보장 감시 (New)
+  - SmKernelEvent   : Win32 커널 이벤트 (CPU 0% 대기, notify/response)
+  - SmSignalStats   : 실시간 시그널 성능 통계소
 
-파일: sm_block.py, sm_value.py, sm_signal_stats.py, sm_blackbox.py
+파일: sm_block.py, sm_value.py, sm_kernel_event.py, sm_signal_stats.py
+
+
+2.5 InvokeDispenser (v2.5~, 단일 스레드 통합 디스패처)
+--------------------------------------------------------------------------------
+
+목적: IPC(RMI)와 Signal을 단일 스레드에서 직렬 처리하여
+      Deadlock-Free 보장 및 CPU 사용량 최소화
+
+루프 구조 (v2.6):
+  ① Signal RECV — QoS P1→P5 우선순위 스캔 (★ 우선 처리)
+  ② IPC/RMI   — request_q 폴링 (Signal 처리 후)
+  ③ Kernel Wait — 모든 큐 비어있으면 CPU 0% 대기
+
+v2.6: ① Signal SEND 단계 제거 (Direct Emit으로 대체)
+
+상세 설계: 2016.InvokeDispenser설계.txt 참조
+
+파일: task_manager.py (_invoke_dispenser 메서드)
 
 
 3. 구현 구조
 ================================================================================
 
-3.1 전체 파일 구성 (sm_memory 패키지 강화)
+3.1 전체 파일 구성 (sm_infra 패키지 강화)
 --------------------------------------------------------------------------------
 
 ┌──────────────────────────┬──────────────────────────────────────────────────┐
@@ -114,15 +153,16 @@ QoS 기능 (v2.3):
 │ sm_block.py              │ 이미지 블록 풀 관리 (SmBlock)                    │
 │ sm_value.py              │ 고속 스칼라 값 공유 (SmValue)                    │
 │ sm_ring_buffer.py        │ Lock-free 메시지 전달 (SmRingBuffer)             │
-│ sm_queue.py              │ SharedMemory IPC 큐 (SmQueue)                    │
+│ sm_queue.py              │ SharedMemory IPC 큐 (SmQueue, SmSignalQueue)     │
 │ sm_signal_stats.py       │ 실시간 시그널 통계 집계 (SmSignalStats)          │
 │ sm_signal_registry.py    │ 구독 비트맵 및 태스크 등록 (SmSignalRegistry)    │
 │ sm_blackbox.py           │ 시그널 체인 세션 감시 (SmBlackBox)               │
+│ sm_kernel_event.py       │ Win32 커널 이벤트 (SmKernelEvent)                │
 │ sm_lock_free_event.py    │ 초저지연 스핀락 이벤트 (SmLockFreeEvent)         │
 └──────────────────────────┴──────────────────────────────────────────────────┘
 
 
-4. 성능 목표 (v2.3)
+4. 성능 목표 (v2.6)
 ================================================================================
 
 4.1 지연 시간 (Latency)
@@ -131,11 +171,29 @@ QoS 기능 (v2.3):
   ┌──────────────────────────┬────────────┬────────────────────────────────────┐
   │ 작업                     │ 목표       │ 구현 방법                          │
   ├──────────────────────────┼────────────┼────────────────────────────────────┤
+  │ RMI ping 왕복 (process)  │ < 0.1ms    │ SmRingBuffer + Kernel Event Wait  │
   │ Signal emit (구독조회)   │ < 0.001ms  │ SmSignalRegistry 비트맵 조회      │
-  │ 통계 기록 (record)       │ < 0.005ms  │ SmSignalStats 직접 메모리 쓰기    │
-  │ 프로세스 통지 (Event)    │ < 0.001ms  │ SmLockFreeEvent 스핀락            │
+  │ Signal emit→recv 왕복    │ < 0.2ms    │ Direct Emit + QoS 큐              │
+  │ 중첩호출 1단              │ < 0.2ms    │ response_event 커널 깨움           │
+  │ 프로세스 통지 (Event)    │ < 0.05ms   │ SmKernelEvent (조건부 set)        │
+  │ Idle 대기                │ CPU 0%     │ SmKernelEvent.wait()              │
   │ BlackBox 세션 체크       │ < 0.01ms   │ SmBlackBox 슬롯 접근              │
   └──────────────────────────┴────────────┴────────────────────────────────────┘
+
+4.2 실측 성능 (v2.6 — 2026-03-01 측정)
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────┬────────────┬────────────┬───────────────────┐
+  │ 항목                         │ v2.0       │ v2.6       │ 개선              │
+  ├──────────────────────────────┼────────────┼────────────┼───────────────────┤
+  │ RMI ping (process)           │ 0.605ms    │ 0.056ms    │ 11x 빠름          │
+  │ RMI add 연산 (process)       │ 0.598ms    │ 0.047ms    │ 13x 빠름          │
+  │ Signal emit→recv 왕복        │ 0.238ms    │ 0.115ms    │ 2x 빠름           │
+  │ Signal 5구독자 브로드캐스트   │ 0.467ms    │ 0.165ms    │ 3x 빠름           │
+  │ 중첩호출 1단                  │ 1.046ms    │ 0.104ms    │ 10x 빠름          │
+  │ 중첩호출 2단                  │ 1.383ms    │ 0.141ms    │ 10x 빠름          │
+  │ 5 프로세스 동시호출           │ 0.469ms    │ 0.061ms    │ 8x 빠름           │
+  └──────────────────────────────┴────────────┴────────────┴───────────────────┘
 
 
 5. 실시간 가시성 (Visibility)
@@ -144,12 +202,13 @@ QoS 기능 (v2.3):
 5.1 SmAsset 모니터링
 --------------------------------------------------------------------------------
 
-  ALASKA v2.3의 모든 공유 메모리 자원은 웹 디버거에서 실시간 가시화된다.
+  ALASKA v2.6의 모든 공유 메모리 자원은 웹 디버거에서 실시간 가시화된다.
   - Signal Stats: 각 시그널의 실시간 Transit/Proc Latency 차트 제공
   - BlackBox: 실행 중인 시그널 체인의 단계별 완료 현황 트리 뷰
   - Registry: 현재 살아있는 태스크와 구독 맵 Mermaid 다이어그램
+  - Dispenser Telemetry: cycle_time, handler_time, idle_wait 카운터
 
 
 ================================================================================
-  End of Document - 1101.구조설명서 (v2.3 Update)
+  End of Document - 1101.구조설명서 (v2.6 Update)
 ================================================================================

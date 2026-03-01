@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    from py_alaska.qt import AlaskaApp
+    from py_alaska import AlaskaApp
     from example.ex050_select_signal.dest_ui import ResultWindow, set_window
 
     class MainWindow(ResultWindow):

@@ -28,7 +28,7 @@ import time
 import random
 import threading
 from collections import defaultdict
-from src import TaskManager, reset_rmi_stats
+from py_alaska import TaskManager
 
 # === 전역 통계 ===
 stats = {
@@ -272,7 +272,6 @@ def reset_stats():
         stats["events_emitted"] = 0
         stats["events_received"] = 0
         stats["event_stats"].clear()
-    reset_rmi_stats()
 
 
 def print_stats(process_stats=None):
@@ -574,6 +573,8 @@ def main_scalability():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     # main()           # 기본 스트레스 테스트 (모니터 포함)
     # main_simple()    # 간단한 버전 (모니터 없음)
     # main_mixed()     # Thread + Process 혼합 테스트

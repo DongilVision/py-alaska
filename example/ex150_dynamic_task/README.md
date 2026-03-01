@@ -63,7 +63,7 @@
 | `manager.get_status()` | 전체 태스크 상태 조회 |
 | `self.runtime.name` | 태스크 런타임 이름 접근 |
 | `self.runtime.running` | 태스크 실행 상태 확인 |
-| `@rmi_signal("event_name")` | 시그널 핸들러 등록 |
+| `signal_subscribe=["event_name"]` + `on_event_name()` | 시그널 자동 구독 및 핸들러 매핑 |
 
 ## 설정 (config.json)
 ```json

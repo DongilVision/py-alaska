@@ -1,4 +1,6 @@
 # Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
+# Project : ALASKA 2.0 — Multiprocess Task Framework
+# Date    : 2026-03-02
 """
 ImiCameraView Widget (DeviceProperty 버전)
 ==========================================
@@ -473,36 +475,34 @@ class ImiCameraView(QWidget):
     def on_camera_received(self, signal):
         """Signal: 프레임 수신 — InvokeDispenser 스레드에서 직접 실행
 
-        - 모든 프레임: FPS 카운트 + mfree (프레임 손실 없음)
+        - 모든 프레임: FPS 카운트 (프레임 손실 없음)
         - 60 FPS분만: 버퍼 복사 → _frame_ready Signal → UI 스레드 표시
+        - mfree는 save_image 태스크가 담당 (copy만 수행)
         """
         if not self.smblock:
             return
 
         data = signal.data
         sm_index = data["sm_index"]
-        try:
-            now = time.time()
+        now = time.time()
 
-            # FPS 카운터: 수신된 모든 프레임 계산
-            self.frame_count += 1
-            self.total_frame_count += 1
-            elapsed = now - self.last_fps_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.last_fps_time = now
+        # FPS 카운터: 수신된 모든 프레임 계산
+        self.frame_count += 1
+        self.total_frame_count += 1
+        elapsed = now - self.last_fps_time
+        if elapsed >= 1.0:
+            self.fps = self.frame_count / elapsed
+            self.frame_count = 0
+            self.last_fps_time = now
 
-            # 표시 주기 외 프레임: mfree만 하고 종료 (버퍼 복사/변환 없음)
-            if now - self._last_display_time < self._display_interval:
-                return
+        # 표시 주기 외 프레임: 스킵 (버퍼 복사/변환 없음)
+        if now - self._last_display_time < self._display_interval:
+            return
 
-            self._last_display_time = now
-            image = self.smblock.get_buffer(sm_index).copy()
-            # Qt Signal로 UI 스레드에 전달 (자동 queued connection)
-            self._frame_ready.emit(image, self.total_frame_count, self.fps)
-        finally:
-            self.smblock.mfree(sm_index)
+        self._last_display_time = now
+        image = self.smblock.get_buffer(sm_index).copy()
+        # Qt Signal로 UI 스레드에 전달 (자동 queued connection)
+        self._frame_ready.emit(image, self.total_frame_count, self.fps)
 
     def _on_frame_ready_ui(self, image, total_count, current_fps):
         """UI 스레드: 프레임 표시 (_frame_ready Signal 수신)"""

@@ -1,4 +1,6 @@
 # Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
+# Project : ALASKA 2.0 — Multiprocess Task Framework
+# Date    : 2026-03-02
 """
 IMI Camera Driver (DEVICE_PROPERTY 버전)
 ========================================
@@ -19,8 +21,6 @@ import multiprocessing
 import queue
 import time
 from dataclasses import dataclass
-from typing import Optional
-
 import cv2
 import numpy as np
 
@@ -48,6 +48,13 @@ INITIAL_WAIT = 1
 QUEUE_TIMEOUT = 0.3
 
 TAG = "[imi_cam_dp]"  # staticmethod용 (self.print 불가)
+
+_BAYER_MAP = {
+    "bg": cv2.COLOR_BayerBG2BGR,
+    "gb": cv2.COLOR_BayerGB2BGR,
+    "rg": cv2.COLOR_BayerRG2BGR,
+    "gr": cv2.COLOR_BayerGR2BGR,
+}
 
 
 @dataclass
@@ -356,7 +363,7 @@ class imi_cam_dp:
 
             # ② Zero-copy numpy 뷰 (buffer_ptr.contents 복사 제거)
             rx_frame = np.frombuffer(
-                self._buf_type.from_address(pImage.pData), dtype=np.uint8)
+                self._buf_type.from_address(ctypes.cast(pImage.pData, ctypes.c_void_p).value), dtype=np.uint8)
 
             dst_buffer = self.smblock.get_buffer(index)
 
@@ -384,29 +391,53 @@ class imi_cam_dp:
                 self.smblock.mfree(index)
         except Exception as e:
             self.smblock.mfree(index)
-            self.print(f"ERROR Frame processing error: {e}")
+            self.exception(e)
 
     def _select_convert_fn(self, pImage):
-        """연결 후 1회만 호출 — 변환 함수 결정 및 캐시"""
+        """연결 후 1회만 호출 — 변환 함수 결정 및 캐시
+
+        판정 기준:
+            bpp = uiSize / (H * W)   → 1: mono/bayer8, 2: 10/12/16bit, 3: BGR
+            ch  = smblock channels    → 1: mono 저장,   3: color 저장
+            bayer_pattern (config.json) → "bg","gb","rg","gr" (기본 "bg")
+        """
         ch = self._sm_channels
+        H, W = pImage.uiHeight, pImage.uiWidth
+        bpp = pImage.uiSize // (H * W)
         bd = pImage.uiBitDepth
-        if ch == 1:
-            if bd != 8:
-                return lambda f, img, dst: dst.__setitem__(
-                    slice(None), f.reshape(img.uiHeight, img.uiWidth))
+
+        bayer_key = getattr(self, 'bayer_pattern', 'bg').lower()
+        _code = _BAYER_MAP.get(bayer_key, cv2.COLOR_BayerBG2BGR)
+
+        self.print(f"convert: {W}x{H} bd={bd} bpp={bpp} bayer={bayer_key} sm_ch={ch}")
+
+        if bpp >= 3:
+            # 카메라가 이미 BGR 출력
+            if ch == 3:
+                return lambda f, img, dst: np.copyto(
+                    dst, f.reshape(img.uiHeight, img.uiWidth, 3))
             else:
                 return lambda f, img, dst: cv2.cvtColor(
-                    f.reshape(img.uiHeight, img.uiWidth, -1),
+                    f.reshape(img.uiHeight, img.uiWidth, 3),
                     cv2.COLOR_BGR2GRAY, dst=dst)
-        else:
-            if bd != 8:
+        elif bpp == 2:
+            # 10/12/16bit (uint16 packed)
+            _shift = max(0, bd - 8)
+            if ch == 3:
                 return lambda f, img, dst: cv2.cvtColor(
-                    f.reshape(img.uiHeight, img.uiWidth),
-                    cv2.COLOR_GRAY2BGR, dst=dst)
+                    (f.view(np.uint16).reshape(img.uiHeight, img.uiWidth) >> _shift).astype(np.uint8),
+                    _code, dst=dst)
             else:
+                return lambda f, img, dst: np.copyto(dst,
+                    (f.view(np.uint16).reshape(img.uiHeight, img.uiWidth) >> _shift).astype(np.uint8))
+        else:
+            # bpp==1: Mono8 또는 Bayer8
+            if ch == 3:
                 return lambda f, img, dst: cv2.cvtColor(
-                    f.reshape(img.uiHeight, img.uiWidth, -1),
-                    cv2.COLOR_BayerGB2BGR, dst=dst)
+                    f.reshape(img.uiHeight, img.uiWidth), _code, dst=dst)
+            else:
+                return lambda f, img, dst: np.copyto(
+                    dst, f.reshape(img.uiHeight, img.uiWidth))
 
     def RecvFrameDropCallBack(self, _=None):
         self.rx_drop += 1

@@ -1,0 +1,371 @@
+============================================================================
+  ex510_save_image - 이미지 저장 시스템 설계
+  Date: 2026-03-02 (rev.5)
+============================================================================
+
+1. 개요
+----------------------------------------------------------------------------
+카메라에서 수신한 프레임을 디스크에 저장하는 시스템.
+세션(S001, S002...) 단위로 이미지를 관리하며, single-slot 지연저장,
+ThreadPoolExecutor 병렬 쓰기, max_fps 제한, 보존 기간 초과 자동 삭제.
+
+    Task 구성:
+        imi_cam_dp      — 카메라 드라이버 (기존, process)
+        ImiCameraView   — 좌측 카메라 뷰어 (기존, main_thread)
+        saver           — 이미지 저장 워커 (신규, process)
+        SaveImageUI     — 우측 저장 UI 패널 (신규, main_thread)
+
+    주의: Task 이름에 언더스코어(_) 사용 금지.
+          ALASKA 시그널 파서가 on_X_Y → X.Y 로 변환하므로
+          save_image → save.image.* 매칭 실패. → "saver" 사용.
+
+
+2. 사용법
+----------------------------------------------------------------------------
+
+2.1 실행
+
+    python -m example.ex510_save_image.main
+
+    또는:
+        cd example/ex510_save_image
+        python main.py
+
+2.2 기본 조작
+
+    1) 앱 시작 → 카메라 자동 연결 → 좌측 실시간 뷰 표시
+    2) [Save] 버튼 클릭 → 저장 시작
+       - 세션 디렉토리 생성 (D:/images_xxx/2026/03/02/S001/)
+       - 그리드 테이블에 새 세션 행 추가 (하늘색)
+       - 하단 미리보기에 마지막 저장 이미지 표시
+    3) [Stop] 버튼 클릭 → 저장 중지
+       - 세션 행 회색 처리
+    4) [Save] 다시 클릭 → 새 세션 (S002) 생성, seq=1부터
+
+2.3 세션 스캔 / 이미지 조회
+
+    [Scan] 버튼:
+    - 세션 디렉토리 재스캔 (기존 행 갱신/삭제 + 새 세션 추가)
+    - 테이블 행 또는 save_path에서 base_dir(YYYY/MM/DD) 자동 추출
+
+    이미지 뷰어 열기:
+    - 테이블 행 더블클릭 → ImageViewerDialog 열림
+    - 테이블 우클릭 → "Open" 메뉴 선택
+
+    뷰어 조작:
+    - ◀ Prev / Next ▶ 버튼 또는 좌/우 화살표 키로 네비게이션
+    - 마우스 휠 → 확대/축소 (스크롤 위치 비율 유지)
+    - 좌클릭 드래그 → 패닝 (확대 상태에서)
+    - 더블클릭 → fit ↔ 100% 토글
+    - +/-/0 키 → 확대/축소/맞춤
+    - Delete 키 또는 [Delete Image] → 현재 이미지 삭제 (confirm)
+    - [Delete All] → 해당 세션 디렉토리 전체 삭제 (confirm)
+    - ESC → 닫기
+    - 대화창 닫기 후 → 디렉토리 재스캔 (삭제 시 행 제거, 변경 시 카운트 갱신)
+
+2.4 세션 삭제 (context 메뉴)
+
+    - 테이블 우클릭 → "Delete Session" 메뉴 선택
+    - confirm 대화 후 세션 디렉토리 전체 삭제 + 테이블 행 제거
+
+2.5 config.json 설정
+
+    "saver/saver": {
+        "save_path": "D:/images_xxx",   저장 루트 경로
+        "retain_days": 30,              보존 일수 (0=무제한)
+        "image_format": "png",          png / bmp / jpg
+        "max_fps": 10,                  초당 최대 저장 장수
+        "debug": "msg"                  디버그 메시지 출력
+    }
+
+    포맷별 특성:
+        png  — 무손실, compression=1 (속도 우선)
+        bmp  — 무손실, 무압축 (최고속, 파일 큼)
+        jpg  — 손실, quality=95 (파일 작음)
+
+
+3. 디렉토리 구조
+----------------------------------------------------------------------------
+
+    save_path/
+    └── 2026/
+        └── 03/
+            ├── 01/
+            │   ├── S001/
+            │   │   ├── img_0001_20260301_091023_456.png
+            │   │   └── img_0002_20260301_091023_789.png
+            │   └── S002/
+            │       └── img_0001_20260301_140512_123.png
+            └── 02/
+                └── S001/
+                    ├── img_0001_20260302_143052_123.png
+                    └── img_0002_20260302_143053_456.png
+
+    구조: save_path / YYYY / MM / DD / S{NNN} / img_{seq}_{timestamp}.{ext}
+
+    - 날짜 디렉토리: 카메라 연결 시 자동 생성 (_base_dir)
+    - 세션 디렉토리: Save 버튼 시 S001, S002, ... 자동 생성 (_session_dir)
+    - 세션 번호: 기존 S??? 디렉토리 스캔 → max+1
+    - seq: 세션마다 1부터 시작 (파일명은 타임스탬프로 유니크)
+
+
+4. 화면 레이아웃
+----------------------------------------------------------------------------
+
+    ┌──────────────────────────┬──────────────────────┐
+    │                          │ [Save/Stop] [Scan]   │
+    │                          │  ──────────────────── │
+    │    ImiCameraView         │  Directory  Ses Saved │
+    │    (카메라 실시간 뷰)    │  ─────────────────── │
+    │                          │  .../02/S001 #1   47 │ ← 우클릭: context 메뉴
+    │                          │  .../02/S002 #2   12 │   (Open / Delete Session)
+    │                          │  ──────────────────── │
+    │                          │  ┌─ 미리보기 ───────┐ │
+    │                          │  │ (마지막 저장 IMG) │ │
+    │                          │  └──────────────────┘ │
+    └──────────────────────────┴──────────────────────┘
+
+    비율: 좌 70% / 우 30% (QSplitter)
+
+    테이블 색상:
+        활성 세션: #4fc3f7 (하늘색)
+        종료 세션: #666666 (회색)
+        Dropped > 0: #ff4444 (빨간색)
+
+
+5. Task 설계
+----------------------------------------------------------------------------
+
+5.1 saver (이미지 저장 워커)
+
+    @task(name="saver", mode="process")
+    class SaveImage:
+        smblock         — 공유 메모리 블록
+        save_path       — 저장 루트 경로
+        retain_days     — 보존 일수 (0=무제한)
+        image_format    — png / bmp / jpg
+        max_fps         — 초당 최대 저장 수
+
+    시그널 수신:
+        on_camera_connected     — _prepare_base_dir()
+        on_camera_disconnected  — _session_close()
+        on_camera_received      — save_q 적재 + mfree
+
+    시그널 발신:
+        saver.saved     — 저장 완료 1건 (path, seq, dropped)
+        saver.session   — 세션 상태 변경 (open/close)
+
+    RMI (SaveImageUI에서 호출):
+        start_saving()  — S??? 디렉토리 생성 + 저장 시작
+        stop_saving()   — 저장 중지 + 세션 닫기
+        get_status()    — 현재 상태 조회
+
+5.2 SaveImageUI (저장 UI 패널)
+
+    @task()
+    class SaveImageUI(QWidget):
+        target: inject("client:saver")
+
+    버튼:
+        [Save/Stop]     — saver RMI (start_saving/stop_saving)
+        [Scan]          — 세션 디렉토리 재스캔 (기존 갱신 + 새 세션 추가)
+
+    테이블 context 메뉴 (우클릭):
+        Open            — ImageViewerDialog 열기
+        Delete Session  — 세션 디렉토리 전체 삭제 (confirm)
+
+    시그널 수신 (@ui_thread 필수):
+        on_saver_saved      — 테이블 갱신 + 미리보기
+        on_saver_session    — 세션 행 추가/종료
+
+5.3 ImageViewerDialog
+
+    class ImageViewerDialog(QDialog):
+        - 상단: Prev/Next 네비게이션 + 줌 표시 + 파일명
+        - 중앙: QScrollArea + QLabel (확대/축소/패닝)
+        - 하단: [Delete Image] + [Delete All] (confirm)
+        - 마우스: 휠(줌), 좌클릭드래그(패닝), 더블클릭(fit↔100%)
+        - 키보드: ←→ 네비게이션, +/-/0 줌, Delete, ESC
+        - 닫힘 후: 부모 테이블 _rescan_row() 호출
+
+
+6. smblock 소유권
+----------------------------------------------------------------------------
+
+    원칙: mfree는 가장 느린 소비자(saver)가 담당
+
+    viewer:  copy만 수행, mfree 하지 않음
+    saver:   copy + mfree (finally 블록에서 항상 수행)
+
+    주의: saver Task 없으면 mfree 미수행 → 슬롯 고갈
+
+
+7. 저장 파이프라인
+----------------------------------------------------------------------------
+
+7.1 Single-Slot 디바운스
+
+    on_camera_received → copy → _pending_frame 교체 → mfree → return
+    드롭 카운트/시그널 발신 없음 (main loop에서 처리)
+
+7.2 Main Loop (Rate Limiting)
+
+    _pending_event.wait() → frame pickup → max_fps 체크
+        통과: executor.submit(_write_image) → saved.emit (워커에서)
+        미달: _dropped_count += 1 → continue (시그널 미발신)
+
+    dropped 카운트는 saved 시그널에 포함되어 UI에 전달.
+    (overflow 시그널 폭주 방지 — 시그널 버퍼 포화 원인이었음)
+
+7.3 ThreadPoolExecutor (병렬 쓰기)
+
+    max_workers=4: cv2.imwrite를 워커 스레드에서 병렬 실행
+    run 루프: submit() 후 즉시 반환 → 다음 프레임 수신 가능
+    _emit_lock: 워커 간 signal emit 직렬화
+    세션 닫기: futures_wait() → 미완료 쓰기 대기 후 close
+
+
+8. 세션 생명주기
+----------------------------------------------------------------------------
+
+    camera.connected  ─→  _prepare_base_dir()
+         │                  └─ save_path/YYYY/MM/DD 생성
+         │
+         ├── [Save] ──────→  start_saving()
+         │                    ├─ S??? 스캔 → S{max+1} 디렉토리 생성
+         │                    ├─ seq=0, dropped=0 초기화
+         │                    └─ session.emit("open") → UI 행 추가
+         │
+         ├── camera.received → save_q 적재 + mfree
+         │                     main loop → rate limit → save/drop
+         │
+         ├── [Stop] ──────→  stop_saving()
+         │                    ├─ session.emit("close") → UI 행 회색
+         │                    └─ _session_dir = None
+         │
+         ├── [Save] ──────→  start_saving()  (S002 생성)
+         │
+         ├── 30분 idle ───→  _session_close()
+         │
+    camera.disconnected ─→ _session_close()
+                            ├─ flush + futures_wait
+                            ├─ session.emit("close")
+                            └─ _cleanup_expired()
+
+
+9. 시그널 흐름도
+----------------------------------------------------------------------------
+
+    imi_cam_dp          ImiCameraView       saver              SaveImageUI
+    ──────────         ─────────────       ──────────         ─────────────
+        │                    │                  │                    │
+        ├─ connected ───────→│                  │                    │
+        ├─ connected ───────→├─────────────────→│ _prepare_base_dir  │
+        │                    │                  │                    │
+        │                    │                  │              [Save 버튼]
+        │                    │                  │◀── start_saving() ─┤
+        │                    │                  ├─ S001 생성         │
+        │                    │                  ├─ session("open") ─→│ 행 추가
+        │                    │                  │                    │
+        ├─ received ────────→│ copy (mfree 안함) │                    │
+        ├─ received ────────→├─────────────────→│ copy+slot+mfree   │
+        │                    │                  ├─ submit(write)     │
+        │                    │                  │   └─ saved.emit ──→│ 테이블+미리보기
+        │                    │                  │                    │
+        │                    │                  │              [Stop 버튼]
+        │                    │                  │◀── stop_saving() ──┤
+        │                    │                  ├─ session("close")─→│ 행 회색
+        │                    │                  │                    │
+        │                    │                  │              [Scan 버튼]
+        │                    │                  │                    ├─ _find_base_dir()
+        │                    │                  │                    ├─ _scan_sessions()
+        │                    │                  │                    │
+        │                    │                  │              [더블클릭 / 우클릭 → Open]
+        │                    │                  │                    ├─ ImageViewerDialog
+        │                    │                  │                    ├─ _rescan_row()
+        │                    │                  │                    │
+        │                    │                  │              [우클릭 → Delete Session]
+        │                    │                  │                    ├─ confirm → rmtree
+        │                    │                  │                    ├─ 행 제거
+        │                    │                  │                    │
+        ├─ disconnected ────→│                  │                    │
+        ├─ disconnected ────→├─────────────────→│ _session_close()   │
+        │                    │                  ├─ session("close")─→│ 행 회색
+        │                    │                  ├─ cleanup_expired() │
+        ▼                    ▼                  ▼                    ▼
+
+
+10. config.json
+----------------------------------------------------------------------------
+
+    {
+      "task_config": {
+        "camera1/imi_cam_dp": {
+          "@import": "example.ex510_save_image.task_cam_driver",
+          "smblock": "smblock:smblock2048",
+          "mac_address": "00:09:7e:35:80:38",
+          "fps": 900,
+          "exposure": 15000,
+          "trigger_source": "hardware",
+          "trigger_mode": false
+        },
+        "viewer/ImiCameraView": {
+          "@import": "example.ex510_save_image.task_viewer",
+          "target": "client:camera1",
+          "smblock": "smblock:smblock2048"
+        },
+        "saver/saver": {
+          "@import": "example.ex510_save_image.task_save_image",
+          "smblock": "smblock:smblock2048",
+          "save_path": "D:/images_xxx",
+          "retain_days": 30,
+          "image_format": "png",
+          "max_fps": 10,
+          "debug": "msg"
+        },
+        "save_ui/SaveImageUI": {
+          "@import": "example.ex510_save_image.task_save_image_ui",
+          "target": "client:saver"
+        }
+      }
+    }
+
+
+11. 버그 방어
+----------------------------------------------------------------------------
+
+    이중 mfree           → viewer는 mfree 안함, saver 단독 담당
+    threading pickle     → __init__에서 None, run()에서 생성
+    Task 이름 언더스코어 → "saver" 사용 (_없음)
+    시그널 버퍼 포화     → rate limit 드롭 시 overflow.emit 안함
+    디스크 풀            → _check_disk_space() 100MB 여유 확인
+    빈 디렉토리 정리     → rmdir OSError 무시
+    imwrite 실패         → 반환값 체크 + WARN 로그
+    iterdir OSError      → 모든 iterdir() 호출에 try/except 래핑
+    삭제 후 행 인덱스    → _session_row 보정 (row 삭제 시 > row 감소)
+    빈 파일 목록 UI      → image_label.clear() + 버튼 비활성화
+
+
+12. 파일 구성
+----------------------------------------------------------------------------
+
+    example/ex510_save_image/
+    ├── config.json              — Task 설정
+    ├── main.py                  — AlaskaApp.run() 진입점
+    ├── task_cam_driver.py       — 카메라 드라이버 (기존)
+    ├── task_viewer.py           — 카메라 뷰어 (기존, mfree 제거됨)
+    ├── task_save_image.py       — 이미지 저장 워커
+    ├── task_save_image_ui.py    — 저장 UI + ImageViewerDialog
+    └── save_image설계.txt       — 본 설계서
+
+
+13. 성능 최적화 이력
+----------------------------------------------------------------------------
+
+    v1 (큐):       queue.Queue + cv2.imwrite 동기 블로킹
+    v2 (디바운스): single-slot → 메모리 안정, 속도 동일
+    v3 (병렬):     ThreadPoolExecutor(4) + PNG level 1
+    v4 (rate):     max_fps 제한 + overflow.emit 제거 (버퍼 포화 해결)
+    v5 (UI):       QScrollArea 줌/패닝, Scan 버튼 (세션 재스캔),
+                   context 메뉴 (Open / Delete Session), 공통 코드 추출,
+                   스타일 상수 통합, 대화창 닫힘 후 재스캔

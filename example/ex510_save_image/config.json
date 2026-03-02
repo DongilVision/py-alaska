@@ -19,19 +19,31 @@
   },
   "task_config": {
     "camera1/imi_cam_dp": {
-      "@import": "example.ex130a_camera.task_cam_driver",
+      "@import": "example.ex510_save_image.task_cam_driver",
       "smblock": "smblock:smblock2048",
       "mac_address": "00:09:7e:35:80:38",
       "fps": 900,
       "exposure": 15000,
       "trigger_source": "hardware",
-      "trigger_mode": false,
-      "debug": "sig"
+      "trigger_mode": false
     },
     "viewer/ImiCameraView": {
-      "@import": "example.ex130a_camera.task_viewer",
+      "@import": "example.ex510_save_image.task_viewer",
       "target": "client:camera1",
       "smblock": "smblock:smblock2048"
+    },
+    "saver/saver": {
+      "@import": "example.ex510_save_image.task_save_image",
+      "smblock": "smblock:smblock2048",
+      "save_path": "D:/images_xxx",
+      "retain_days": 30,
+      "image_format": "png",
+      "max_fps": 2,
+      "debug": "msg"
+    },
+    "save_ui/SaveImageUI": {
+      "@import": "example.ex510_save_image.task_save_image_ui",
+      "target": "client:saver"
     }
   }
 }

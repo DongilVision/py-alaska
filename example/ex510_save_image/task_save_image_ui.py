@@ -439,13 +439,8 @@ class SaveImageUI(QWidget):
         self._init_ui()
 
     def run(self):
-        """초기화: saver 상태 조회."""
-        if self.target:
-            try:
-                status = self.target.get_status()
-                self._save_path = status.get("session_dir", "") or ""
-            except Exception:
-                pass
+        """초기화 (시작 시 saver 미기동 → RMI 호출 없음)."""
+        pass
 
     # ═══════════════════════════════════════════════════════════════════
     # UI 초기화

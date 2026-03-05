@@ -1,0 +1,578 @@
+============================================================================
+  ALASKA v2.6 - IPC / Signal 개요 및 Quick 개발자 매뉴얼
+  Date: 2026-03-03
+============================================================================
+
+
+1. 일반 개념
+----------------------------------------------------------------------------
+
+1.1 Task 간 통신이란
+
+    ALASKA는 기능을 Task 단위로 분리한다.
+    각 Task는 독립된 스레드 또는 프로세스에서 실행되므로,
+    Task 간 데이터 교환에는 통신 메커니즘이 필요하다.
+
+    ALASKA는 두 가지 통신 방식을 제공한다:
+
+        ┌────────────────────────────────────────────────┐
+        │                                                │
+        │   IPC (RMI)          Signal                    │
+        │   ─────────          ──────                    │
+        │   1:1 호출            1:N 이벤트               │
+        │   동기 / 비동기       비동기 전용               │
+        │   반환값 있음          반환값 없음               │
+        │   메서드 호출 형태     이벤트 발행/구독 형태     │
+        │                                                │
+        └────────────────────────────────────────────────┘
+
+1.2 IPC (Inter-Process Communication)
+
+    다른 Task의 메서드를 로컬 메서드처럼 호출한다.
+    내부적으로 직렬화 → 전송 → 실행 → 응답 반환이 자동 처리된다.
+
+        ┌──────────┐   "add(1,2)"   ┌──────────┐
+        │ Caller   │ ────────────> │ Target   │
+        │          │               │ add(1,2) │
+        │          │   result=3    │ return 3 │
+        │          │ <──────────── │          │
+        └──────────┘               └──────────┘
+
+    사용자 입장에서는 일반 메서드 호출과 동일하다:
+
+        result = self.worker.add(1, 2)      # 마치 로컬 호출
+
+1.3 Signal
+
+    이벤트를 발행하면, 구독한 모든 Task가 수신한다.
+    발행자는 누가 수신하는지 알 필요가 없다 (느슨한 결합).
+
+        ┌──────────┐   "sensor.temp"   ┌──────────┐
+        │ Publisher│ ────────────────> │ Sub A    │
+        │          │ ────────────────> │ Sub B    │
+        │          │ ────────────────> │ Sub C    │
+        └──────────┘                   └──────────┘
+
+    사용자 코드:
+
+        self.signal.emit("sensor.temp", 25.5)   # 발행 (1:N)
+
+1.4 IPC vs Signal 선택 기준
+
+    상황                                      권장
+    ────────────────────────────────────────  ─────────────
+    특정 Task의 메서드 호출 + 반환값 필요       IPC (동기)
+    특정 Task에 커맨드 전달 (반환값 불필요)     IPC (.nowait())
+    이벤트 알림 (1:N, 누가 받든 상관없음)       Signal
+    실시간 데이터 스트림 (프레임, 센서)          Signal + QoS
+    시스템 상태 변경 알림                       Signal + CRITICAL
+    UI 갱신                                    Signal + @ui_thread
+
+
+2. IPC API
+----------------------------------------------------------------------------
+
+2.1 설정 (config.json)
+
+    IPC를 사용하려면 config.json에서 injection을 설정한다:
+
+        {
+            "tasks": {
+                "controller": {
+                    "class": "ControllerJob",
+                    "injection": {
+                        "worker": "client:worker_task"
+                    }
+                },
+                "worker_task": {
+                    "class": "WorkerJob"
+                }
+            }
+        }
+
+    → controller의 self.worker가 worker_task에 대한 IPC 클라이언트가 된다.
+
+2.2 동기 호출 — self.worker.method()
+
+    대상 Task의 메서드를 호출하고 결과를 기다린다.
+
+        result = self.worker.add(1, 2)          # 블로킹, 반환값 O
+        result = self.worker.process(data)      # 인자 전달 가능
+
+    특징:
+    - 호출 스레드가 응답 올 때까지 블록됨
+    - 타임아웃: 기본 2초 → RmiTimeoutError 발생
+    - 반환값 수신 가능
+
+2.3 비동기 호출 — self.worker.method.nowait()
+
+    요청만 보내고 즉시 리턴한다 (Fire-and-Forget).
+
+        self.worker.start_job.nowait()          # 비블로킹, 반환값 X
+        self.worker.process.nowait(data, k=v)   # 인자 전달 가능
+
+    특징:
+    - 호출 즉시 리턴 (블로킹 없음)
+    - 반환값 없음 (항상 None)
+    - UI 스레드에서 안전하게 사용 가능
+
+2.4 비동기 호출 — self.worker.method.async_call()
+
+    요청을 보내고 즉시 리턴하되, 완료 시 signal로 결과를 전달한다.
+
+        self.worker.run_analysis.async_call(done="analysis.done")
+        self.worker.run_analysis.async_call(done="analysis.done",
+                                            error="analysis.error")
+
+    특징:
+    - 호출 즉시 리턴 (블로킹 없음)
+    - 반환값을 signal.data로 비동기 수신
+    - UI 스레드에서 안전하게 사용 가능
+
+2.5 변수 접근
+
+    대상 Task의 인스턴스 변수를 원격으로 읽기/쓰기한다.
+
+        value = self.worker.status              # 읽기 (동기, 블로킹)
+        self.worker.status = "running"          # 쓰기 (동기, 블로킹)
+
+2.6 API 요약 표
+
+    코드                                  블로킹  반환값  UI안전
+    ──────────────────────────────────── ──────  ──────  ──────
+    self.worker.method(args)              O       O       △(*)
+    self.worker.method.nowait(args)       X       X       O
+    self.worker.method.async_call(done=)  X       O(**)   O
+    self.worker.variable                  O       O       △(*)
+    self.worker.variable = val            O       X       △(*)
+
+    (*)  UI 스레드에서 사용 시, 대상이 @ui_thread signal을 emit하면
+         데드락 위험 → .nowait() 또는 .async_call() 사용 권장
+    (**) signal 경유로 비동기 수신
+
+2.7 예외 처리
+
+2.6 예외 처리
+
+    대상 메서드에서 예외 발생 시, 호출 측에서 동일 예외를 수신한다:
+
+        try:
+            result = self.worker.risky_method()
+        except Exception as e:
+            print(f"Remote error: {e}")
+            # e에는 원격 traceback도 포함됨
+
+    주요 예외:
+    - RmiTimeoutError: 응답 타임아웃 (기본 2초)
+    - InvokeDeadlockError: 자기 자신에게 동기 RMI 호출
+    - CircularRmiError: 순환 호출 감지 (A→B→A)
+
+
+3. Signal API
+----------------------------------------------------------------------------
+
+3.1 Signal 발행 — emit()
+
+    이벤트를 발행한다. 구독자가 있으면 모두에게 전달된다.
+
+        # 기본 형식
+        self.signal.emit("event.name", data)
+
+        # QoS 지정
+        self.signal.emit("event.name", data, qos="REALTIME")
+        self.signal.emit("event.name", data, qos={"priority": 2, "deadline": 0.030})
+
+        # 체인 형식 (동일 동작)
+        self.signal.event.name.emit(data)
+        self.signal.event.name.emit(data, qos="REALTIME")
+
+    특징:
+    - 비동기: emit 후 즉시 리턴
+    - 1:N: 구독한 모든 Task에게 전달
+    - 구독자가 없으면 아무 일도 일어나지 않음
+
+3.2 Signal 수신 — 핸들러 등록 (3가지 방법)
+
+    ■ 방법 1: @rmi_signal 데코레이터 (권장)
+
+        @task()
+        class MyJob:
+            @rmi_signal("sensor.temperature")
+            def on_temp_change(self, signal):
+                print(f"Temp: {signal.data}")
+
+        ※ 메서드명은 자유. 데코레이터의 signal 이름이 매핑 기준.
+
+    ■ 방법 2: signal_subscribe (규칙 기반 자동)
+
+        @task(signal_subscribe=["sensor.temperature", "system.status"])
+        class MyJob:
+            def on_sensor_temperature(self, signal):     # 자동 매핑
+                ...
+            def on_system_status(self, signal):           # 자동 매핑
+                ...
+
+        ※ 규칙: "a.b.c" → on_a_b_c() (점 → 언더스코어)
+
+    ■ 방법 3: signal_forward (Qt Signal 브리지)
+
+        @task(signal_forward={"frame.ready": "frameReady"})
+        class ViewerUI(QWidget):
+            frameReady = Signal(object)     # Qt Signal로 자동 변환
+
+        ※ ALASKA Signal이 Qt Signal로 변환되어 UI 스레드에서 수신됨
+
+3.3 Signal 동적 구독/해제
+
+    런타임에 동적으로 구독/해제할 수 있다:
+
+        # 구독
+        self.signal.on("event.name", self.handler_method)
+
+        # 해제
+        self.signal.off("event.name", self.handler_method)
+
+3.4 Signal 객체
+
+    핸들러가 수신하는 signal 객체의 속성:
+
+        def on_event(self, signal):
+            signal.name       # str: "sensor.temperature"
+            signal.source     # str: 발행자 Task ID
+            signal.data       # Any: 전달된 데이터
+            signal.qos        # dict: QoS 설정
+
+3.5 QoS 프리셋
+
+    프리셋         우선순위  Deadline  용도
+    ───────────  ────────  ────────  ──────────────────
+    "CRITICAL"    P1        10ms      긴급 (에러, 종료)
+    "REALTIME"    P2        30ms      실시간 (프레임, 센서)
+    "NORMAL"      P3        100ms     일반 (기본값)
+    "LOW"         P4        500ms     낮은 우선순위
+    "BACKGROUND"  P5        2000ms    배경 (로깅, 통계)
+
+    사용법:
+        self.signal.emit("event", data, qos="REALTIME")
+
+
+4. Quick 개발자 매뉴얼
+----------------------------------------------------------------------------
+
+4.1 최소 예제: IPC 호출
+
+    # jobs.py
+    from py_alaska import task
+
+    @task()
+    class Calculator:
+        def add(self, a, b):
+            return a + b
+
+        def multiply(self, a, b):
+            return a * b
+
+    @task()
+    class Controller:
+        # self.calc는 config.json에서 "client:calculator"로 주입됨
+        def run(self):
+            result = self.calc.add(3, 5)        # → 8
+            print(f"3 + 5 = {result}")
+
+            self.calc.multiply.nowait(2, 3)     # Fire-and-Forget
+            print("multiply 호출 완료 (결과 안 기다림)")
+
+    # config.json
+    {
+        "tasks": {
+            "calculator": {"class": "Calculator"},
+            "controller": {
+                "class": "Controller",
+                "injection": {"calc": "client:calculator"}
+            }
+        }
+    }
+
+4.2 최소 예제: Signal 통신
+
+    # jobs.py
+    from py_alaska import task
+    from py_alaska.core.task_decoration import rmi_signal
+
+    @task()
+    class Sensor:
+        def run(self):
+            import time
+            while self.running:
+                temp = self._read_sensor()
+                self.signal.emit("sensor.temp", temp)
+                time.sleep(1.0)
+
+        def _read_sensor(self):
+            import random
+            return round(20 + random.random() * 10, 1)
+
+    @task()
+    class Logger:
+        @rmi_signal("sensor.temp")
+        def on_temp(self, signal):
+            print(f"[{signal.source}] Temperature: {signal.data}°C")
+
+    @task()
+    class Alarm:
+        @rmi_signal("sensor.temp")
+        def on_temp(self, signal):
+            if signal.data > 28.0:
+                print(f"★ HIGH TEMP WARNING: {signal.data}°C")
+
+    # config.json (injection 불필요 — Signal은 자동 구독)
+    {
+        "tasks": {
+            "sensor": {"class": "Sensor"},
+            "logger": {"class": "Logger"},
+            "alarm":  {"class": "Alarm"}
+        }
+    }
+
+4.3 최소 예제: Qt UI Task
+
+    from py_alaska import task
+    from py_alaska.qt import ui_thread
+    from py_alaska.core.task_decoration import rmi_signal
+    from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton
+
+    @task()
+    class Dashboard(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.label = QLabel("--°C")
+            self.btn = QPushButton("Start")
+            layout = QVBoxLayout()
+            layout.addWidget(self.label)
+            layout.addWidget(self.btn)
+            self.setLayout(layout)
+
+            self.btn.clicked.connect(self.on_start)
+
+        # ★ Signal 수신 + UI 갱신
+        @rmi_signal("sensor.temp")
+        @ui_thread
+        def on_temp(self, signal):
+            self.label.setText(f"{signal.data}°C")
+
+        # ★ IPC 호출 (UI 스레드 → .nowait() 필수)
+        def on_start(self):
+            self.sensor.start_capture.nowait()   # 안전
+
+            # ✕ 위험: self.sensor.start_capture()
+            #   → 동기 RMI, UI 블록, 데드락 가능
+
+4.4 IPC + Signal 조합 패턴
+
+    IPC로 작업을 요청하고, Signal로 결과를 수신하는 패턴:
+
+    @task()
+    class Analyzer:
+        @rmi_signal("request.analysis")
+        def on_request(self, signal):
+            result = self._heavy_work(signal.data)
+            self.signal.emit("result.analysis", result)
+
+    @task()
+    class Controller:
+        def start(self):
+            # Signal로 요청 (1:N 가능, 비동기)
+            self.signal.emit("request.analysis", {"mode": "full"})
+
+        @rmi_signal("result.analysis")
+        def on_result(self, signal):
+            print(f"분석 완료: {signal.data}")
+
+4.5 자주 하는 실수와 해결
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 실수 1: UI 스레드에서 동기 RMI                              │
+    │                                                             │
+    │   ✕  def on_click(self):                                    │
+    │          result = self.worker.process()   # 데드락 위험     │
+    │                                                             │
+    │   ○  def on_click(self):                                    │
+    │          self.worker.process.nowait()     # 안전            │
+    └─────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 실수 2: Signal 핸들러에서 UI 직접 조작                      │
+    │                                                             │
+    │   ✕  @rmi_signal("data.ready")                              │
+    │      def on_data(self, signal):                             │
+    │          self.label.setText(str(signal.data))  # 크래시     │
+    │                                                             │
+    │   ○  @rmi_signal("data.ready")                              │
+    │      @ui_thread                              # 추가        │
+    │      def on_data(self, signal):                             │
+    │          self.label.setText(str(signal.data))  # 안전       │
+    └─────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 실수 3: 자기 자신에게 동기 RMI                              │
+    │                                                             │
+    │   ✕  self.self_client.my_method()  # InvokeDeadlockError   │
+    │                                                             │
+    │   ○  self.my_method()              # 직접 호출             │
+    └─────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 실수 4: Process 모드에서 pickle 불가능한 데이터 전달        │
+    │                                                             │
+    │   ✕  self.signal.emit("evt", lambda x: x+1)  # pickle 불가│
+    │                                                             │
+    │   ○  self.signal.emit("evt", {"fn": "add", "val": 1})      │
+    └─────────────────────────────────────────────────────────────┘
+
+4.6 빠른 참조 카드
+
+    ┌──────────────────────────────────────────────────────────┐
+    │  IPC                                                     │
+    │  ───                                                     │
+    │  result = self.target.method(args)   동기, 반환값 O      │
+    │  self.target.method.nowait(args)     비동기, 반환값 X    │
+    │  val = self.target.variable          변수 읽기           │
+    │  self.target.variable = val          변수 쓰기           │
+    ├──────────────────────────────────────────────────────────┤
+    │  Signal                                                  │
+    │  ──────                                                  │
+    │  self.signal.emit("name", data)      발행               │
+    │  self.signal.emit("name", data,      발행 + QoS         │
+    │                   qos="REALTIME")                        │
+    │  @rmi_signal("name")                 핸들러 등록        │
+    │  @ui_thread                          UI 스레드 전환     │
+    ├──────────────────────────────────────────────────────────┤
+    │  주의사항                                                │
+    │  ────────                                                │
+    │  UI에서 동기 RMI → .nowait() 사용                        │
+    │  UI에서 Signal 수신 → @ui_thread 추가                    │
+    │  자기 자신 RMI → 직접 호출                               │
+    │  Process 모드 → pickle 가능 데이터만                     │
+    └──────────────────────────────────────────────────────────┘
+
+
+5. IPC 내부 프로토콜
+----------------------------------------------------------------------------
+
+5.1 개요
+
+    IPC(RMI)의 내부 통신은 공유 메모리 링 버퍼(SmRingBuffer)를 통해
+    바이트 스트림으로 전달된다. v2.6에서 Binary RMI Protocol을 도입하여
+    pickle 직렬화 호출을 최소화했다.
+
+        v2.5 이전:  request/response 모두 pickle dict
+        v2.6:       고정 헤더(struct) + 가변 payload(pickle)
+
+5.2 Binary RMI Protocol 형식
+
+    ■ Request (Caller → InvokeDispenser)
+
+        ┌────────────────────────────────────────────────────┐
+        │ Header (6 bytes, struct '<BHBBB')                  │
+        ├──────┬──────┬───────┬──────┬──────┐               │
+        │ 0xB1 │ seq  │ flags │ mlen │ clen │               │
+        │  1B  │  2B  │  1B   │  1B  │  1B  │               │
+        ├──────┴──────┴───────┴──────┴──────┘               │
+        │ method (mlen bytes, UTF-8)                         │
+        │ caller (clen bytes, UTF-8, 없으면 0)               │
+        │ [tail: pickle(dict)] — flags & 0x01 일 때만        │
+        └────────────────────────────────────────────────────┘
+
+        - magic: 0xB1 (Binary Request 식별자)
+        - seq: uint16 요청 시퀀스 (stale 응답 감지용)
+        - flags: bit0 = tail 존재 여부
+        - mlen: 메서드 이름 길이
+        - clen: caller Task ID 길이 (외부 호출 시 0)
+
+        tail dict 구조 (인자/chain 존재 시만):
+            {'a': args, 'kw': kwargs, 'chain': set, 'rq': SmRingBuffer}
+
+    ■ Response (InvokeDispenser → Caller)
+
+        ┌────────────────────────────────────────────────────┐
+        │ Header (4 bytes, struct '<BHB')                    │
+        ├──────┬──────┬────────┐                             │
+        │ 0xB2 │ seq  │ status │                             │
+        │  1B  │  2B  │  1B    │                             │
+        ├──────┴──────┴────────┘                             │
+        │ [payload: pickle(result)] — status > 0 일 때만     │
+        └────────────────────────────────────────────────────┘
+
+        - magic: 0xB2 (Binary Response 식별자)
+        - seq: uint16 (요청 seq 에코)
+        - status:
+            0x00 = result가 None (payload 없음, 4 bytes only)
+            0x01 = result 있음 (pickle(result) 추가)
+            0x02 = error 발생 (pickle({'e':..., 'trace':...}) 추가)
+
+5.3 Pickle 호출 횟수 비교
+
+    호출 유형                v2.5 (pickle dict)    v2.6 (binary)
+    ─────────────────────  ──────────────────    ──────────────
+    noop() — 인자 없음,       pickle 4회             0회
+      결과 None              (req dump/load         (struct만 사용,
+                              + resp dump/load)      pickle 불필요)
+
+    method(a,b) → result     pickle 4회             pickle 2회
+                             (dict 전체 직렬화)     (args만 + result만
+                                                     직렬화)
+
+    method(a,b) → None       pickle 4회             pickle 1회
+                                                    (args만 직렬화,
+                                                     응답은 4B struct)
+
+    method() → error         pickle 4회             pickle 2회
+                                                    (error dict 직렬화)
+
+5.4 Wire 크기 비교 (noop 호출 예시)
+
+    v2.5 Request:  pickle.dumps({'m':'noop','_id':1,'c':'caller'})
+                   → ~80~120 bytes
+
+    v2.6 Request:  [0xB1][0x01,0x00][0x00][0x04][0x06] + "noop" + "caller"
+                   → 16 bytes (5x 감소)
+
+    v2.5 Response: pickle.dumps({'r': None, '_id': 1})
+                   → ~30~50 bytes
+
+    v2.6 Response: [0xB2][0x01,0x00][0x00]
+                   → 4 bytes (10x 감소)
+
+5.5 Backward Compatibility (하위 호환)
+
+    InvokeDispenser는 수신 데이터의 첫 바이트로 형식을 자동 감지한다:
+
+        data[0] == 0xB1 → Binary Protocol (v2.6)
+        data[0] == 0x80 → Pickle Protocol 5 (v2.5 이전)
+
+    이를 통해 다음 경로들이 공존한다:
+
+        _call()          → Binary (동기 RMI, 성능 최적화 대상)
+        _call_nowait()   → Pickle (Signal 큐 경유, 비동기)
+                            또는 Pickle (SmRingBuffer fallback)
+
+5.6 성능 영향
+
+    PM-01 RMI round-trip:  0.070ms → 0.040ms  (-43%)
+    PM-04 RMI throughput:  18,535  → 20,923 TPS (+13%)
+    PM-05 Multi-task TPS:  16,994  → 24,029 TPS (+41%)
+
+    핵심 원인: pickle.dumps/loads는 호출당 5~10μs 소요.
+    noop 경로에서 4회 → 0회 제거로 ~20~30μs/roundtrip 절감.
+
+
+6. 상태
+----------------------------------------------------------------------------
+
+    상태: 확정 (v2.6)
+    등록일: 2026-03-03
+    갱신일: 2026-03-03 (5장 Binary RMI Protocol 추가)
+    분류: IPC / Signal 개요 및 개발자 매뉴얼
+    관련: doc/3060____IPC설계.txt (상세 IPC 설계)
+          doc/3070____Signal설계.txt (상세 Signal 설계)
+          doc/3080____InvokeDispenser설계.txt (디스패처 설계)

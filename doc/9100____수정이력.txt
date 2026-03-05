@@ -3,8 +3,110 @@
 ║  Modification History                                                        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  Version : 2.6.0                                                             ║
-║  Date    : 2026-03-01                                                        ║
+║  Date    : 2026-03-04                                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+================================================================================
+[v2.6.0] 2026-03-04 — 코드 리뷰 3차 (예외 보강, 통합, 간소화)
+================================================================================
+
+■ Round 1 (예외 보강 + 중복 제거 + 알고리즘 간소화)
+
+  ┌────┬──────────────────────┬──────────────────────────────────────────┐
+  │ ID │ 파일                 │ 내용                                     │
+  ├────┼──────────────────────┼──────────────────────────────────────────┤
+  │ E2 │ task_log.py          │ 파일 회전 시 안전 가드 (open 실패 방어)  │
+  │ E3 │ _rmi_client.py       │ write retry 실패 시 reason 전달          │
+  │ E3 │ task_error.py        │ RmiTimeoutError.reason 파라미터 추가     │
+  │ E4 │ sm_queue.py          │ 세마포어 복구 (read None 시 release)     │
+  │ D1 │ _utils.py            │ _build_chain() 공통 추출 (순환 감지)     │
+  │ D2 │ _utils.py            │ _make_async_worker() 공통 추출           │
+  │ D2 │ _task_client.py      │ async_call → _make_async_worker 사용     │
+  │ D5 │ task_performance.py  │ _window_stats() 공통 추출 (6곳 통합)     │
+  │ D6 │ task_decoration.py   │ QObject 체크 3블록 → 루프 통합           │
+  │ S2 │ sm_signal_registry   │ get_subscribers bit-shift 조기 종료      │
+  │ S3 │ sm_value.py          │ _DTYPE_TO_CODE 역방향 맵 O(n)→O(1)      │
+  │ S4 │ _task_validator.py   │ _has_run_method 제거 → _find_run 통합    │
+  └────┴──────────────────────┴──────────────────────────────────────────┘
+
+■ Round 2 (예외 보강 + 통합 + 간소화)
+
+  ┌────┬──────────────────────┬──────────────────────────────────────────┐
+  │ ID │ 파일                 │ 내용                                     │
+  ├────┼──────────────────────┼──────────────────────────────────────────┤
+  │ E1 │ sm_mutex.py          │ close()/__del__ 예외 보호                │
+  │ E2 │ sm_blackbox.py       │ walrus 제거 (ndarray 항상 truthy)        │
+  │ A1 │ task_signal.py       │ 중복 pass 제거                           │
+  │ C1 │ task_signal.py       │ _get_queues_cached() 추출 (2곳 통합)    │
+  │ C2 │ _rmi_client.py       │ _trace_call() 추출 (debug trace 통합)   │
+  │ C3 │ sm_block.py          │ SmBlockBuffer release() 통합             │
+  └────┴──────────────────────┴──────────────────────────────────────────┘
+
+■ Round 3 (예외 보강 + 통합 + 간소화)
+
+  ┌────┬──────────────────────┬──────────────────────────────────────────┐
+  │ ID │ 파일                 │ 내용                                     │
+  ├────┼──────────────────────┼──────────────────────────────────────────┤
+  │ E5 │ _base.py             │ _ShmBase.__del__() GC 리소스 안전 해제   │
+  │ E5 │ _shm_utils.py        │ safe_shm_close() shm.close() 예외 보호  │
+  │ E6 │ sm_mutex.py          │ release() 예외 보호                      │
+  │ A2 │ sm_signal_registry   │ _find_sig_slot() 중복 조건 분리          │
+  │ C2 │ _rmi_client.py       │ 응답 대기 루프 통합 + _raise_timeout()   │
+  └────┴──────────────────────┴──────────────────────────────────────────┘
+
+■ 성능 검증 (3회 측정 중앙값)
+
+  PM-01 RMI ping:     0.039ms (동일)    PM-09 Ping-pong:   0.119ms (+5%)
+  PM-02 Signal P→T:   0.077ms (동일)    PM-10 3-Hop RMI:   0.140ms (동일)
+  PM-12 Pure Signal:  0.145ms (+13%)    PM-07 Registry:    2.6μs  (동일)
+
+  테스트: 42/42 성능, 12/12 시그널, 87/88 기능 (1 기존 flaky)
+
+
+================================================================================
+[v2.6.0] 2026-03-04 — 모듈 분리 및 클래스 추출
+================================================================================
+
+■ 700줄 초과 파일 5개 → 내부 서브모듈 분리 (가독성·유지보수성 향상)
+
+  외부 API 변경 0건 — 원본 파일이 하위 모듈을 re-import하여 호환성 유지.
+
+  ┌──────────────────────┬─────────────────────┬──────────────────────────────┐
+  │ 원본 파일 (줄수)     │ 분리 모듈           │ 이동 대상                    │
+  ├──────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ task_signal.py (868) │ _signal_core.py     │ QoS, Signal, PriorityScheduler│
+  │                      │                     │ PayloadTooLargeError, 상수   │
+  │ task_decoration (702)│ _task_validator.py   │ TaskValidator                │
+  │ gconfig.py (1,289)   │ _config_errors.py   │ ConfigError + 10 예외 서브클래스│
+  │                      │ _config_infra.py    │ PathParser, FileLock 등 10종 │
+  │ task_manager (2,338) │ _rmi_client.py      │ RmiClient, _RmiProxy 등      │
+  │                      │ _task_client.py     │ DirectClient, _SignalEmitter  │
+  │ tab_camera.py (732)  │ _zoom_view.py       │ ZoomView, CameraView         │
+  └──────────────────────┴─────────────────────┴──────────────────────────────┘
+
+■ 클래스 추출 및 캡슐화 (v2.6 IPC 리팩토링)
+
+  ┌──────────────────────┬──────────────────────┬──────────────────────────────┐
+  │ 클래스               │ 파일                 │ 역할                         │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────┤
+  │ ShmResourceFactory   │ _shm_factory.py      │ SHM 리소스 생성 로직 캡슐화  │
+  │ SubscriberCache      │ _subscriber_cache.py │ SignalBroker 캐시 6필드 캡슐화│
+  │ RmiProtocol          │ _rmi_protocol.py     │ 바이너리 RMI 프로토콜 핸들러 │
+  └──────────────────────┴──────────────────────┴──────────────────────────────┘
+
+■ Bug Fix
+
+  - _broker._q_cache → _broker._cache.q_cache (SubscriberCache 리팩토링 후 경로 수정)
+
+■ 패키지명 변경: sm_memory → sm_infra
+
+■ SmMutex 추가 (sm_mutex.py)
+  - Win32 Named Mutex 래퍼 (프로세스 간 상호배제)
+  - SmSignalQueue의 Multi-Producer 보호에 사용
+
+   수정 파일: core/ 내부 모듈 7개 신규, qt/ 내부 모듈 1개 신규
+   전체 테스트 결과: 129 passed (87 기능 + 42 성능), 1 flaky
 
 
 ================================================================================
@@ -51,7 +153,7 @@
    - 42개 성능 시험 전수 통과
 
 ■ 테스트 보고서: tests/REPORT_PERFORMANCE.txt
-■ 설계서: doc/2016.InvokeDispenser설계.txt (section 11)
+■ 설계서: doc/3080.InvokeDispenser설계.txt (section 11)
 
    전체 테스트 결과: 130 passed, 0 failed (2026-03-01 기준)
    (88 기능 + 42 성능)
@@ -83,7 +185,7 @@
    - Weighted Fair Queuing + Starvation Guard
    - CYCLE_QUOTAS = [20, 10, 5, 2, 1] (P1~P5)
 
-■ 설계서: doc/2016.InvokeDispenser설계.txt
+■ 설계서: doc/3080.InvokeDispenser설계.txt
 
    전체 테스트 결과: 88 passed, 0 failed
 
@@ -119,7 +221,7 @@
    - 하트비트 기반 태스크 정지/좀비 감지
    - 자동 재시작 (restart=True 설정 시)
 
-■ 설계서: doc/2013.시그널QOS기능V2.txt, doc/2014.SmInfra설계.txt
+■ 설계서: doc/3050.시그널QOS기능V2.txt, doc/4500.SmInfra설계.txt
 
    전체 테스트 결과: 88 passed, 0 failed
 

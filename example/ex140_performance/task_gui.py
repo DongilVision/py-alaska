@@ -1,5 +1,5 @@
 # Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
-"""GUI Task - Performance Test Orchestrator & Result Viewer (Qt)"""
+"""GUI Task - IPC Performance Test (Dark Theme, 3-Column Layout)"""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -9,430 +9,727 @@ import time
 import json
 import statistics
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import List
 from threading import Thread
 
 from py_alaska import task
-from py_alaska import ui_thread
+
+import matplotlib
+matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLabel, QGroupBox, QTableWidget, QTableWidgetItem,
-    QProgressBar, QTextEdit, QSplitter, QFrame
+    QPushButton, QLabel, QFrame, QSpinBox,
+    QProgressBar, QTabWidget, QCheckBox
 )
 from PySide6.QtCore import Qt, Signal as QtSignal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QFont, QShortcut, QKeySequence
+
+# ── Dark Theme Stylesheet ──────────────────────────────────────
+DARK_STYLE = """
+QWidget {
+    background-color: #222222;
+    color: #e0e0e0;
+    font-family: "Segoe UI", Arial;
+}
+QFrame#card {
+    background: #2b2b2b;
+    border: 1px solid #3a3a3a;
+    border-radius: 6px;
+}
+QFrame#card:hover {
+    border: 1px solid #4FC3F7;
+}
+QFrame#separator {
+    background: #3a3a3a;
+    max-height: 1px;
+}
+QSpinBox {
+    background: #2b2b2b;
+    border: 1px solid #444;
+    border-radius: 3px;
+    color: white;
+    padding: 4px 8px;
+    font-size: 13px;
+}
+QPushButton {
+    background: #333;
+    border: 1px solid #555;
+    color: white;
+    padding: 6px 14px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+QPushButton:hover {
+    background: #444;
+    border-color: #4FC3F7;
+}
+QPushButton:pressed {
+    background: #222;
+}
+QPushButton:disabled {
+    background: #222;
+    color: #555;
+    border-color: #333;
+}
+QPushButton#startBtn {
+    background: #2196F3;
+    border: none;
+    font-weight: bold;
+    padding: 8px;
+}
+QPushButton#startBtn:hover {
+    background: #42A5F5;
+}
+QPushButton#startBtn:disabled {
+    background: #1a3a5c;
+    color: #556;
+}
+QProgressBar {
+    border: 1px solid #333;
+    border-radius: 3px;
+    background: #252525;
+    text-align: center;
+    color: #aaa;
+    font-size: 11px;
+}
+QProgressBar::chunk {
+    background: #4CAF50;
+    border-radius: 2px;
+}
+QTabWidget::pane {
+    border: 1px solid #333;
+    background: #222222;
+}
+QTabBar::tab {
+    background: #2b2b2b;
+    color: #888;
+    border: 1px solid #333;
+    padding: 6px 16px;
+    margin-right: 2px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+QTabBar::tab:selected {
+    background: #222222;
+    color: #4FC3F7;
+    border-bottom: none;
+}
+QTabBar::tab:hover {
+    color: #e0e0e0;
+}
+QCheckBox {
+    color: #e0e0e0;
+    font-size: 20px;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 20px;
+    height: 20px;
+    border: 1px solid #555;
+    border-radius: 3px;
+    background: #2b2b2b;
+}
+QCheckBox::indicator:checked {
+    background: #FF9800;
+    border-color: #FF9800;
+}
+QCheckBox::indicator:hover {
+    border-color: #4FC3F7;
+}
+"""
 
 
-@task(name="PerformanceGui", signal_subscribe=["awake"])
+@task(name="PerformanceGui")
 class PerformanceGui(QWidget):
-    """Performance Test GUI Widget"""
+    """IPC Performance Test GUI — Dark Theme, 3-Column Layout"""
 
-    # Qt Signals for thread-safe UI updates
-    update_progress = QtSignal(int, int)  # current, total
-    update_log = QtSignal(str)
-    update_result = QtSignal(str, dict)  # test_name, metrics
-    test_completed = QtSignal(str)  # test_name
+    sig_progress = QtSignal(int, int)
+    sig_test_done = QtSignal(str)
 
-    # Success criteria
-    SIGNAL_TARGET_MS = 0.5
-    IPC_TARGET_MS = 3.0
-    TARGET_TPS = 300
-    TARGET_FAILURE_RATE = 0.1
+    WARMUP_COUNT = 10
 
     def __init__(self):
         super().__init__()
-        self.iterations = 100
-        self.warmup_count = 10
+        self.setStyleSheet(DARK_STYLE)
 
-        # RMI clients (injected)
-        self.p1 = None
-        self.t1 = None
-
-        # Test state
+        self.p1 = None  # RMI client (injected)
+        self.p2 = None  # RMI client for contention (injected)
+        self.p3 = None  # RMI client for contention (injected)
         self._running = False
-        self._signal_responses: Dict[str, Dict] = {}
-        self._pending_signal_count = 0
-
-        # Results storage
-        self.signal_results: Dict[str, List[float]] = {}
-        self.ipc_results: Dict[str, List[Dict]] = {}
+        self._results: List[float] = []
+        self._iterations_requested = 0
+        self._stat_labels = {}
+        self._btn_starts: List[QPushButton] = []
+        self._selected_test = "ipc"
 
         self._init_ui()
         self._connect_signals()
+        self._setup_shortcuts()
+
+    # ── UI Construction ─────────────────────────────────────────
 
     def _init_ui(self):
-        """Initialize UI components"""
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+        root.setContentsMargins(12, 8, 12, 8)
 
         # Title
-        title = QLabel("Signal / RMI Performance Test")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
+        title = QLabel("IPC Performance Test")
+        title.setFont(QFont("Segoe UI", 18, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
+        title.setStyleSheet("color: #ffffff; padding: 4px;")
+        root.addWidget(title)
 
-        # Criteria display
-        criteria_group = QGroupBox("Success Criteria")
-        criteria_layout = QHBoxLayout(criteria_group)
-        criteria_layout.addWidget(QLabel(f"Signal: < {self.SIGNAL_TARGET_MS}ms"))
-        criteria_layout.addWidget(QLabel(f"IPC: < {self.IPC_TARGET_MS}ms"))
-        criteria_layout.addWidget(QLabel(f"TPS: > {self.TARGET_TPS}"))
-        criteria_layout.addWidget(QLabel(f"Fail Rate: < {self.TARGET_FAILURE_RATE}%"))
-        layout.addWidget(criteria_group)
+        # ── 3-column main area ──
+        columns = QHBoxLayout()
+        columns.setSpacing(10)
 
-        # Test buttons
-        btn_group = QGroupBox("Test Controls")
-        btn_layout = QHBoxLayout(btn_group)
+        # LEFT: Stats panel
+        columns.addWidget(self._build_stats_panel())
 
-        self.btn_signal = QPushButton("1. Signal Test")
-        self.btn_signal.clicked.connect(lambda: self._start_test("signal"))
-        btn_layout.addWidget(self.btn_signal)
+        # CENTER: Graph
+        columns.addWidget(self._build_graph_panel(), stretch=1)
 
-        self.btn_process = QPushButton("2. Process IPC")
-        self.btn_process.clicked.connect(lambda: self._start_test("process"))
-        btn_layout.addWidget(self.btn_process)
+        # RIGHT: Scenario list
+        columns.addWidget(self._build_scenario_panel())
 
-        self.btn_thread = QPushButton("3. Thread IPC")
-        self.btn_thread.clicked.connect(lambda: self._start_test("thread"))
-        btn_layout.addWidget(self.btn_thread)
-
-        self.btn_all = QPushButton("Run All Tests")
-        self.btn_all.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        self.btn_all.clicked.connect(lambda: self._start_test("all"))
-        btn_layout.addWidget(self.btn_all)
-
-        layout.addWidget(btn_group)
+        root.addLayout(columns, stretch=1)
 
         # Progress bar
-        progress_group = QGroupBox("Progress")
-        progress_layout = QVBoxLayout(progress_group)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(True)
-        self.progress_label = QLabel("Ready")
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.progress_label)
-        layout.addWidget(progress_group)
+        self.progress_bar.setFixedHeight(18)
+        root.addWidget(self.progress_bar)
 
-        # Splitter for results and log
-        splitter = QSplitter(Qt.Vertical)
+    def _build_stats_panel(self) -> QWidget:
+        """Left panel — iteration count + statistics grid"""
+        panel = QWidget()
+        panel.setFixedWidth(400)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-        # Results table
-        result_frame = QFrame()
-        result_layout = QVBoxLayout(result_frame)
-        result_layout.setContentsMargins(0, 0, 0, 0)
-        result_label = QLabel("Results")
-        result_label.setFont(QFont("Arial", 12, QFont.Bold))
-        result_layout.addWidget(result_label)
+        # Iteration count
+        lbl = QLabel("시험 횟수")
+        lbl.setStyleSheet("color: #888; font-size: 22px;")
+        layout.addWidget(lbl)
 
-        self.result_table = QTableWidget()
-        self.result_table.setColumnCount(8)
-        self.result_table.setHorizontalHeaderLabels([
-            "Test", "Avg(ms)", "Min(ms)", "Max(ms)", "P95(ms)", "P99(ms)", "TPS", "Status"
-        ])
-        self.result_table.horizontalHeader().setStretchLastSection(True)
-        result_layout.addWidget(self.result_table)
-        splitter.addWidget(result_frame)
+        self.spin_iter = QSpinBox()
+        self.spin_iter.setRange(100, 1000000)
+        self.spin_iter.setValue(1000)
+        self.spin_iter.setSingleStep(100)
+        self.spin_iter.setStyleSheet(
+            "QSpinBox { background: #2b2b2b; border: 1px solid #444; "
+            "border-radius: 3px; color: white; padding: 6px 10px; font-size: 24px; }"
+        )
+        layout.addWidget(self.spin_iter)
 
-        # Log area
-        log_frame = QFrame()
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_label = QLabel("Log")
-        log_label.setFont(QFont("Arial", 12, QFont.Bold))
-        log_layout.addWidget(log_label)
+        # Contention option
+        self.chk_contention = QCheckBox("Contention")
+        self.chk_contention.setToolTip(
+            "ON: 흐름제어 없이 전부 emit (큐 경합 테스트)\n"
+            "OFF: 배치별 수신 확인 (안정 모드)"
+        )
+        layout.addWidget(self.chk_contention)
 
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
-        log_layout.addWidget(self.log_text)
-        splitter.addWidget(log_frame)
+        # Separator
+        layout.addWidget(self._separator())
 
-        layout.addWidget(splitter)
+        # Stats grid
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        stats = [
+            ("Avg", "avg"), ("Std", "std"), ("Min", "min"),
+            ("Max", "max"), ("P95", "p95"), ("P99", "p99"),
+            ("TPS", "tps"), ("Loss", "loss"),
+        ]
+        for row, (label, key) in enumerate(stats):
+            name = QLabel(label)
+            name.setStyleSheet("color: #888; font-size: 24px;")
+            value = QLabel("-")
+            value.setAlignment(Qt.AlignRight)
+            color = "#FF5252" if key == "max" else "#4FC3F7"
+            value.setStyleSheet(f"color: {color}; font-size: 24px; font-family: Consolas;")
+            grid.addWidget(name, row, 0)
+            grid.addWidget(value, row, 1)
+            self._stat_labels[key] = value
+
+        layout.addLayout(grid)
+        layout.addStretch()
+
+        # Export button
+        self.btn_export = QPushButton("결과 저장")
+        self.btn_export.setEnabled(False)
+        self.btn_export.clicked.connect(self._export_results)
+        layout.addWidget(self.btn_export)
+
+        return panel
+
+    def _build_graph_panel(self) -> QWidget:
+        """Center panel — tabbed graphs (scatter + histogram)"""
+        self.tab_graph = QTabWidget()
+
+        # Tab 1: Time per iteration (scatter)
+        self.fig_scatter = Figure(dpi=100, facecolor='#222222')
+        self.canvas_scatter = FigureCanvas(self.fig_scatter)
+        self.tab_graph.addTab(self.canvas_scatter, "시도별 측정시간")
+
+        # Tab 2: Histogram (100 bins)
+        self.fig_hist = Figure(dpi=100, facecolor='#222222')
+        self.canvas_hist = FigureCanvas(self.fig_hist)
+        self.tab_graph.addTab(self.canvas_hist, "히스토그램")
+
+        self._draw_empty_graphs()
+
+        return self.tab_graph
+
+    def _build_scenario_panel(self) -> QWidget:
+        """Right panel — test scenario cards"""
+        panel = QWidget()
+        panel.setFixedWidth(220)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        header = QLabel("시험 시나리오")
+        header.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(header)
+
+        scenarios = [
+            ("1. IPC Test", "P1 → P2",
+             "P1이 P2에게 직접 IPC 호출\nP2가 수신 소요시간 측정", "ipc"),
+            ("2. 3-Hop Test", "P1 → P2 → P3 → P4",
+             "3-hop 체인 IPC 호출\nP4에서 수신시간 측정", "hop"),
+            ("3. Signal Test", "P1 → P2",
+             "P1이 P2에게 시그널 발신\nP2가 수신 소요시간 측정", "sig"),
+            ("4. Signal 3-Hop", "P1 → P2 → P3 → P4",
+             "3-hop 시그널 체인\nP4에서 수신시간 측정", "sig3hop"),
+        ]
+        self._scenario_cards = []
+        for name, route, desc, test_type in scenarios:
+            card, btn = self._scenario_card(name, route, desc, test_type)
+            layout.addWidget(card)
+            self._btn_starts.append(btn)
+            self._scenario_cards.append((card, test_type))
+
+        layout.addStretch()
+        return panel
+
+    def _scenario_card(self, name: str, route: str, desc: str, test_type: str):
+        """Create a styled scenario card with start button"""
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(4)
+
+        title = QLabel(name)
+        title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        title.setStyleSheet("color: #ffffff; border: none; background: transparent;")
+        layout.addWidget(title)
+
+        route_lbl = QLabel(route)
+        route_lbl.setStyleSheet("color: #4FC3F7; font-size: 11px; border: none; background: transparent;")
+        layout.addWidget(route_lbl)
+
+        desc_lbl = QLabel(desc)
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet("color: #888; font-size: 10px; border: none; background: transparent;")
+        layout.addWidget(desc_lbl)
+
+        btn = QPushButton("시작  (F5)")
+        btn.setObjectName("startBtn")
+        btn.clicked.connect(lambda: self._select_and_start(test_type))
+        layout.addWidget(btn)
+
+        return card, btn
+
+    def _select_and_start(self, test_type: str):
+        """Select scenario and start test"""
+        self._selected_test = test_type
+        self._update_card_selection()
+        self._start_test(test_type)
+
+    def _update_card_selection(self):
+        """Highlight the selected scenario card"""
+        for card, t in self._scenario_cards:
+            if t == self._selected_test:
+                card.setStyleSheet(
+                    "QFrame#card { background: #2b2b2b; border: 2px solid #4FC3F7; border-radius: 6px; }"
+                )
+            else:
+                card.setStyleSheet("")
+
+    def _separator(self) -> QFrame:
+        sep = QFrame()
+        sep.setObjectName("separator")
+        sep.setFrameShape(QFrame.HLine)
+        return sep
+
+    def _draw_empty_graphs(self):
+        """Draw placeholder axes on both tabs"""
+        for fig, canvas, xlabel, ylabel in [
+            (self.fig_scatter, self.canvas_scatter, 'Iteration', 'Elapsed (ms)'),
+            (self.fig_hist, self.canvas_hist, 'Elapsed (ms)', 'Count'),
+        ]:
+            fig.clear()
+            ax = fig.add_subplot(111)
+            self._style_axes(ax)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title('Ready', fontsize=12, color='#888')
+            fig.tight_layout()
+            canvas.draw()
+
+    def _style_axes(self, ax):
+        """Apply dark theme to axes"""
+        ax.set_facecolor('#252525')
+        ax.tick_params(colors='#aaa', labelsize=9)
+        ax.xaxis.label.set_color('#aaa')
+        ax.yaxis.label.set_color('#aaa')
+        for spine in ax.spines.values():
+            spine.set_color('#444')
+        ax.grid(True, alpha=0.15, color='#666')
+
+    # ── Shortcuts ─────────────────────────────────────────────
+
+    def _setup_shortcuts(self):
+        """F5: start selected test, F11: toggle fullscreen"""
+        QShortcut(QKeySequence(Qt.Key_F5), self).activated.connect(
+            lambda: self._start_test(self._selected_test)
+        )
+        QShortcut(QKeySequence(Qt.Key_F11), self).activated.connect(
+            self._toggle_fullscreen
+        )
+
+    def _toggle_fullscreen(self):
+        win = self.window()
+        if win.isFullScreen():
+            win.showNormal()
+        else:
+            win.showFullScreen()
+
+    # ── Signal connections ──────────────────────────────────────
 
     def _connect_signals(self):
-        """Connect Qt signals to slots"""
-        self.update_progress.connect(self._on_progress)
-        self.update_log.connect(self._on_log)
-        self.update_result.connect(self._on_result)
-        self.test_completed.connect(self._on_test_completed)
+        self.sig_progress.connect(self._on_progress)
+        self.sig_test_done.connect(self._on_test_done)
 
     def _on_progress(self, current: int, total: int):
-        """Update progress bar"""
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"Progress: {current}/{total}")
 
-    def _on_log(self, message: str):
-        """Append log message"""
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self.log_text.append(f"[{timestamp}] {message}")
-
-    def _on_result(self, test_name: str, metrics: dict):
-        """Update result table"""
-        row = self.result_table.rowCount()
-        self.result_table.insertRow(row)
-
-        avg = metrics.get("avg_ms", 0)
-        target = self.SIGNAL_TARGET_MS if "signal" in test_name.lower() else self.IPC_TARGET_MS
-        passed = avg < target
-
-        items = [
-            test_name,
-            f"{metrics.get('avg_ms', 0):.4f}",
-            f"{metrics.get('min_ms', 0):.4f}",
-            f"{metrics.get('max_ms', 0):.4f}",
-            f"{metrics.get('p95_ms', 0):.4f}",
-            f"{metrics.get('p99_ms', 0):.4f}",
-            f"{metrics.get('tps', 0):.0f}",
-            "PASS" if passed else "FAIL"
-        ]
-
-        for col, text in enumerate(items):
-            item = QTableWidgetItem(str(text))
-            item.setTextAlignment(Qt.AlignCenter)
-            if col == 7:  # Status column
-                if passed:
-                    item.setBackground(QColor(76, 175, 80))  # Green
-                    item.setForeground(QColor(255, 255, 255))
-                else:
-                    item.setBackground(QColor(244, 67, 54))  # Red
-                    item.setForeground(QColor(255, 255, 255))
-            self.result_table.setItem(row, col, item)
-
-        self.result_table.resizeColumnsToContents()
-
-    def _on_test_completed(self, test_name: str):
-        """Handle test completion"""
+    def _on_test_done(self, test_name: str):
+        """Update graph + stats on main thread"""
         self._set_buttons_enabled(True)
-        self.progress_label.setText(f"{test_name} completed")
+        if not self._results:
+            return
+
+        results = self._results
+        n = len(results)
+        avg = statistics.mean(results)
+        std = statistics.stdev(results) if n > 1 else 0
+        mn, mx = min(results), max(results)
+        sr = sorted(results)
+        p95 = sr[int(n * 0.95)]
+        p99 = sr[int(n * 0.99)]
+        tps = 1000 / avg if avg > 0 else 0
+
+        # Loss
+        req = self._iterations_requested
+        loss = req - n if req > 0 else 0
+        loss_pct = (loss / req * 100) if req > 0 else 0
+
+        # Update stat labels
+        self._stat_labels["avg"].setText(f"{avg:.4f} ms")
+        self._stat_labels["std"].setText(f"{std:.4f} ms")
+        self._stat_labels["min"].setText(f"{mn:.4f} ms")
+        self._stat_labels["max"].setText(f"{mx:.4f} ms")
+        self._stat_labels["p95"].setText(f"{p95:.4f} ms")
+        self._stat_labels["p99"].setText(f"{p99:.4f} ms")
+        self._stat_labels["tps"].setText(f"{tps:,.0f}")
+        self._stat_labels["loss"].setText(f"{loss} ({loss_pct:.1f}%)")
+
+        # ── Tab 1: Scatter (time per iteration) ──
+        self.fig_scatter.clear()
+        ax1 = self.fig_scatter.add_subplot(111)
+        self._style_axes(ax1)
+
+        x = list(range(1, n + 1))
+        ax1.scatter(x, results, s=2, alpha=0.5, color='#42A5F5', zorder=2)
+
+        ax1.axhline(y=avg, color='#FF5252', linewidth=1.5,
+                     label=f'Avg: {avg:.4f} ms', zorder=3)
+        if std > 0:
+            lo = max(0, avg - std)
+            ax1.axhspan(lo, avg + std, alpha=0.12, color='#FF5252',
+                         label=f'Std: \u00b1{std:.4f} ms', zorder=1)
+
+        ax1.set_xlabel('Iteration')
+        ax1.set_ylabel('Elapsed (ms)')
+        ax1.set_title(test_name, fontsize=12, color='#e0e0e0', fontweight='bold')
+        ax1.legend(loc='upper right', fontsize=9, facecolor='#2b2b2b',
+                   edgecolor='#444', labelcolor='#ccc')
+        self.fig_scatter.tight_layout()
+        self.canvas_scatter.draw()
+
+        # ── Tab 2: Histogram (100 bins) ──
+        self.fig_hist.clear()
+        ax2 = self.fig_hist.add_subplot(111)
+        self._style_axes(ax2)
+
+        ax2.hist(results, bins=100, color='#42A5F5', edgecolor='#1a1a1a',
+                 alpha=0.85, zorder=2)
+
+        ax2.axvline(x=avg, color='#FF5252', linewidth=1.5,
+                     label=f'Avg: {avg:.4f} ms', zorder=3)
+        if std > 0:
+            lo = max(0, avg - std)
+            ax2.axvspan(lo, avg + std, alpha=0.12, color='#FF5252',
+                         label=f'Std: \u00b1{std:.4f} ms', zorder=1)
+
+        ax2.set_xlabel('Elapsed (ms)')
+        ax2.set_ylabel('Count')
+        ax2.set_title(test_name, fontsize=12, color='#e0e0e0', fontweight='bold')
+        ax2.legend(loc='upper right', fontsize=9, facecolor='#2b2b2b',
+                   edgecolor='#444', labelcolor='#ccc')
+        self.fig_hist.tight_layout()
+        self.canvas_hist.draw()
+
+        self.btn_export.setEnabled(True)
+
+    # ── Button control ──────────────────────────────────────────
 
     def _set_buttons_enabled(self, enabled: bool):
-        """Enable/disable test buttons"""
-        self.btn_signal.setEnabled(enabled)
-        self.btn_process.setEnabled(enabled)
-        self.btn_thread.setEnabled(enabled)
-        self.btn_all.setEnabled(enabled)
+        for btn in self._btn_starts:
+            btn.setEnabled(enabled)
+        self.spin_iter.setEnabled(enabled)
+        self.chk_contention.setEnabled(enabled)
 
     def _start_test(self, test_type: str):
-        """Start test in background thread"""
         if self._running:
+            return
+        if not self.p1:
+            print("[ERROR] P1 client not available")
             return
 
         self._running = True
         self._set_buttons_enabled(False)
+        self.btn_export.setEnabled(False)
 
-        thread = Thread(target=self._run_test, args=(test_type,), daemon=True)
-        thread.start()
+        Thread(target=self._run_test, args=(test_type,), daemon=True).start()
+
+    # ── Test execution (background thread) ──────────────────────
 
     def _run_test(self, test_type: str):
-        """Run test (background thread)"""
         try:
-            if test_type == "signal":
-                self._run_signal_test()
-            elif test_type == "process":
-                self._run_process_ipc_test()
-            elif test_type == "thread":
-                self._run_thread_ipc_test()
-            elif test_type == "all":
-                self._run_signal_test()
-                self._run_process_ipc_test()
-                self._run_thread_ipc_test()
-                self._export_results()
+            iters = self.spin_iter.value()
+            self._iterations_requested = iters
+            if test_type == "ipc":
+                self._run_ipc_test(iters)
+            elif test_type == "hop":
+                self._run_hop_test(iters)
+            elif test_type == "sig":
+                self._run_sig_test(iters)
+            elif test_type == "sig3hop":
+                self._run_sig_3hop_test(iters)
         finally:
             self._running = False
-            self.test_completed.emit(test_type)
 
-    def _run_signal_test(self):
-        """Signal Broadcast Test"""
-        self.update_log.emit("=== Signal Broadcast Test ===")
-        self.signal_results = {"p1": [], "p2": [], "p3": [], "t1": [], "t2": [], "t3": []}
-
-        # Warmup
-        self.update_log.emit(f"Warmup ({self.warmup_count} iterations)...")
-        for _ in range(self.warmup_count):
-            self._signal_responses.clear()
-            self._pending_signal_count = 6
-            self.signal.wakeup.emit({"send_time": time.perf_counter()})
-            time.sleep(0.01)
-
-        # Actual test
-        self.update_log.emit(f"Running ({self.iterations} iterations)...")
-        for i in range(self.iterations):
-            self._signal_responses.clear()
-            self._pending_signal_count = 6
-            send_time = time.perf_counter()
-            self.signal.wakeup.emit({"send_time": send_time})
-
-            # Wait for responses
-            timeout = time.perf_counter() + 0.1
-            while self._pending_signal_count > 0 and time.perf_counter() < timeout:
-                time.sleep(0.0001)
-
-            # Collect results
-            for task_name, data in self._signal_responses.items():
-                short_name = task_name.lower()
-                if short_name in self.signal_results:
-                    self.signal_results[short_name].append(data["elapsed_ms"])
-
-            self.update_progress.emit(i + 1, self.iterations)
-
-        # Report results
-        all_times = []
-        for task_name, times in self.signal_results.items():
-            if times:
-                all_times.extend(times)
-                metrics = self._calc_metrics(times)
-                self.update_result.emit(f"Signal/{task_name}", metrics)
-
-        if all_times:
-            avg_all = statistics.mean(all_times)
-            self.update_log.emit(f"Signal Avg: {avg_all:.4f}ms ({'PASS' if avg_all < self.SIGNAL_TARGET_MS else 'FAIL'})")
-
-    def _run_process_ipc_test(self):
-        """Process IPC Chain Test"""
-        self.update_log.emit("=== Process IPC Test (P1→P2→P3→GUI) ===")
-        self.ipc_results["process"] = []
-
-        if not self.p1:
-            self.update_log.emit("[SKIP] P1 client not available")
-            return
-
-        # Warmup
-        self.update_log.emit(f"Warmup ({self.warmup_count} iterations)...")
-        for _ in range(self.warmup_count):
+    def _ipc_load(self, client, iterations: int):
+        """Background IPC load for contention testing"""
+        for _ in range(iterations):
             try:
-                self.p1.chain_call({"path": ["gui"], "timestamps": [time.perf_counter()]})
-            except Exception as e:
-                self.update_log.emit(f"Warmup error: {e}")
+                client.ipc_call_next(time.perf_counter())
+            except:
+                pass
 
-        # Actual test
-        self.update_log.emit(f"Running ({self.iterations} iterations)...")
-        for i in range(self.iterations):
-            start = time.perf_counter()
+    def _start_contention_threads(self, iterations: int):
+        """Start P2→P3, P3→P4 IPC load threads"""
+        threads = []
+        if self.p2:
+            t = Thread(target=self._ipc_load, args=(self.p2, iterations), daemon=True)
+            t.start()
+            threads.append(t)
+        if self.p3:
+            t = Thread(target=self._ipc_load, args=(self.p3, iterations), daemon=True)
+            t.start()
+            threads.append(t)
+        return threads
+
+    def _run_ipc_test(self, iterations: int):
+        contention = self.chk_contention.isChecked()
+        mode = "contention" if contention else "single"
+        name = f"IPC Test (P1\u2192P2) \u00d7{iterations} [{mode}]"
+        print(f"=== {name} ===")
+        self._results = []
+
+        # Start contention load
+        load_threads = []
+        if contention:
+            load_threads = self._start_contention_threads(iterations)
+            print("Contention: P2\u2192P3, P3\u2192P4 load started")
+
+        print(f"Warmup ({self.WARMUP_COUNT})...")
+        for _ in range(self.WARMUP_COUNT):
             try:
-                result = self.p1.chain_call({"path": ["gui"], "timestamps": [start]})
-                end = time.perf_counter()
-                self.ipc_results["process"].append({"total_ms": (end - start) * 1000})
+                self.p1.ipc_call(time.perf_counter())
             except Exception as e:
-                self.ipc_results["process"].append({"error": str(e)})
+                print(f"Warmup error: {e}")
 
-            self.update_progress.emit(i + 1, self.iterations)
-
-        # Report
-        self._report_ipc_results("process")
-
-    def _run_thread_ipc_test(self):
-        """Thread IPC Chain Test"""
-        self.update_log.emit("=== Thread IPC Test (T1→T2→T3→GUI) ===")
-        self.ipc_results["thread"] = []
-
-        if not self.t1:
-            self.update_log.emit("[SKIP] T1 client not available")
-            return
-
-        # Warmup
-        self.update_log.emit(f"Warmup ({self.warmup_count} iterations)...")
-        for _ in range(self.warmup_count):
+        print(f"Running {iterations} iterations...")
+        errors = 0
+        for i in range(iterations):
             try:
-                self.t1.chain_call({"path": ["gui"], "timestamps": [time.perf_counter()]})
+                result = self.p1.ipc_call(time.perf_counter())
+                self._results.append(result["elapsed_ms"])
             except Exception as e:
-                self.update_log.emit(f"Warmup error: {e}")
+                errors += 1
+                if errors <= 3:
+                    print(f"Error: {e}")
 
-        # Actual test
-        self.update_log.emit(f"Running ({self.iterations} iterations)...")
-        for i in range(self.iterations):
-            start = time.perf_counter()
+            if (i + 1) % 50 == 0 or i == iterations - 1:
+                self.sig_progress.emit(i + 1, iterations)
+
+        # Wait for contention threads
+        for t in load_threads:
+            t.join(timeout=30)
+
+        print(f"Done. {len(self._results)}/{iterations} ok, {errors} errors")
+        self.sig_test_done.emit(name)
+
+    def _run_hop_test(self, iterations: int):
+        contention = self.chk_contention.isChecked()
+        mode = "contention" if contention else "single"
+        name = f"3-Hop (P1\u2192P2\u2192P3\u2192P4) \u00d7{iterations} [{mode}]"
+        print(f"=== {name} ===")
+        self._results = []
+
+        # Start contention load
+        load_threads = []
+        if contention:
+            load_threads = self._start_contention_threads(iterations)
+            print("Contention: P2\u2192P3, P3\u2192P4 load started")
+
+        print(f"Warmup ({self.WARMUP_COUNT})...")
+        for _ in range(self.WARMUP_COUNT):
             try:
-                result = self.t1.chain_call({"path": ["gui"], "timestamps": [start]})
-                end = time.perf_counter()
-                self.ipc_results["thread"].append({"total_ms": (end - start) * 1000})
+                self.p1.hop_call(time.perf_counter())
             except Exception as e:
-                self.ipc_results["thread"].append({"error": str(e)})
+                print(f"Warmup error: {e}")
 
-            self.update_progress.emit(i + 1, self.iterations)
+        print(f"Running {iterations} iterations...")
+        errors = 0
+        for i in range(iterations):
+            try:
+                result = self.p1.hop_call(time.perf_counter())
+                self._results.append(result["elapsed_ms"])
+            except Exception as e:
+                errors += 1
+                if errors <= 3:
+                    print(f"Error: {e}")
 
-        # Report
-        self._report_ipc_results("thread")
+            if (i + 1) % 50 == 0 or i == iterations - 1:
+                self.sig_progress.emit(i + 1, iterations)
 
-    def _report_ipc_results(self, test_type: str):
-        """Report IPC test results"""
-        results = self.ipc_results.get(test_type, [])
-        times = [r["total_ms"] for r in results if "total_ms" in r]
-        errors = [r for r in results if "error" in r]
+        # Wait for contention threads
+        for t in load_threads:
+            t.join(timeout=30)
 
-        if not times:
-            self.update_log.emit(f"{test_type} IPC: No successful results")
-            return
+        print(f"Done. {len(self._results)}/{iterations} ok, {errors} errors")
+        self.sig_test_done.emit(name)
 
-        metrics = self._calc_metrics(times)
-        metrics["error_count"] = len(errors)
-        metrics["success_rate"] = (len(times) / len(results)) * 100
+    def _run_sig_test(self, iterations: int):
+        """Test 3: Signal P1→P2 (batch emit + chunked collect)"""
+        contention = self.chk_contention.isChecked()
+        mode = "contention" if contention else "flow-ctrl"
+        name = f"Signal (P1\u2192P2) \u00d7{iterations} [{mode}]"
+        print(f"=== {name} ===")
+        self._results = []
+        CHUNK = 500
 
-        self.update_result.emit(f"IPC/{test_type}", metrics)
+        self.sig_progress.emit(0, iterations)
+        try:
+            # Phase 1: Emit signals
+            received = self.p1.sig_emit(iterations, contention)
+            print(f"Signal emit done: {received}/{iterations} received")
 
-        avg = metrics["avg_ms"]
-        tps = metrics["tps"]
-        self.update_log.emit(
-            f"{test_type} IPC Avg: {avg:.4f}ms, TPS: {tps:.0f} "
-            f"({'PASS' if avg < self.IPC_TARGET_MS else 'FAIL'})"
-        )
+            # Phase 2: Collect results in chunks (64KB buffer limit)
+            for offset in range(0, received, CHUNK):
+                chunk = self.p1.get_sig_chunk(offset, CHUNK)
+                self._results.extend(chunk)
+                self.sig_progress.emit(min(offset + CHUNK, received), iterations)
 
-    def _calc_metrics(self, times: List[float]) -> dict:
-        """Calculate statistics from time list"""
-        if not times:
-            return {}
+            print(f"Collected {len(self._results)} results")
+        except Exception as e:
+            print(f"Signal test error: {e}")
 
-        sorted_times = sorted(times)
-        n = len(sorted_times)
+        self.sig_progress.emit(iterations, iterations)
+        self.sig_test_done.emit(name)
 
-        return {
-            "avg_ms": statistics.mean(times),
-            "min_ms": min(times),
-            "max_ms": max(times),
-            "std_ms": statistics.stdev(times) if n > 1 else 0,
-            "p50_ms": statistics.median(times),
-            "p95_ms": sorted_times[int(n * 0.95)] if n > 0 else 0,
-            "p99_ms": sorted_times[int(n * 0.99)] if n > 0 else 0,
-            "tps": 1000 / statistics.mean(times) if statistics.mean(times) > 0 else 0,
-            "count": n
-        }
+    def _run_sig_3hop_test(self, iterations: int):
+        """Test 4: Signal 3-hop P1→P2→P3→P4 (batch emit + chunked collect)"""
+        contention = self.chk_contention.isChecked()
+        mode = "contention" if contention else "flow-ctrl"
+        name = f"Signal 3-Hop (P1\u2192P2\u2192P3\u2192P4) \u00d7{iterations} [{mode}]"
+        print(f"=== {name} ===")
+        self._results = []
+        CHUNK = 500
 
-    def on_awake(self, signal):
-        """Receive signal response"""
-        data = signal.data
-        task_name = data.get("task", "unknown")
-        self._signal_responses[task_name] = data
-        self._pending_signal_count -= 1
+        self.sig_progress.emit(0, iterations)
+        try:
+            # Phase 1: Emit signals
+            received = self.p1.sig_3hop_emit(iterations, contention)
+            print(f"Signal 3-hop emit done: {received}/{iterations} received")
 
-    def on_chain_result(self, data: dict) -> dict:
-        """Receive IPC chain result"""
-        data["path"].append("gui")
-        data["timestamps"].append(time.perf_counter())
-        return data
+            # Phase 2: Collect results in chunks
+            for offset in range(0, received, CHUNK):
+                chunk = self.p1.get_hop_chunk(offset, CHUNK)
+                self._results.extend(chunk)
+                self.sig_progress.emit(min(offset + CHUNK, received), iterations)
+
+            print(f"Collected {len(self._results)} results")
+        except Exception as e:
+            print(f"Signal 3-hop test error: {e}")
+
+        self.sig_progress.emit(iterations, iterations)
+        self.sig_test_done.emit(name)
+
+    # ── Export ──────────────────────────────────────────────────
 
     def _export_results(self):
-        """Export results to JSON"""
+        if not self._results:
+            return
+
         results_dir = Path(__file__).parent / "results"
         results_dir.mkdir(exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = results_dir / f"performance_{timestamp}.json"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = results_dir / f"performance_{ts}.json"
 
-        export_data = {
+        n = len(self._results)
+        sr = sorted(self._results)
+        avg = statistics.mean(self._results)
+
+        data = {
             "timestamp": datetime.now().isoformat(),
-            "iterations": self.iterations,
-            "signal_results": {k: self._calc_metrics(v) for k, v in self.signal_results.items() if v},
-            "ipc_results": {}
+            "iterations": n,
+            "metrics": {
+                "avg_ms": avg,
+                "std_ms": statistics.stdev(self._results) if n > 1 else 0,
+                "min_ms": min(self._results),
+                "max_ms": max(self._results),
+                "p50_ms": statistics.median(self._results),
+                "p95_ms": sr[int(n * 0.95)],
+                "p99_ms": sr[int(n * 0.99)],
+                "tps": 1000 / avg if avg > 0 else 0,
+            },
+            "raw_elapsed_ms": self._results,
         }
 
-        for test_type, results in self.ipc_results.items():
-            times = [r["total_ms"] for r in results if "total_ms" in r]
-            if times:
-                export_data["ipc_results"][test_type] = self._calc_metrics(times)
-
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(export_data, f, indent=2)
+            json.dump(data, f, indent=2)
 
-        self.update_log.emit(f"Results exported: {filepath}")
+        print(f"Exported: {filepath.name}")

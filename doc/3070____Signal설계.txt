@@ -1,0 +1,554 @@
+============================================================================
+  ALASKA v2.6 - Signal 설계
+  Date: 2026-03-03
+============================================================================
+
+
+1. Signal 정의
+----------------------------------------------------------------------------
+
+1.1 개요
+
+    Signal은 ALASKA Task 간의 이벤트 기반 통신 메커니즘이다.
+    발행자(Publisher)가 이벤트를 emit하면, 해당 시그널을 구독한
+    모든 Task의 핸들러가 자동으로 호출된다.
+
+    IPC(RMI)와의 차이:
+    - IPC: 1:1 호출, 동기 블로킹, 반환값 있음
+    - Signal: 1:N 발행, 비동기, 반환값 없음
+
+        Publisher Task                   Subscriber Tasks
+        ─────────────                    ────────────────
+        self.signal.emit(               → Task A: on_sensor(signal)
+            "sensor.temp", 25.5         → Task B: on_sensor(signal)
+        )                               → Task C: on_sensor(signal)
+
+1.2 전송 계층
+
+    모드              전송 수단                       특징
+    ───────────────  ──────────────────────────────  ──────────────────
+    Thread 모드      queue.Queue (P1~P5 각 1개)       GIL 보호, 단순
+    Process 모드     SmRingBuffer + Per-Priority Mutex 공유메모리, IPC
+
+    ※ emit()은 모드에 관계없이 동일한 API를 사용한다.
+
+1.3 핵심 컴포넌트
+
+    ┌──────────────┐    SignalBroker    ┌──────────────────────┐
+    │ Publisher     │    (중앙 분배)     │ Subscriber A         │
+    │              │                    │                      │
+    │ SignalClient │ ──emit()──>        │ InvokeDispenser      │
+    │ └─ _Signal   │    │               │ └─ QoS P1~P5 큐     │
+    │    Emitter   │    │               │ └─ _dispatch()       │
+    │              │    │  SmSignal      │ └─ handler 호출     │
+    └──────────────┘    │  Registry     ├──────────────────────┤
+                        │  (구독 조회)   │ Subscriber B         │
+                        └──emit()──>    │ ...                  │
+                                        └──────────────────────┘
+
+    - SignalClient: Signal emit + 구독 관리 + dispatch
+    - SignalBroker: 중앙 분배기 (구독자 조회, 큐 전달)
+    - SmSignalRegistry: 공유 메모리 비트맵 (구독 정보, O(1) 조회)
+    - _SignalEmitter: 체인 접근자 (self.signal.sensor.temp.emit())
+    - PriorityScheduler: 가중 공정 큐잉 (Weighted Fair Queuing)
+
+
+2. API 종류
+----------------------------------------------------------------------------
+
+2.1 Signal 발행 (emit)
+
+    이벤트를 발행한다. 구독자가 있으면 각각의 QoS 큐에 전달된다.
+
+    호출 형식:
+
+        # 직접 호출
+        self.signal.emit("sensor.temp", 25.5)
+        self.signal.emit("sensor.temp", 25.5, qos="REALTIME")
+        self.signal.emit("sensor.temp", 25.5, qos={"priority": 2, "deadline": 0.030})
+
+        # 체인 호출
+        self.signal.sensor.temp.emit(25.5)
+        self.signal.sensor.temp.emit(25.5, qos="REALTIME")
+
+    내부 흐름:
+        _SignalEmitter.emit() → SignalClient.emit()
+        → Signal 객체 생성 (name, source, data, qos, _seq)
+        → SignalBroker.emit()
+          → SmSignalRegistry.get_subscribers() (비트맵 O(1))
+          → 각 구독자 QoS 큐에 payload 전달
+          → 조건부 notify_event.set() (is_sleeping 체크)
+
+    특징:
+    - 비동기: emit 후 즉시 리턴 (구독자 실행을 기다리지 않음)
+    - 1:N: 모든 구독자에게 동시 전달
+    - v2.6 Direct emit: caller 스레드에서 직접 처리 (IO 스레드 제거)
+    - Broadcast Pre-pickle: 직렬화 1회 (N개 구독자에 동일 바이트)
+
+2.2 Signal 구독 (on)
+
+    시그널 핸들러를 등록한다.
+
+        # 동적 구독
+        self.signal.on("sensor.temp", self.on_temp_change)
+
+        # 체인 구독
+        self.signal.sensor.temp.on(self.on_temp_change)
+
+    내부 흐름:
+        SignalClient.on(name, handler)
+        → _handlers[name].append(handler)
+        → SignalBroker.subscribe(name, task_id)
+        → SmSignalRegistry.subscribe() (비트마스크 설정)
+        → registry version 증가 (캐시 무효화)
+
+2.3 Signal 구독 해제 (off)
+
+    시그널 핸들러를 제거한다.
+
+        self.signal.off("sensor.temp", self.on_temp_change)
+
+        # 체인
+        self.signal.sensor.temp.off(self.on_temp_change)
+
+    내부 흐름:
+        SignalClient.off(name, handler)
+        → _handlers[name].remove(handler)
+        → 핸들러 0개 시 SignalBroker.unsubscribe()
+        → SmSignalRegistry.unsubscribe() (비트마스크 해제)
+
+2.4 Signal 핸들러 등록 방법 (3가지)
+
+    방법 1: @rmi_signal 데코레이터 (명시적, 권장)
+
+        @task()
+        class MyJob:
+            @rmi_signal("sensor.temperature")
+            def on_temp_change(self, signal):
+                print(f"Temperature: {signal.data}")
+
+    방법 2: signal_subscribe (규칙 기반 자동)
+
+        @task(signal_subscribe=["sensor.temperature", "system.status"])
+        class MyJob:
+            def on_sensor_temperature(self, signal):     # 자동 매핑
+                ...
+            def on_system_status(self, signal):           # 자동 매핑
+                ...
+
+        ※ 규칙: "signal.name" → on_signal_name() (점을 언더스코어로)
+
+    방법 3: signal_forward (Qt Signal 브리지)
+
+        @task(signal_forward={"frame.ready": "frameReady"})
+        class ViewerUI(QWidget):
+            frameReady = Signal(object)     # Qt Signal
+
+            def __init__(self):
+                super().__init__()
+                self.frameReady.connect(self._on_frame)
+
+            def _on_frame(self, data):
+                self.label.setPixmap(data)
+
+        ※ ALASKA Signal → Qt Signal 자동 변환 (UI 스레드 안전)
+
+2.5 Signal 객체 구조
+
+    핸들러가 수신하는 Signal 객체:
+
+        signal.name     # str: 시그널 이름 ("sensor.temperature")
+        signal.source   # str: 발행자 Task ID
+        signal.data     # Any: 전달 데이터 (pickle 가능한 모든 타입)
+        signal.qos      # dict: QoS 설정 {"priority", "deadline", "on_violation"}
+        signal._seq     # int: 시퀀스 번호 (발행자별 자동 증가)
+
+2.6 API 비교 표
+
+    API                                   방향  동기  반환값  용도
+    ────────────────────────────────────  ────  ────  ──────  ──────────────
+    self.signal.emit("name", data)        1:N   X     X       이벤트 발행
+    self.signal.name.emit(data)           1:N   X     X       이벤트 발행 (체인)
+    self.signal.on("name", handler)       구독  -     -       핸들러 등록
+    self.signal.off("name", handler)      해제  -     -       핸들러 제거
+    @rmi_signal("name")                   구독  -     -       데코레이터 등록
+
+
+3. 일반 처리 구조
+----------------------------------------------------------------------------
+
+3.1 Signal 발행 → 수신 흐름
+
+    시간  Publisher                         Subscriber (InvokeDispenser)
+    ───  ──────────────────────────────  ──────────────────────────────
+    T1   self.signal.emit("evt", data)
+         → SignalClient.emit()
+    T2   → Signal(name, source, data, qos, _seq) 생성
+    T3   → SignalBroker.emit()
+         → SmSignalRegistry.get_subscribers("evt")
+         → version 캐시 확인 (v2.6)
+    T4   → 구독자 리스트 [A, B, C]
+         → Broadcast Pre-pickle (process 모드)
+    T5   → A의 QoS P3 큐에 payload 전달
+         → B의 QoS P3 큐에 payload 전달
+         → C의 QoS P3 큐에 payload 전달
+    T6   → is_sleeping 체크 → 조건부 notify
+         → return (emit 완료)
+                                           T7  InvokeDispenser ① Signal RECV
+                                           T8  P3 큐에서 payload 수신
+                                           T9  _dispatch(data)
+                                               → QoS deadline 검사
+                                               → _handlers["evt"] 조회
+                                           T10 handler(signal) 호출
+                                           T11 (다음 cycle 계속)
+
+3.2 SmSignalRegistry 구독자 조회
+
+    공유 메모리 비트맵 기반 O(1) 조회:
+
+        SIGNAL_TABLE[sig_idx].sub_mask = 0b00001011
+                                           ↑   ↑↑
+                                       Task2 Task1 Task0
+
+        get_subscribers("sensor.temp"):
+        → sig_idx = hash("sensor.temp") → 슬롯 조회
+        → mask = 0b00001011
+        → [Task0, Task1, Task2] 반환
+
+    메모리 레이아웃:
+
+        ┌─────────────────────────────────────────────────┐
+        │ HEADER (64B)                                    │
+        │   version(4B), task_count(4B), sig_count(4B)    │
+        ├─────────────────────────────────────────────────┤
+        │ TASK_TABLE (64 × 64B = 4096B)                   │
+        │   [task_id(32B), status(1B), last_alive(8B)]    │
+        ├─────────────────────────────────────────────────┤
+        │ SIGNAL_TABLE (256 × 128B = 32768B)              │
+        │   [sig_name(64B), sub_mask(8B), last_seq(8B)]   │
+        └─────────────────────────────────────────────────┘
+
+    제한: 최대 64 Task, 256 Signal
+
+3.3 v2.6 Registry Version Cache
+
+    emit() 호출 시 SmSignalRegistry 읽기 최적화:
+
+        emit() {
+            ver = sm_registry.get_version()
+            if ver == _sub_ver_snap:
+                subs = _sub_ver_cache[sig_name]     # 캐시 히트
+            else:
+                _sub_ver_cache.clear()              # 캐시 무효화
+                _sub_ver_snap = ver
+                subs = sm_registry.get_subscribers(sig_name)
+                _sub_ver_cache[sig_name] = subs
+        }
+
+    효과: subscribe/unsubscribe가 없으면 SHM 읽기 N+1 → 1회/emit
+
+3.4 InvokeDispenser에서의 Signal 처리
+
+    ┌─────────────────────────────────────────────────────┐
+    │  InvokeDispenser Loop (단일 스레드)                  │
+    │                                                     │
+    │  while running:                                     │
+    │      ① Signal RECV (P1→P5 우선순위)                 │
+    │         - P1 CRITICAL : 20건/cycle                  │
+    │         - P2 HIGH     : 10건/cycle                  │
+    │         - P3 NORMAL   :  5건/cycle                  │
+    │         - P4 LOW      :  2건/cycle (nowait RMI 포함)│
+    │         - P5 BACKGROUND: 1건/cycle                  │
+    │         - Burst Guard : 50건/cycle 상한             │
+    │                                                     │
+    │      ② IPC/RMI (request_q)                          │
+    │                                                     │
+    │      ③ Idle → Kernel Wait                           │
+    └─────────────────────────────────────────────────────┘
+
+    ※ Signal이 RMI보다 우선 처리된다.
+       Signal 폭주 시에도 Burst Guard(50건)로 RMI 처리 기회 보장.
+
+3.5 _dispatch() 핸들러 호출
+
+    SignalClient._dispatch(data):
+        1. sig_name == "_rmi.nowait" → _dispatch_rmi_nowait() (별도 처리)
+        2. QoS deadline 검사 (qos_enabled 시)
+           → cycle_time - signal.ts > deadline → 위반 처리
+        3. _handlers[sig_name] → 핸들러 리스트 순회
+        4. 각 handler(signal) 호출
+
+    ※ 핸들러는 InvokeDispenser 스레드에서 실행된다.
+       @ui_thread 데코레이터가 있으면 Qt 이벤트 루프로 전달.
+
+
+4. QoS (Quality of Service) 처리
+----------------------------------------------------------------------------
+
+4.1 QoS 프리셋
+
+    프리셋         Priority  Deadline   on_violation  용도
+    ───────────  ────────  ─────────  ────────────  ──────────────────
+    CRITICAL      P1        10ms       HALT          긴급 (에러, 종료)
+    REALTIME      P2        30ms       LOG           실시간 (프레임, 센서)
+    NORMAL        P3        100ms      LOG           일반 이벤트 (기본값)
+    LOW           P4        500ms      IGNORE        낮은 우선순위
+    BACKGROUND    P5        2000ms     IGNORE        배경 작업 (로깅, 통계)
+
+4.2 우선순위 큐 (Priority Queue)
+
+    각 구독자 Task는 5개의 독립 큐를 보유한다:
+
+        ┌──────┬──────┬──────┬──────┬──────┐
+        │  P1  │  P2  │  P3  │  P4  │  P5  │
+        │  20  │  10  │   5  │   2  │   1  │ ← Cycle Quota
+        └──────┴──────┴──────┴──────┴──────┘
+
+    InvokeDispenser는 매 cycle마다 P1부터 순서대로 처리한다.
+    Quota가 소진되면 다음 우선순위로 넘어간다.
+
+4.3 PriorityScheduler (가중 공정 큐잉)
+
+    Weighted Fair Queuing + Starvation Guard:
+
+        CYCLE_QUOTAS = [20, 10, 5, 2, 1]    # P1~P5 처리 한도/cycle
+        STARVATION_LIMIT = 50                 # 50cycle 미처리 시 강제 1회
+
+    new_cycle():
+        → budgets 리필 [20, 10, 5, 2, 1]
+
+    consume(priority):
+        → budgets[p] -= 1
+        → starvation[p] = 0 (기아 카운터 리셋)
+
+    기아 방지:
+        → P5가 50 cycle 동안 처리되지 않으면 강제 1회 처리
+        → 고우선순위 폭주 시에도 저우선순위 최소 보장
+
+4.4 QoS 설정 방법
+
+    1. emit 시 지정:
+
+        self.signal.emit("evt", data, qos="REALTIME")
+        self.signal.emit("evt", data, qos={"priority": 2, "deadline": 0.030})
+
+    2. 핸들러 데코레이터에서 지정:
+
+        @rmi_signal("sensor.data")
+        def on_sensor(self, signal):
+            ...
+        # ※ 현재 핸들러 수준 QoS는 emit 시 지정된 값이 우선
+
+    3. QoS 미지정 시:
+
+        기본값: NORMAL (P3, deadline=100ms, on_violation=LOG)
+
+4.5 Deadline 처리
+
+    Signal이 큐에 들어간 시각(ts)과 처리 시작 시각(cycle_time)의 차이가
+    deadline을 초과하면 QoS 위반이 발생한다.
+
+        검사 조건:
+            cycle_time - signal.ts > deadline
+
+        위반 시 동작 (on_violation):
+        ─────────────────────────────────────────────
+        "HALT"   : _system.halt signal 발행 → 시스템 정지
+        "LOG"    : 경고 출력 후 핸들러 실행
+        "IGNORE" : 위반 무시, 핸들러 정상 실행
+
+    ※ v2.6 최적화: cycle_time은 cycle당 1회만 time.time() 호출.
+       qos_enabled=False 시 deadline 검사 자체를 스킵.
+
+4.6 Burst Guard
+
+    단일 cycle에서 Signal 처리가 과도하면 RMI 응답이 지연된다.
+
+        _BURST_LIMIT = 50
+
+        if burst_count >= 50:
+            break  → RMI 처리 단계로 이동
+
+    ※ Signal 폭주 시에도 RMI 최소 5건/cycle 보장.
+    ※ cycle 내 Signal 50건을 초과하면 나머지는 다음 cycle로 이월.
+
+
+5. 제약 사항
+----------------------------------------------------------------------------
+
+5.1 Pickle 가능 제약 (Process 모드)
+
+    Signal의 data 필드는 pickle 직렬화가 가능해야 한다.
+
+        ○ 가능: int, str, list, dict, tuple, bytes, dataclass, numpy.ndarray
+        ✕ 불가: lambda, socket, file handle, QWidget, threading.Lock
+
+    ※ Thread 모드(queue.Queue)는 pickle을 사용하지 않으므로 제한 없음.
+
+5.2 반환값 없음
+
+    Signal은 1:N 비동기 통신이므로 반환값이 없다.
+    결과가 필요하면 수신 측에서 별도 Signal을 emit해야 한다.
+
+        # 요청 → 응답 패턴
+        Publisher: self.signal.emit("request.analysis", params)
+        Subscriber: ...처리 후... self.signal.emit("response.analysis", result)
+
+5.3 순서 보장
+
+    동일 우선순위 내에서는 FIFO 순서가 보장된다.
+    다른 우선순위 간에는 순서 보장 없음 (P1이 항상 P3보다 먼저 처리).
+
+5.4 구독자 제한
+
+    SmSignalRegistry 기반:
+    - 최대 64개 Task
+    - 최대 256개 Signal 이름
+
+    ※ 동적 생성 시그널이 256개를 초과하면 레지스트리 슬롯 부족.
+
+5.5 Back Pressure
+
+    구독자의 QoS 큐가 가득 차면 emit()이 재시도 루프에 진입한다.
+
+        _BP_RETRIES = 50 (약 5ms 지연)
+
+    50회 재시도 후에도 실패하면 해당 구독자에게는 전달되지 않는다.
+    ※ emit()은 caller 스레드에서 실행되므로, 지연이 publisher를 블록한다.
+
+5.6 @ui_thread 핸들러
+
+    @ui_thread 데코레이터가 붙은 핸들러는 InvokeDispenser 스레드에서
+    Qt Signal(invoke_signal)을 통해 UI 스레드로 전달된다.
+
+    ※ UI 스레드가 블록되어 있으면 핸들러가 실행되지 않는다.
+       (doc/3060____IPC설계.txt 7장 "검토: UI 스레드 데드락" 참조)
+
+5.7 emit() 블로킹 가능성
+
+    v2.6 Direct emit은 caller 스레드에서 직접 처리한다.
+    구독자가 많거나 Back Pressure가 발생하면 emit()이 지연될 수 있다.
+
+    ※ 실시간 루프에서 emit() 호출 시 주의.
+       구독자 수 × Back Pressure 재시도가 최악 지연.
+
+
+6. 성능 특성
+----------------------------------------------------------------------------
+
+    항목                    측정값          비고
+    ────────────────────  ─────────────  ──────────────────────
+    Signal emit            avg 0.096ms    Direct emit (v2.6)
+    Signal ping-pong       avg 0.134ms    emit → handler → emit
+    Pure signal ping       avg 0.168ms    왕복 시그널
+    SmSignalRegistry 조회  ~0.001ms       비트맵 O(1)
+    Back Pressure 1회      ~0.1ms         time.sleep(0) yield
+
+    v2.6 최적화 효과:
+    - Direct emit: IO 스레드 제거, context switch 절감
+    - Registry Version Cache: SHM 읽기 N+1 → 1회/emit
+    - Broadcast Pre-pickle: 직렬화 N → 1회/emit (process 모드)
+    - 조건부 notify: syscall ~5us 절감/건
+    - Per-Priority Mutex: 1개 → 5개 (우선순위별 경합 제거)
+    - cycle-time: time.time() N → 1회/cycle
+
+
+7. 검토: Signal 사용 패턴
+----------------------------------------------------------------------------
+
+7.1 이벤트 통지 (가장 일반적)
+
+    Publisher가 이벤트를 발행하고, 관심 있는 Subscriber가 처리한다.
+
+        # Publisher (센서 Task)
+        @task()
+        class SensorJob:
+            def run(self):
+                while self.running:
+                    temp = self.read_sensor()
+                    self.signal.emit("sensor.temp", temp, qos="REALTIME")
+                    time.sleep(0.1)
+
+        # Subscriber (UI Task)
+        @task()
+        class DisplayJob(QWidget):
+            @rmi_signal("sensor.temp")
+            @ui_thread
+            def on_sensor_temp(self, signal):
+                self.label.setText(f"{signal.data}°C")
+
+7.2 요청-응답 패턴
+
+    Signal은 반환값이 없으므로, 응답이 필요하면 별도 Signal을 사용한다.
+
+        # 요청자
+        @task()
+        class Controller:
+            def start_analysis(self):
+                self.signal.emit("request.analysis", {"mode": "full"})
+
+            @rmi_signal("response.analysis")
+            def on_result(self, signal):
+                print(f"Result: {signal.data}")
+
+        # 처리자
+        @task()
+        class Analyzer:
+            @rmi_signal("request.analysis")
+            def on_request(self, signal):
+                result = self._analyze(signal.data)
+                self.signal.emit("response.analysis", result)
+
+7.3 브로드캐스트 패턴
+
+    시스템 전체에 상태 변경을 알린다.
+
+        # 시스템 이벤트
+        self.signal.emit("system.shutdown", reason, qos="CRITICAL")
+        self.signal.emit("system.config_changed", new_config)
+        self.signal.emit("system.error", error_info, qos="CRITICAL")
+
+7.4 데이터 파이프라인 패턴
+
+    Task 간 데이터 처리 체인을 Signal로 구성한다.
+
+        Camera → "frame.raw" → Preprocessor → "frame.processed" → Analyzer
+                                                                     ↓
+                                               Display ← "result.ready"
+
+        @task()
+        class Camera:
+            def run(self):
+                while self.running:
+                    frame = self.capture()
+                    self.signal.emit("frame.raw", frame, qos="REALTIME")
+
+        @task()
+        class Preprocessor:
+            @rmi_signal("frame.raw")
+            def on_frame(self, signal):
+                processed = self._preprocess(signal.data)
+                self.signal.emit("frame.processed", processed, qos="REALTIME")
+
+7.5 IPC vs Signal 선택 기준
+
+    상황                                  권장
+    ────────────────────────────────────  ──────────────────────
+    특정 Task의 메서드 호출 + 반환값       IPC (동기 RMI)
+    특정 Task에 커맨드 전달 (반환값 불요)   IPC (.nowait())
+    이벤트 알림 (1:N)                      Signal
+    실시간 데이터 스트림                    Signal (QoS REALTIME)
+    시스템 상태 변경 통지                   Signal (QoS CRITICAL)
+    UI 갱신                               Signal + @ui_thread
+
+
+8. 상태
+----------------------------------------------------------------------------
+
+    상태: 확정 (v2.6)
+    등록일: 2026-03-03
+    분류: Signal 설계 문서
+    관련: doc/3060____IPC설계.txt
+          doc/3080____InvokeDispenser설계.txt
+          doc/3040____시그널QoS기능V1.txt
+          doc/3050____시그널QoS기능V2.txt

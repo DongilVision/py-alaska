@@ -1,7 +1,7 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  ALASKA v2.6 — SmInfra (공유 메모리 자원) 설계서                              ║
 ║  고속 IPC, 실시간 통계, 세션 감시를 위한 SharedMemory 인프라 통합 설계        ║
-║  문서 버전: 2026-03-01 (v2.6 개정 - CPU 절감 자원 추가)                       ║
+║  문서 버전: 2026-03-05 (v2.6 개정 - 소스 재배치)                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -154,6 +154,7 @@
   │ SmSignalRegistry │ SharedMem+numpy  │ Atomic bitwise   │ —               │ —               │
   │ SmSignalStats    │ SharedMem+numpy  │ Lock(선택)       │ —               │ —               │
   │ SmBlackBox       │ SharedMem+numpy  │ Lock(선택)       │ —               │ —               │
+  │ SmMutex          │ —                │ kernel32 Mutex   │ —               │ —               │
   └──────────────────┴──────────────────┴──────────────────┴─────────────────┴─────────────────┘
 
 
@@ -175,7 +176,11 @@
   │  ┌──────┴───────┐ ┌──────┴───────┐ ┌──────┴───────┐ ┌──────────────┐ │
   │  │  SmQueue     │ │SmLockFree..  │ │SmKernelEvent │ │SmBlockHandler│ │
   │  │(IPC 큐)     │ │(스핀 이벤트) │ │(커널 이벤트) │ │(블록 팩토리) │ │
-  │  └──┬───┬──────┘ └──────┬───────┘ └──────────────┘ └──────┬───────┘ │
+  │  └──┬───┬──────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ │
+  │     │   │               │          ┌──────┴───────┐        │         │
+  │     │   │               │          │  SmMutex     │        │         │
+  │     │   │               │          │(Named Mutex) │        │         │
+  │     │   │               │          └──────────────┘        │         │
   │     │   │               │                                  │         │
   ├─────┼───┼───────────────┼──────────────────────────────────┼─────────┤
   │  Layer 1 — 기본 자원 (Primitive)                                       │
@@ -262,7 +267,8 @@
   │      │              │ kernel32, mp.Event                   │                                  │
   │ L1   │ 기본 자원    │ SmRingBuffer, SmValue, SmBlock       │ SharedMemory 위 원자 클래스      │
   │ L2   │ 복합 자원    │ SmQueue, SmLockFreeEvent,            │ L1 조합 또는 커널 자원 래퍼      │
-  │      │              │ SmKernelEvent, SmBlockHandler        │                                  │
+  │      │              │ SmKernelEvent, SmBlockHandler,       │                                  │
+  │      │              │ SmMutex                              │                                  │
   │ L3   │ 감시/통계    │ SmSignalStats, SmSignalRegistry,     │ 런타임 모니터링·레지스트리       │
   │      │              │ SmBlackBox                           │                                  │
   └──────┴──────────────┴──────────────────────────────────────┴──────────────────────────────────┘
@@ -280,6 +286,7 @@
   SmQueue            → SmRingBuffer + Event(통지)   TaskManager, SignalBroker
   SmLockFreeEvent    → SmValue                     (스핀 기반 이벤트, 선택적)
   SmKernelEvent      → kernel32.dll (Win32)        TaskManager (notify_event)
+  SmMutex            → kernel32.dll (Win32)        SmSignalQueue (Multi-Producer 보호)
   SmBlockHandler     → SmBlock + Lock + GConfig    TaskManager (블록 풀 관리)
   ─────────────────────────────────────────────────────────────────────────
   SmSignalRegistry   → SharedMemory, numpy         TaskManager + SignalBroker
@@ -287,7 +294,34 @@
   SmBlackBox         → SharedMemory, numpy         SignalBroker (체인 세션 감시)
 
 
-  2.5 클래스 전체 목록
+  2.5 공통 기반 (_base.py)
+  ──────────────────────────────────────
+
+  L1~L3 SharedMemory 기반 클래스는 모두 _ShmBase를 상속한다.
+  유틸리티 함수 safe_shm_close, cleanup_existing_shm도 동일 파일에 포함.
+
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │ _base.py                                                             │
+  │ ─────────────────────────────────────────────────────────────────────│
+  │  safe_shm_close(shm, is_owner)  close + 조건부 unlink (예외 보호)   │
+  │  cleanup_existing_shm(name)     잔류 SHM 안전 제거 (재시작 시)      │
+  │ ─────────────────────────────────────────────────────────────────────│
+  │ class _ShmBase                                                       │
+  │  _init_shm(name, size, create)  SharedMemory 생성/연결 + 공통 필드  │
+  │  close()                        safe_shm_close 위임 (중복 호출 방지)│
+  │  __del__()                      GC 시 리소스 안전 해제 (v2.6.0)     │
+  │  __enter__ / __exit__           with 문 지원                        │
+  │  name (property)                SharedMemory 이름                   │
+  │ ─────────────────────────────────────────────────────────────────────│
+  │  상속: SmRingBuffer, SmValue, SmBlock, SmSignalRegistry,            │
+  │        SmSignalStats, SmBlackBox                                     │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  ※ SmMutex, SmKernelEvent은 Win32 핸들 기반이므로 _ShmBase 미상속.
+     각자 close()/__del__() 에서 CloseHandle 호출.
+
+
+  2.6 클래스 전체 목록
   ─────────────────────
 
   ┌────┬──────────────────┬──────┬────────────────────────┬──────────────────────────┬────────────────┬────────────┐
@@ -296,14 +330,15 @@
   │  1 │ SmValue          │ L1   │ sm_value.py            │ 스칼라 값 공유           │ Lock(선택)     │ dtype × 1  │
   │  2 │ SmBlock          │ L1   │ sm_block.py            │ 이미지 블록 풀 O(1)      │ Lock           │ H×W×C × N  │
   │  3 │ SmBlockBuffer    │ L1   │ sm_block.py            │ SmBlock 컨텍스트 매니저  │ (SmBlock)      │ (SmBlock)  │
-  │  4 │ SmRingBuffer     │ L1   │ sm_ring_buffer.py      │ Lock-free SPSC 링 버퍼   │ 없음 (SPSC)    │ 64KB 기본  │
-  │  5 │ SmQueue          │ L2   │ sm_queue.py            │ IPC 큐 (mp.Queue 대체)   │ Event+Lock선택 │ SmRingBuf  │
-  │  6 │ SmLockFreeEvent  │ L2   │ sm_lock_free_event.py  │ 스핀락 프로세스 통지     │ Spin-wait      │ SmValue 1B │
-  │  7 │ SmKernelEvent    │ L2   │ sm_kernel_event.py     │ 커널 이벤트 (Win32)      │ kernel32 Event │ OS 핸들    │
-  │  8 │ SmBlockHandler   │ L2   │ sm_block_handler.py    │ SmBlock 생성/주입 팩토리 │ Lock           │ (SmBlock)  │
-  │  9 │ SmSignalRegistry │ L3   │ sm_signal_registry.py  │ 시그널 구독 비트맵       │ Atomic bitwise │ ~40KB      │
-  │ 10 │ SmSignalStats    │ L3   │ sm_signal_stats.py     │ 실시간 Latency/TPS 통계  │ Lock(선택)     │ ~32KB      │
-  │ 11 │ SmBlackBox       │ L3   │ sm_blackbox.py         │ 시그널 체인 세션 감시    │ Lock(선택)     │ ~32KB      │
+  │  4 │ SmBlockHandler   │ L2   │ sm_block.py            │ SmBlock 생성/주입 팩토리 │ Lock           │ (SmBlock)  │
+  │  5 │ SmRingBuffer     │ L1   │ sm_ring_buffer.py      │ Lock-free SPSC 링 버퍼   │ 없음 (SPSC)    │ 64KB 기본  │
+  │  6 │ SmQueue          │ L2   │ sm_queue.py            │ IPC 큐 (mp.Queue 대체)   │ Event+Lock선택 │ SmRingBuf  │
+  │  7 │ SmLockFreeEvent  │ L2   │ sm_sync.py             │ 스핀락 프로세스 통지     │ Spin-wait      │ SmValue 1B │
+  │  8 │ SmKernelEvent    │ L2   │ sm_sync.py             │ 커널 이벤트 (Win32)      │ kernel32 Event │ OS 핸들    │
+  │  9 │ SmMutex          │ L2   │ sm_sync.py             │ Win32 Named Mutex        │ kernel32 Mutex │ OS 핸들    │
+  │ 10 │ SmSignalRegistry │ L3   │ sm_signal.py           │ 시그널 구독 비트맵       │ Atomic bitwise │ ~40KB      │
+  │ 11 │ SmSignalStats    │ L3   │ sm_signal.py           │ 실시간 Latency/TPS 통계  │ Lock(선택)     │ ~32KB      │
+  │ 12 │ SmBlackBox       │ L3   │ sm_blackbox.py         │ 시그널 체인 세션 감시    │ Lock(선택)     │ ~32KB      │
   └────┴──────────────────┴──────┴────────────────────────┴──────────────────────────┴────────────────┴────────────┘
 
 
@@ -818,5 +853,5 @@
 
 
 ──────────────────────────────────────────────────────────────────────────────
-  문서 버전: 2026-03-01 / ALASKA v2.6 SmInfra Spec (CPU 절감 자원 추가)
+  문서 버전: 2026-03-04 / ALASKA v2.6 SmInfra Spec (CPU 절감 자원 추가)
 ──────────────────────────────────────────────────────────────────────────────

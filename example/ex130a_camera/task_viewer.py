@@ -18,6 +18,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from py_alaska import task
 from py_alaska import ui_thread
+import cv2
 import numpy as np
 import time
 
@@ -155,9 +156,8 @@ class ImiCameraView(QWidget):
         self._current_pixmap = None
         self.enable_zoom_pan = False
 
-        # 화면 갱신 주기 제한
-        self._last_display_time = 0.0
-        self._display_interval = 1.0 / 60  # 최대 60 FPS 표시
+        self._fps_counter = 0
+        self._is_iconified = False
 
         # 연결 상태 추적
         self._is_connected = False
@@ -473,40 +473,45 @@ class ImiCameraView(QWidget):
     def on_camera_received(self, signal):
         """Signal: 프레임 수신 — InvokeDispenser 스레드에서 직접 실행
 
-        - 모든 프레임: FPS 카운트 + mfree (프레임 손실 없음)
-        - 60 FPS분만: 버퍼 복사 → _frame_ready Signal → UI 스레드 표시
+        - 모든 프레임: 카운트 + mfree
+        - 최소화 시: 변환/표시 스킵 (CPU 절약)
         """
         if not self.smblock:
             return
 
         data = signal.data
         sm_index = data["sm_index"]
+        raw = None
         try:
-            now = time.time()
-
-            # FPS 카운터: 수신된 모든 프레임 계산
-            self.frame_count += 1
             self.total_frame_count += 1
-            elapsed = now - self.last_fps_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.last_fps_time = now
+            self._fps_counter += 1
 
-            # 표시 주기 외 프레임: mfree만 하고 종료 (버퍼 복사/변환 없음)
-            if now - self._last_display_time < self._display_interval:
+            # 최소화 상태: mfree만 수행, 복사/변환 스킵
+            if self._is_iconified:
                 return
 
-            self._last_display_time = now
-            image = self.smblock.get_buffer(sm_index).copy()
-            # Qt Signal로 UI 스레드에 전달 (자동 queued connection)
-            self._frame_ready.emit(image, self.total_frame_count, self.fps)
+            raw = self.smblock.get_buffer(sm_index).copy()  # 5MB Bayer raw copy
         finally:
             self.smblock.mfree(sm_index)
 
+        # BayerGB → RGB 직접 변환
+        image = cv2.cvtColor(raw, cv2.COLOR_BayerGB2RGB)
+
+        # FPS 계산 (1초 간격)
+        now = time.time()
+        elapsed = now - self.last_fps_time
+        if elapsed >= 1.0:
+            self.fps = self._fps_counter / elapsed
+            self._fps_counter = 0
+            self.last_fps_time = now
+
+        self._frame_ready.emit(image, self.total_frame_count, self.fps)
+
     def _on_frame_ready_ui(self, image, total_count, current_fps):
-        """UI 스레드: 프레임 표시 (_frame_ready Signal 수신)"""
-        pixmap = self._numpy_to_pixmap(image)
+        """UI 스레드: 프레임 표시 (_frame_ready Signal 수신, image=RGB)"""
+        h, w = image.shape[:2]
+        qimg = QImage(image.data, w, h, 3 * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
         self._current_pixmap = pixmap
 
         if self.enable_zoom_pan and self._scale != 1.0:
@@ -561,6 +566,14 @@ class ImiCameraView(QWidget):
             self.stats_label.setText(disconnect_text)
             self.stats_label.adjustSize()
             self.stats_label.raise_()
+
+    def hideEvent(self, event):
+        self._is_iconified = True
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        self._is_iconified = False
+        super().showEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

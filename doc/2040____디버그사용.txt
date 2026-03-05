@@ -1,0 +1,568 @@
+============================================================================
+  ALASKA v2.6 - Debug 구조 설계
+  Date: 2026-03-01
+============================================================================
+
+1. 개요
+----------------------------------------------------------------------------
+Task별 디버그 출력을 제어하는 카테고리 기반 시스템.
+@task 데코레이터의 debug 파라미터로 카테고리를 콤마 구분 문자열로 지정하면
+해당 카테고리의 디버그 출력만 활성화된다.
+
+    @task(debug="msg,signal")     # self.print() + 시그널 추적만 ON
+    @task(debug=True)             # 전체 ON
+
+모든 출력은 통일된 포맷을 사용한다:
+    [  task_name ] FLAG | 내용
+
+관련 파일:
+    core/task_manager.py   - TaskRuntime, DirectClient, RmiClient
+    core/task_signal.py    - SignalClient (emit/on)
+    core/task_decoration.py - @task 데코레이터 (_tc_debug 속성)
+
+
+2. 카테고리 & 플래그
+----------------------------------------------------------------------------
+
+2.1 카테고리 정의
+
+    카테고리      별칭              설명
+    ---------    ---------------   ------------------------------------
+    msg          (없음)            self.print() 사용자 메시지 출력
+    signal       sig               시그널 emit/on 추적
+    method       ipc, rmi          RMI 메서드 호출 추적
+    variable     var               RMI 변수 get/set 추적
+    task         (없음)            Task 수명주기 (→ 2020.생명주기설계.txt)
+    all          (없음)            전체 카테고리 ON (= True)
+
+2.2 @task 데코레이터 설정
+
+    @task(debug=False)              # 기본값. 디버그 전체 OFF
+    @task(debug=True)               # = "all". 전체 ON
+    @task(debug="msg")              # self.print()만 활성
+    @task(debug="signal")           # 시그널 추적만 (별칭: "sig")
+    @task(debug="method")           # RMI 호출 추적만 (별칭: "ipc", "rmi")
+    @task(debug="variable")         # 변수 접근 추적만 (별칭: "var")
+    @task(debug="task")             # 수명주기 추적만
+    @task(debug="all")              # 전체 (= True)
+    @task(debug="msg,signal")       # 복수 지정 (콤마 구분)
+    @task(debug="signal,task")      # 시그널 + 수명주기
+
+2.3 플래그 테이블
+
+    TaskRuntime 내부 플래그 5개:
+        _debug_msg      : bool    (self.print 활성 여부)
+        _debug_signal   : bool    (시그널 emit/on 추적)
+        _debug_method   : bool    (RMI 메서드 호출 추적)
+        _debug_variable : bool    (RMI 변수 get/set 추적)
+        _debug_task     : bool    (수명주기 추적)
+
+                            _debug  _debug   _debug   _debug    _debug
+    debug 설정              _msg    _signal  _method  _variable _task
+    --------------------   ------  -------  -------  --------- ------
+    False (기본)             -       -        -        -         -
+    True                     O       O        O        O         O
+    "all"                    O       O        O        O         O
+    "msg"                    O       -        -        -         -
+    "msg,signal"             O       O        -        -         -
+    "signal"                 -       O        -        -         -
+    "signal,task"            -       O        -        -         O
+    "method,variable"        -       -        O        O         -
+    "msg,method"             O       -        O        -         -
+    "rmi,var"                -       -        O        O         -
+    "sig,task"               -       O        -        -         O
+
+    별칭 매핑:
+        "sig"  → signal
+        "ipc"  → method
+        "rmi"  → method
+        "var"  → variable
+
+2.4 내부 구현 (TaskRuntime.run)
+
+    # 1순위: config.json "debug" 키
+    _cfg_debug = ti.injection.get('debug', None)
+    debug_cfg = _cfg_debug if _cfg_debug is not None else getattr(ti.job_class, '_tc_debug', False)
+
+    if debug_cfg is True:
+        self._debug_msg = ... = self._debug_task = True
+    elif isinstance(debug_cfg, str):
+        opts = {o.strip().lower() for o in debug_cfg.split(',')}
+        _all = 'all' in opts
+        self._debug_msg      = _all or 'msg' in opts
+        self._debug_signal   = _all or 'signal' in opts or 'sig' in opts
+        self._debug_method   = _all or 'method' in opts or 'ipc' in opts or 'rmi' in opts
+        self._debug_variable = _all or 'variable' in opts or 'var' in opts
+        self._debug_task     = _all or 'task' in opts
+
+
+3. 출력 포맷
+----------------------------------------------------------------------------
+
+3.1 포맷 구조
+
+    [ task_name  ] FLAG | 내용
+    ├─ 접두사 ──┤ ├──┤   ├── 본문
+    │  12자 우측  │ 4자   │
+    │  정렬       │       │
+    └─ 14자 ─────┘       └── 파이프(|) 뒤 공백 1자
+
+    총 22자 (접두사 14 + 공백 1 + FLAG 4 + 공백 1 + 파이프 1 + 공백 1)
+
+3.2 FLAG 태그 (4자 고정폭)
+
+    FLAG   카테고리     설명
+    ----   ---------   ---------------------------
+    emit   signal      시그널 emit (송신)
+     on    signal      시그널 on 핸들러 호출 (수신)
+    ipc    method      RMI 메서드 호출
+    var    variable    변수 get/set
+    life   task        수명주기 이벤트 lifecycle("event")
+    MSG    msg         self.print() 사용자 출력
+
+3.3 멀티라인 출력 (연속행 정렬)
+
+    연속행은 파이프(|) 위치를 첫 행과 정렬한다.
+    패딩 = 공백 × prefix 길이
+
+    [  controller] ipc  | sensor_node.get_data(
+                        |   timeout = 5
+                        |   retries = 3
+                        | )
+
+    구현:
+        pad = ' ' * len(prefix)
+        첫 행: prefix + func_expr + "("
+        인자: pad + "  " + param
+        닫기: pad + ")" + suffix
+
+
+4. self.print() - 사용자 디버그 메시지
+----------------------------------------------------------------------------
+
+4.1 개요
+
+    Task 인스턴스에서 호출할 수 있는 디버그 출력 메서드.
+    debug 카테고리에 "msg"가 포함된 경우에만 출력된다.
+    미포함 시 no-op (아무 동작 없음, 오류도 없음).
+
+4.2 사용 예시
+
+    @task(debug="msg")
+    class SensorNode:
+        def run(self):
+            self.print("센서 데이터 수신:", data)
+
+    출력:
+    [ sensor_node] MSG  | 센서 데이터 수신: [23.5, 24.1, 22.8]
+
+4.3 내부 구현
+
+    위치: TaskRuntime.run() → job 인스턴스 생성 후
+
+    _tid_prefix = f"[{ti.task_id:>12s}]"
+    _rt = self
+    def _debug_print(*args, sep=' ', end='\n'):
+        if not _rt._debug_msg:
+            return
+        msg = sep.join(str(a) for a in args)
+        sys.stdout.write(f"{_tid_prefix} MSG  | {msg}{end}")
+        sys.stdout.flush()
+    self.job.print = _debug_print
+
+
+5. IPC 디버그 (method)
+----------------------------------------------------------------------------
+
+5.1 개요
+
+    _debug_method 플래그가 활성화된 경우, RMI 메서드 호출 시
+    caller 측에서 함수호출 형태로 출력한다.
+
+5.2 출력 포맷
+
+    단일행 (인자 없음):
+    [  controller] ipc  | sensor_node.get_status()
+
+    멀티라인 (인자 있음):
+    [  controller] ipc  | sensor_node.get_data(
+                        |   5
+                        |   timeout = 10
+                        | )
+
+5.3 사용 예시
+
+    @task(debug="method")
+    class Controller:
+        def run(self):
+            status = self.sensor.get_status()
+            self.sensor.configure(mode="fast", timeout=5.0)
+
+    출력:
+    [  controller] ipc  | sensor_node.get_status()
+    [  controller] ipc  | sensor_node.configure(
+                        |   mode = 'fast'
+                        |   timeout = 5.0
+                        | )
+
+5.4 내부 구현
+
+    (1) DirectClient (Thread-Thread 모드)
+        위치: _DirectProxy.__call__
+
+        if client and client._debug_method:
+            caller_str = client._caller or "(external)"
+            prefix = f"[{caller_str:>12s}] ipc  | "
+            print(_fmt_debug_call(prefix, f"{client._id}.{self._name}", a, kw))
+
+    (2) RmiClient (Process간 모드)
+        위치: RmiClient._call, RmiClient._call_nowait
+
+        if should_trace and not is_var_access:
+            caller_str = self._caller or "(external)"
+            prefix = f"[{caller_str:>12s}] ipc  | "
+            print(_fmt_debug_call(prefix, f"{self._id}.{m}", a, kw))
+
+
+6. VAR 디버그 (variable)
+----------------------------------------------------------------------------
+
+6.1 개요
+
+    _debug_variable 플래그가 활성화된 경우, 원격 변수 get/set 시
+    caller 측에서 함수호출 형태로 출력한다.
+
+6.2 출력 포맷
+
+    get (읽기):  get("target.속성명")->값
+    set (쓰기):  set("target.속성명", 값)
+
+6.3 사용 예시
+
+    예시 1: 변수 읽기 (get)
+
+        @task(debug="variable")
+        class Controller:
+            def run(self):
+                temp = self.sensor.temperature
+
+        출력:
+        [  controller] var  | get("sensor_node.temperature")->23.5
+
+    예시 2: 변수 쓰기 (set)
+
+        self.sensor.threshold = 42
+
+        출력:
+        [  controller] var  | set("sensor_node.threshold", 42)
+
+    예시 3: method + variable 조합
+
+        @task(debug="method,variable")
+        class Controller:
+            def run(self):
+                temp = self.sensor.temperature
+                self.sensor.threshold = temp + 10
+                self.sensor.calibrate()
+
+        출력:
+        [  controller] var  | get("sensor_node.temperature")->23.5
+        [  controller] var  | set("sensor_node.threshold", 33.5)
+        [  controller] ipc  | sensor_node.calibrate()
+
+6.4 내부 구현
+
+    (1) DirectClient (Thread-Thread)
+
+        __getattr__:
+            try:
+                val = getattr(self._get_job(), name)
+                print(f"[{caller_str:>12s}] var  | get(\"{self._id}.{name}\")->{repr(val)}")
+            except Exception:
+                print(f"[{caller_str:>12s}] var  | get(\"{self._id}.{name}\")")
+
+        __setattr__:
+            print(f"[{caller_str:>12s}] var  | set(\"{self._id}.{name}\", {repr(value)})")
+
+    (2) RmiClient (Process간)
+        __getvar__: _call() 결과 수신 후 값 포함 출력 (return 직전)
+        __setvar__: _call() 진입부에서 출력
+
+
+7. Signal 디버그 (signal)
+----------------------------------------------------------------------------
+
+7.1 개요
+
+    _debug_signal 플래그가 활성화된 경우:
+    - emit 시점: 시그널 송신 (emit)
+    - on 시점: 핸들러 호출 (on)
+
+    출력 위치:
+    - emit: SignalClient.emit()
+    - on: SignalClient._dispatch()
+
+    주의: emit은 caller의 플래그, on은 receiver의 플래그로 각각 제어.
+    (서로 다른 프로세스이므로 독립적)
+
+7.2 출력 포맷
+
+    emit (송신) — signal_name.emit() 형태:
+    [ sender_task] emit | signal_name.emit(
+                        |   data = {...}
+                        | ) N subscribers
+
+    on (수신) — handler_name() 형태:
+    [  recv_task ]  on  | handler_name(
+                        |   data = {...}
+                        | ) from sender_task
+
+7.3 사용 예시
+
+    예시 1: 데이터 포함 시그널
+
+        @task(debug="signal")
+        class SensorNode:
+            def run(self):
+                self.signal.temperature.emit({"value": 23.5})
+
+        @task(debug="signal")
+        class Controller:
+            def on_temperature(self, sig):
+                pass
+
+        출력 (SensorNode):
+        [ sensor_node] emit | temperature.emit(
+                            |   data = {'value': 23.5}
+                            | ) 1 subscribers
+
+        출력 (Controller):
+        [  controller]  on  | on_temperature(
+                            |   data = {'value': 23.5}
+                            | ) from sensor_node
+
+    예시 2: 데이터 없는 시그널
+
+        self.signal.heartbeat.emit()
+
+        출력:
+        [ sensor_node] emit | heartbeat.emit() 3 subscribers
+        [  controller]  on  | on_heartbeat() from sensor_node
+
+    예시 3: 복수 구독자
+
+        self.signal.alarm.emit({"level": "critical"})
+
+        출력 (Sender):
+        [       alarm] emit | alarm.emit(
+                            |   data = {'level': 'critical'}
+                            | ) 3 subscribers
+
+        출력 (각 Receiver):
+        [  controller]  on  | on_alarm(...) from alarm
+        [     display]  on  | on_alarm(...) from alarm
+        [      logger]  on  | on_alarm(...) from alarm
+
+7.4 내부 구현
+
+    (1) emit 시점 (SignalClient.emit)
+
+        result = self._broker.emit(sig)
+        if self._debug:
+            _b = self._broker
+            _subs = _b._sub_ver_cache.get(name) if _b._sm_registry is not None else _b._reg_cache.get(name)
+            _nsub = len(_subs) if _subs else 0
+            _prefix = f"[{self._task_id:>12s}] emit | "
+            _func = f"{name}.emit"
+            if data is not None:
+                print(_fmt_debug_call(_prefix, _func, kwargs={'data': data},
+                      suffix=f" {_nsub} subscribers"))
+            else:
+                print(f"{_prefix}{_func}() {_nsub} subscribers")
+
+    (2) on 시점 (SignalClient._dispatch)
+
+        for h in lst:
+            if self._debug:
+                _prefix = f"[{self._task_id:>12s}]  on  | "
+                _data = sig_obj.data
+                if _data is not None:
+                    print(_fmt_debug_call(_prefix, h.__name__,
+                          kwargs={'data': _data},
+                          suffix=f" from {_src}"))
+                else:
+                    print(f"{_prefix}{h.__name__}() from {_src}")
+            try: h(sig_obj)
+            except Exception: pass
+
+
+8. 런타임 디버그 제어
+----------------------------------------------------------------------------
+
+8.1 개요
+
+    실행 중인 태스크의 디버그 플래그를 RMI를 통해 동적으로 변경 가능.
+    (재시작 없이 실시간 ON/OFF)
+
+8.2 RMI 내부 명령어
+
+    __get_debug__ → 현재 플래그 조회
+    __set_debug__ → 플래그 개별 변경
+
+8.3 사용 예시
+
+    # 다른 태스크에서 sensor_node의 디버그 상태 조회
+    flags = self.sensor.__get_debug__()
+    # → {'msg': False, 'signal': True, 'method': False,
+    #    'variable': False, 'task': False}
+
+    # signal 디버그 끄기
+    self.sensor.__set_debug__('signal', False)
+
+    # method 디버그 켜기
+    self.sensor.__set_debug__('method', True)
+
+
+9. config.json 디버그 오버라이드 (embedded 드라이버)
+----------------------------------------------------------------------------
+
+9.1 개요
+
+    패키지로 제공되는 embedded 드라이버(카메라, 센서 등)는
+    소스 코드의 @task(debug=...) 설정을 사용자가 직접 수정할 수 없다.
+    이를 위해 config.json의 task_config 섹션에서
+    debug 설정을 오버라이드할 수 있다.
+
+    우선순위:
+        config.json "debug" 키  >  @task(debug=...) 데코레이터
+
+9.2 config.json 설정 방법
+
+    {
+      "task_config": {
+        "camera1/imi_cam_dp": {
+          "@import": "example.ex130a_camera.task_cam_driver",
+          "debug": "msg,signal",
+          "smblock": "smblock:smblock2048",
+          "mac_address": "00:09:7e:35:80:38"
+        }
+      }
+    }
+
+    debug 값은 @task(debug=...) 와 동일한 형식:
+        "debug": true              → 전체 ON
+        "debug": false             → 전체 OFF (기본)
+        "debug": "msg"             → self.print()만
+        "debug": "msg,signal"      → self.print() + 시그널
+        "debug": "all"             → 전체 (= true)
+
+9.3 내부 구현
+
+    위치: TaskRuntime.run() — debug_cfg 파싱부
+
+    _cfg_debug = ti.injection.get('debug', None)
+    debug_cfg = _cfg_debug if _cfg_debug is not None else getattr(ti.job_class, '_tc_debug', False)
+
+    주의: "debug" 키는 injection에서 job으로 주입되지 않도록 필터링.
+        for k, v in ti.injection.items():
+            if k == 'debug': continue  # TaskRuntime에서 처리
+
+
+10. 헬퍼 함수
+----------------------------------------------------------------------------
+
+10.1 _fmt_debug_call (멀티라인 함수 표기)
+
+    위치: core/task_manager.py (모듈 레벨), core/task_signal.py (동일 복제)
+
+    def _fmt_debug_call(prefix, func_expr, args=(), kwargs=None, suffix=''):
+        params = [repr(a) for a in args]
+        if kwargs:
+            params.extend(f"{k} = {repr(v)}" for k, v in kwargs.items())
+        if not params:
+            return f"{prefix}{func_expr}(){suffix}"
+        pad = ' ' * len(prefix)
+        lines = [f"{prefix}{func_expr}("]
+        for p in params:
+            lines.append(f"{pad}  {p}")
+        lines.append(f"{pad}){suffix}")
+        return '\n'.join(lines)
+
+    사용:
+        prefix = f"[{caller:>12s}] ipc  | "
+        print(_fmt_debug_call(prefix, "sensor.get_data", (5,), {"timeout": 10}))
+
+    출력:
+        [  controller] ipc  | sensor.get_data(
+                            |   5
+                            |   timeout = 10
+                            | )
+
+
+11. 종합 예시
+----------------------------------------------------------------------------
+
+11.1 전체 디버그 시나리오
+
+    @task(debug=True)     # all
+    class Controller:
+        sensor: inject("client:sensor_node")
+        def run(self):
+            self.print("센서 조회 시작")
+            temp = self.sensor.temperature
+            self.sensor.threshold = temp + 10
+            data = self.sensor.get_data(timeout=5)
+            self.signal.result.emit({"temp": temp, "data": data})
+            self.print("완료")
+
+    전체 출력:
+    [  controller] life | lifecycle("started", mode=thread, pid=12345)
+    [  controller] MSG  | 센서 조회 시작
+    [  controller] var  | get("sensor_node.temperature")->23.5
+    [  controller] var  | set("sensor_node.threshold", 33.5)
+    [  controller] ipc  | sensor_node.get_data(
+                        |   timeout = 5
+                        | )
+    [  controller] emit | result.emit(
+                        |   data = {'temp': 23.5, 'data': [1, 2, 3]}
+                        | ) 2 subscribers
+    [  controller] MSG  | 완료
+    [  controller] life | lifecycle("stopped")
+
+11.2 카테고리별 필터링 비교
+
+    동일 코드에 대해 debug 설정별 출력:
+
+    (A) debug="msg"
+    [  controller] MSG  | 센서 조회 시작
+    [  controller] MSG  | 완료
+
+    (B) debug="method,variable"
+    [  controller] var  | get("sensor_node.temperature")->23.5
+    [  controller] var  | set("sensor_node.threshold", 33.5)
+    [  controller] ipc  | sensor_node.get_data(
+                        |   timeout = 5
+                        | )
+
+    (C) debug="signal"
+    [  controller] emit | result.emit(
+                        |   data = {'temp': 23.5, 'data': [1, 2, 3]}
+                        | ) 2 subscribers
+
+    (D) debug="task"
+    [  controller] life | lifecycle("started", mode=thread, pid=12345)
+    [  controller] life | lifecycle("stopped")
+
+
+12. 구현 상태
+----------------------------------------------------------------------------
+    [완료] self.print() 메서드 (TaskRuntime → job 바인딩)
+    [완료] 출력 포맷 통일 ([task_name] FLAG | 내용)
+    [완료] signal emit/on 디버그 출력
+    [완료] task 수명주기 디버그 출력
+    [완료] 카테고리 파싱 (msg, signal, method, variable, task, all + 별칭)
+    [완료] 런타임 디버그 제어 (__get_debug__/__set_debug__)
+    [완료] config.json 디버그 오버라이드 (embedded 드라이버)
+    [완료] RMI/Signal/VAR 함수형 표기 (_fmt_debug_call)
+    [완료] VAR get/set 함수호출 표기: get("name")->val, set("name", val)
+    [완료] 구독자 수 표시 (SmSignalRegistry _sub_ver_cache)

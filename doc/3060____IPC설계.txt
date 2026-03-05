@@ -1,0 +1,798 @@
+============================================================================
+  ALASKA v2.6 - IPC (Inter-Process Communication) 설계
+  Date: 2026-03-03
+============================================================================
+
+
+1. IPC 정의
+----------------------------------------------------------------------------
+
+1.1 개요
+
+    IPC(Inter-Process Communication)는 ALASKA Task 간의 원격 메서드 호출
+    및 변수 접근을 위한 통신 메커니즘이다.
+
+    호출자(Caller)가 대상 Task의 메서드를 마치 로컬 메서드처럼 호출하면,
+    프레임워크가 직렬화(pickle) → IPC 전송 → 역직렬화 → 실행 → 응답 반환
+    과정을 자동으로 처리한다.
+
+        Caller Task                      Target Task
+        ──────────                       ──────────
+        self.worker.add(1, 2)  ──req──>  InvokeDispenser
+                                         → job.add(1, 2)
+        result = 3             <──res──  → return 3
+
+1.2 전송 계층
+
+    모드              전송 수단                  특징
+    ───────────────  ────────────────────────  ──────────────────
+    Process-Process  SmRingBuffer (공유메모리)   Lock-free SPSC
+    Process-Thread   SmRingBuffer (공유메모리)   Lock-free SPSC
+    Thread-Thread    DirectClient (직접 호출)    IPC 없음, 최고 성능
+
+    ※ Thread-Thread 모드는 같은 프로세스 메모리를 공유하므로
+       SmRingBuffer를 거치지 않고 메서드를 직접 호출한다.
+
+1.3 핵심 컴포넌트
+
+    ┌───────────────────┐     SmRingBuffer     ┌───────────────────┐
+    │  Caller Task      │     (request_q)      │  Target Task      │
+    │                   │ ──────────────────>   │                   │
+    │  RmiClient        │                      │  InvokeDispenser  │
+    │  └─ _RmiProxy     │     SmRingBuffer     │  └─ method_cache  │
+    │                   │     (response_q)     │                   │
+    │                   │ <──────────────────   │                   │
+    └───────────────────┘                      └───────────────────┘
+
+    - RmiClient: 요청 송신 + 응답 대기
+    - _RmiProxy: 메서드명 캡처 (Lazy Proxy)
+    - InvokeDispenser: 요청 수신 + 메서드 실행 + 응답 송신
+    - SmRingBuffer: 공유 메모리 SPSC 큐 (Lock-free)
+
+
+2. API 종류
+----------------------------------------------------------------------------
+
+2.1 동기 호출 (Synchronous Call)
+
+    응답이 올 때까지 호출 스레드를 블록한다.
+    반환값을 받을 수 있다.
+
+        result = self.worker.add(1, 2)          # 블로킹, 반환값 수신
+        name = self.worker.name                 # 변수 읽기 (__getvar__)
+        self.worker.name = "new_name"           # 변수 쓰기 (__setvar__)
+
+    내부 흐름:
+        _RmiProxy.__call__() → RmiClient._call()
+        → pickle.dumps(req) → SmRingBuffer.write()
+        → SmKernelEvent.set() (대상 깨움)
+        → response_event.wait() (응답 대기)
+        → SmRingBuffer.read() → pickle.loads(res)
+        → return result
+
+    특징:
+    - 타임아웃: 기본 2초 (설정 가능)
+    - stale 응답 감지: _id(시퀀스 번호) 매칭
+    - 순환 호출 감지: chain set으로 A→B→A 감지
+    - Self-RMI 감지: caller == target → InvokeDeadlockError
+
+    응답 대기 전략 (v2.6 통합 루프):
+        RmiClient._call()에서 event-wait와 spin-wait를 단일 while 루프로 통합.
+        응답 읽기(read + unpack + seq 매칭)는 공통, 대기 방식만 분기:
+
+        while True:
+            resp = response_q.read()       ← 공통 (lock 조건부)
+            if resp: unpack + seq 매칭     ← 공통
+            # Wait strategy (분기):
+            if response_event:
+                event.wait(timeout)        ← Win32 (CPU 0%)
+            else:
+                spin + sleep(0)            ← Fallback (non-Win32)
+
+        타임아웃 시 _raise_timeout(m) 공통 헬퍼 호출.
+
+2.2 비동기 호출 - nowait (Fire-and-Forget)
+
+    요청만 보내고 즉시 리턴한다.
+    반환값을 받을 수 없다.
+
+        self.worker.start_job.nowait()          # 비블로킹, 반환값 없음
+        self.worker.start_job.nowait(arg1, k=v) # 인자 전달 가능
+
+    내부 흐름:
+        _RmiProxy.nowait() → RmiClient._call_nowait()
+        → Signal P4 큐 경유 (QoS 통합)
+        → InvokeDispenser에서 _rmi.nowait으로 디스패치
+        → 응답 전송 없음
+
+    특징:
+    - 반환값 없음 (항상 None)
+    - Signal P4(LOW) 우선순위로 처리
+    - QoS deadline: 500ms, 위반 시 IGNORE
+    - 큐 실패 시 SmRingBuffer 직접 전송 (fallback)
+
+2.3 비동기 호출 - async_call (Signal 콜백)
+
+    요청을 보내고 즉시 리턴하되, 완료 시 signal로 결과를 전달한다.
+    반환값을 비동기로 받을 수 있다.
+
+        # 사용자 코드
+        self.worker.run_analysis.async_call(done="analysis.done")
+
+        @ui_thread
+        def on_analysis_done(self, signal):
+            result = signal.data                # 반환값 수신 가능
+            self.label.setText(str(result))
+
+    내부 흐름:
+        _RmiProxy.async_call(done=...) → RmiClient._call_async()
+        → threading.Thread 생성 (daemon)
+          → _call() 동기 실행 (워커 스레드)
+          → broker.emit(done, result) (완료 시 signal 발행)
+
+    특징:
+    - UI 스레드 안전 (블로킹 없음)
+    - 기존 signal + @ui_thread 인프라 활용
+    - 에러 signal 분리 가능 (error="analysis.error")
+
+2.4 변수 접근
+
+    대상 Task의 인스턴스 변수를 원격으로 읽기/쓰기한다.
+
+        # 읽기: __getvar__ RMI로 변환
+        value = self.worker.status              # 동기, 블로킹
+
+        # 쓰기: __setvar__ RMI로 변환
+        self.worker.status = "running"          # 동기, 블로킹
+
+    ※ 변수 읽기도 동기 RMI이므로 UI 스레드에서 주의 필요
+      (단, signal emit이 없으면 데드락 위험 없음)
+
+2.5 API 비교 표
+
+    API                              블로킹  반환값  UI안전  용도
+    ─────────────────────────────── ──────  ──────  ──────  ──────────────────
+    self.worker.method()             O       O       X(*)   결과 필요 시
+    self.worker.method.nowait()      X       X       O      커맨드 전달
+    self.worker.method.async_call()  X       O(**)   O      UI에서 결과 필요 시
+    self.worker.variable             O       O       X(*)   변수 읽기
+    self.worker.variable = val       O       X       X(*)   변수 쓰기
+
+    (*)  UI 스레드에서 호출 시 데드락 위험 (대상이 @ui_thread signal emit 시)
+    (**) signal 경유로 비동기 수신
+
+
+3. 일반 처리 구조
+----------------------------------------------------------------------------
+
+3.1 동기 호출 처리 흐름
+
+    시간  Caller                              Target (InvokeDispenser)
+    ───  ──────────────────────────────────  ──────────────────────────
+    T1   self.worker.add(1, 2)
+         → _RmiProxy.__call__(1, 2)
+    T2   → RmiClient._call('add', 1, 2)
+         → req = {'m':'add', 'a':(1,2), '_id':seq, 'c':caller}
+    T3   → pickle.dumps(req)
+         → request_q.write(data)
+    T4   → notify_event.set()                T5  notify_event → 깨어남
+         (대상이 sleeping이면)
+    T5   → response_event.wait()             T6  request_q.read()
+         ★ Caller 블록                       T7  pickle.loads(data)
+                                             T8  method_cache['add'] → fn
+                                             T9  result = fn(1, 2)
+                                             T10 res = {'r': result, '_id': seq}
+                                             T11 pickle.dumps(res)
+                                             T12 response_q.write(data)
+                                             T13 response_event.set()
+    T14  → response_event 수신
+         → response_q.read()
+    T15  → pickle.loads(res)
+         → _id 매칭 확인
+    T16  → return result (= 3)
+
+3.2 nowait 처리 흐름
+
+    시간  Caller                              Target (InvokeDispenser)
+    ───  ──────────────────────────────────  ──────────────────────────
+    T1   self.worker.start.nowait()
+         → _RmiProxy.nowait()
+    T2   → RmiClient._call_nowait('start')
+         → req = {'m':'start'}
+    T3   → broker._q_cache[target] → qs
+         → qs[3].put_nowait({               (Signal P4 큐에 삽입)
+             'name': '_rmi.nowait',
+             'data': req, ...
+           })
+    T4   → notify_event.set() (조건부)
+         → return (즉시 리턴)
+                                             T5  Signal P4 큐에서 수신
+                                             T6  _dispatch_rmi_nowait(data)
+                                             T7  job.start() 실행
+                                             T8  (응답 없음)
+
+3.3 InvokeDispenser 메인 루프
+
+    ┌─────────────────────────────────────────────────────┐
+    │  InvokeDispenser Loop (단일 스레드)                  │
+    │                                                     │
+    │  while running:                                     │
+    │      ① Signal RECV (P1→P5 우선순위)                 │
+    │         - P1 CRITICAL : 20건/cycle                  │
+    │         - P2 HIGH     : 10건/cycle                  │
+    │         - P3 NORMAL   :  5건/cycle                  │
+    │         - P4 LOW      :  2건/cycle (nowait RMI 포함)│
+    │         - P5 BACKGROUND: 1건/cycle                  │
+    │         - Burst Guard : 50건/cycle 상한             │
+    │                                                     │
+    │      ② IPC/RMI (request_q)                          │
+    │         - 최대 5건/cycle                             │
+    │         - 순환 호출 감지                             │
+    │         - 메서드 실행 + 응답 전송                    │
+    │                                                     │
+    │      ③ Idle → Kernel Wait                           │
+    │         - is_sleeping = 1                            │
+    │         - notify_event.clear()                      │
+    │         - Double-Check (race condition 방지)        │
+    │         - notify_event.wait(timeout)                │
+    │         - is_sleeping = 0                            │
+    └─────────────────────────────────────────────────────┘
+
+    ※ Signal이 RMI보다 우선 처리된다.
+       RMI는 cycle당 5건으로 제한되어 Signal 처리를 방해하지 않는다.
+
+3.4 Thread-Thread 직접 호출 (DirectClient)
+
+    Thread 모드 Task 간 호출은 IPC를 거치지 않는다.
+
+        self.worker.add(1, 2)
+        → _DirectProxy.__call__(1, 2)
+        → getattr(job, 'add')
+        → job.add(1, 2)                    # 직접 호출 (pickle 없음)
+        → return 3
+
+    ※ SmRingBuffer, pickle, notify_event 모두 불필요.
+       함수 호출 오버헤드만 발생한다.
+
+
+4. QoS (Quality of Service) 처리
+----------------------------------------------------------------------------
+
+4.1 Signal QoS 우선순위
+
+    우선순위  이름          Cycle Quota  용도
+    ────────  ──────────  ──────────  ──────────────────────
+    P1        CRITICAL     20          긴급 이벤트 (에러, 종료)
+    P2        HIGH         10          실시간 데이터 (프레임, 센서)
+    P3        NORMAL        5          일반 이벤트 (기본값)
+    P4        LOW           2          낮은 우선순위 + nowait RMI
+    P5        BACKGROUND    1          배경 작업 (로깅, 통계)
+
+    ※ nowait RMI는 P4 큐에 삽입된다.
+       동기 RMI는 QoS 큐가 아닌 SmRingBuffer(request_q)로 전송된다.
+
+4.2 QoS 설정 방법
+
+    Signal 핸들러 데코레이터에서 설정:
+
+        @task()
+        class MyJob:
+            @signal("sensor.data", qos={"priority": 2, "deadline": 0.050})
+            def on_sensor(self, signal):
+                ...
+
+    또는 emit 시 지정:
+
+        self.signal.emit("event.name", data,
+                         qos={"priority": 1, "deadline": 0.010})
+
+4.3 Deadline 처리
+
+    Signal에 deadline(초)을 설정하면, 처리 시작 시각이 deadline을 초과한
+    경우 QoS 위반으로 처리된다.
+
+        deadline 검사:
+            cycle_time - signal.ts > deadline  → 위반
+
+        위반 시 동작 (on_violation):
+        ──────────────────────────────────────────────
+        "WARN"    : 경고 출력 후 실행 (기본값)
+        "DROP"    : 실행하지 않고 폐기
+        "IGNORE"  : 위반 무시, 정상 실행
+
+4.4 Burst Guard
+
+    단일 cycle에서 Signal 처리가 과도하면 RMI 응답이 지연된다.
+    Burst Guard는 cycle당 Signal 처리를 50건으로 제한한다.
+
+        if burst_count >= 50:
+            break  → RMI 처리 단계로 이동
+
+    ※ Signal 폭주 시에도 RMI 최소 5건/cycle 보장.
+
+
+5. 제약 사항
+----------------------------------------------------------------------------
+
+5.1 UI 스레드 데드락
+
+    QObject(QWidget) Task에서 동기 RMI를 호출하면,
+    대상 메서드가 @ui_thread signal을 emit할 경우 데드락이 발생한다.
+
+        ★ 위험 패턴:
+        class ViewerUI(QWidget):
+            def on_button_clicked(self):
+                result = self.worker.run_analysis()     # ← UI 스레드 블록
+                # → run_analysis()가 @ui_thread signal emit → 데드락
+
+        ★ 안전 패턴:
+        class ViewerUI(QWidget):
+            def on_button_clicked(self):
+                self.worker.run_analysis.nowait()       # ← 비블로킹
+
+    ※ 상세 분석: 7장 "검토: UI 스레드 데드락" 참조
+
+5.2 Self-RMI 금지
+
+    자기 자신에게 동기 RMI를 호출하면 InvokeDispenser가 응답을 보내야
+    하는데, 동시에 _call()이 해당 스레드를 블록하므로 영구 멈춤된다.
+
+        self.rmi_self.method()  → InvokeDeadlockError 즉시 발생
+
+    ※ 프레임워크가 caller == target을 감지하여 예외를 던진다.
+
+5.3 순환 호출 금지
+
+    A → B → C → A 형태의 순환 RMI를 호출하면 데드락이 발생한다.
+
+        A._call() → 블록 (A의 응답 대기)
+        B._call() → 블록 (B의 응답 대기)
+        C._call('A.method') → A의 InvokeDispenser가 처리해야 하지만
+                               A는 이미 _call()에서 블록 중
+        → 데드락
+
+    ※ 프레임워크가 chain set으로 감지하여 CircularRmiError를 반환한다.
+
+5.4 Pickle 가능 제약
+
+    동기/비동기 RMI의 인자와 반환값은 pickle 직렬화가 가능해야 한다.
+
+        ○ 가능: int, str, list, dict, tuple, bytes, dataclass
+        ✕ 불가: lambda, socket, file handle, QWidget, threading.Lock
+
+    ※ Thread-Thread(DirectClient)는 pickle을 사용하지 않으므로 제한 없음.
+
+5.5 응답 큐 단일 채널
+
+    각 Task의 response_q는 하나뿐이다.
+    동시에 여러 Task에게 동기 RMI를 보내면 응답이 섞일 수 있다.
+
+    ※ v2.6에서 _id(시퀀스 번호) 기반 stale 응답 감지로 완화됨.
+       잘못된 응답은 skip하고 올바른 응답을 대기한다.
+
+5.6 타임아웃
+
+    동기 RMI는 기본 2초 타임아웃이 있다.
+    대상 Task가 중단되었거나, 메서드 실행이 오래 걸리면 타임아웃 발생.
+
+        RmiTimeoutError: caller → target.method() timed out (2.0s)
+
+    ※ 타임아웃 조정: TaskManager config에서 rmi_timeout 설정.
+    ※ nowait는 응답을 기다리지 않으므로 타임아웃 없음.
+
+5.7 SmRingBuffer 용량
+
+    request_q, response_q는 고정 크기 링 버퍼이다.
+    버퍼가 가득 차면 write가 실패하고 재시도 루프에 진입한다.
+    최대 500회 재시도 후 RmiTimeoutError 발생.
+
+    ※ 대용량 데이터 전송 시 주의 (큰 pickle → 버퍼 부족 가능).
+
+
+6. 성능 특성
+----------------------------------------------------------------------------
+
+    항목                  측정값           비고
+    ──────────────────  ──────────────  ──────────────────
+    IPC ping (왕복)      avg 0.064ms     Process-Process
+    Signal emit          avg 0.096ms     Direct emit (v2.6)
+    Signal ping-pong     avg 0.134ms     emit → handler → emit
+    DirectClient 호출    ~0.001ms        Thread-Thread, IPC 없음
+    nowait 호출          ~0.010ms        Signal P4 큐 삽입만
+
+    v2.6 최적화 효과:
+    - 조건부 notify: syscall ~5us 절감/건
+    - Kernel Event 대기: CPU 사용량 90% 감소
+    - 메서드 캐시: 첫 호출 getattr 비용 제거
+    - stale 응답 감지: _id 시퀀스 매칭
+
+
+7. 검토: UI 스레드 데드락
+----------------------------------------------------------------------------
+
+7.1 현상
+
+    GUI Task의 버튼 핸들러에서 다른 Task의 메서드를 동기 RMI로 호출하면,
+    응답이 돌아오지 않고 UI가 영구 멈춤(freeze)된다.
+
+    재현 코드:
+
+        class ViewerUI(QWidget):       # thread 모드, UI 스레드
+            def on_button_clicked(self):
+                result = self.rmi.processor.run_analysis()   # ← 여기서 멈춤
+
+        class Processor:               # thread 모드, 워커 스레드
+            @ui_thread
+            def on_result_ready(self, signal):
+                self.label.setText(str(signal.data))
+
+            def run_analysis(self):
+                data = self._do_work()
+                self.signal.emit("result.ready", data)       # ← @ui_thread 핸들러 트리거
+                return data
+
+    증상:
+    - UI 완전 멈춤 (버튼, 창 이동, 닫기 불가)
+    - RmiTimeoutError 발생 안 함 (timeout 전에 이미 데드락)
+    - Ctrl+C로도 종료 어려움 (메인 스레드 블록)
+
+7.2 데드락 발생 흐름
+
+    시간  UI 스레드 (메인)              워커 스레드 (Processor)
+    ───  ─────────────────────────────  ─────────────────────────────
+    T1   on_button_clicked() 진입
+    T2   rmi.processor.run_analysis()
+         → RmiClient._call() 진입
+         → SmRingBuffer에 요청 기록
+         → 응답 대기 (spin-wait/event)
+         ★ UI 스레드 블록됨
+                                        T3  InvokeDispenser가 요청 수신
+                                        T4  run_analysis() 실행
+                                        T5  signal.emit("result.ready")
+                                        T6  @ui_thread 핸들러 dispatch
+                                            → invoker.invoke_signal.emit(func)
+                                            → Qt Signal → UI 스레드 이벤트 큐
+                                        T7  run_analysis() return data
+                                        T8  응답 SmRingBuffer에 기록
+    T9   응답 수신, _call() 리턴
+         ★ 여기서 Qt 이벤트 루프 재개
+         → @ui_thread 핸들러 실행
+
+    ※ 위는 정상 종료되는 경우이다.
+       실제로는 T6의 @ui_thread 핸들러가 UI 스레드에서 처리를 요구하는데,
+       T2에서 UI 스레드가 이미 블록되어 있으면 데드락이 된다.
+
+7.3 데드락 조건 (동시 충족 시)
+
+    조건 1: UI 스레드에서 동기 RMI 호출 (RmiClient._call()이 블로킹)
+    조건 2: 호출된 메서드가 @ui_thread 핸들러를 트리거하는 signal emit
+    조건 3: @ui_thread 핸들러가 Qt event loop 처리를 필요로 함
+
+    ※ 조건 2가 없으면 (signal emit이 없거나, @ui_thread가 아닌 핸들러),
+       _call()은 정상적으로 응답을 받고 리턴된다.
+
+7.4 근본 원인
+
+    RmiClient._call()은 응답이 올 때까지 현재 스레드를 블록한다.
+    UI 스레드가 블록되면 Qt 이벤트 루프가 멈추고,
+    @ui_thread 데코레이터가 Qt Signal(invoke_signal)로 전달한 함수가
+    이벤트 큐에 쌓이기만 하고 실행되지 않는다.
+
+    호출된 메서드 자체는 워커 스레드에서 정상 실행되지만,
+    그 메서드가 emit한 signal의 @ui_thread 핸들러가 UI 스레드를 필요로 하여
+    상호 대기(mutual wait) 상태가 된다.
+
+7.5 대응 방안
+
+    방안 A: .nowait() 사용 (권장, 즉시 적용 가능)
+
+        반환값이 필요 없는 경우, .nowait()로 비동기 호출한다.
+        UI 스레드가 블록되지 않으므로 데드락이 발생하지 않는다.
+
+            class ViewerUI(QWidget):
+                def on_button_clicked(self):
+                    self.rmi.processor.run_analysis.nowait()   # Fire-and-Forget
+
+        장점: 코드 변경 최소 (메서드명 뒤에 .nowait() 추가)
+        단점: 반환값을 받을 수 없음
+
+    방안 B: QTimer.singleShot (반환값 불필요 시)
+
+        버튼 핸들러에서 직접 RMI를 호출하지 않고,
+        QTimer.singleShot(0, func)으로 다음 이벤트 루프 사이클에 위임한다.
+
+            class ViewerUI(QWidget):
+                def on_button_clicked(self):
+                    QTimer.singleShot(0, self._do_analysis)
+
+                def _do_analysis(self):
+                    # 여전히 UI 스레드이므로 데드락 가능성 동일
+                    # → 별도 스레드에서 실행해야 의미 있음
+                    pass
+
+        ※ QTimer.singleShot은 UI 스레드에서 실행되므로,
+           동기 RMI를 호출하면 동일한 데드락이 발생한다.
+           반드시 방안 C와 결합하거나 .nowait()를 사용해야 한다.
+
+    방안 C: 별도 스레드에서 RMI 호출
+
+        동기 RMI를 워커 스레드에서 실행하고, 결과를 signal로 UI에 전달한다.
+
+            import threading
+
+            class ViewerUI(QWidget):
+                def on_button_clicked(self):
+                    threading.Thread(
+                        target=self._call_in_background,
+                        daemon=True
+                    ).start()
+
+                def _call_in_background(self):
+                    result = self.rmi.processor.run_analysis()  # 워커 스레드 → OK
+                    # 결과를 UI에 전달
+                    self.signal.emit("analysis.done", result)
+
+                @ui_thread
+                def on_analysis_done(self, signal):
+                    self.label.setText(str(signal.data))
+
+        장점: 반환값 사용 가능, UI 반응성 유지
+        단점: 코드량 증가, 스레드 생성 오버헤드
+
+    방안 D: 프레임워크 자동 방어 (검토 중)
+
+        RmiClient._call() 진입 시 현재 스레드가 UI 스레드인지 감지하여,
+        자동으로 _call_nowait()로 전환하는 방어 코드.
+
+            def _call(self, m, *a, **kw):
+                if _is_ui_thread():   # QApplication.thread() == QThread.currentThread()
+                    print(f"[ALASKA] Warning: sync RMI '{self._id}.{m}()' from UI thread -> auto-nowait")
+                    return self._call_nowait(m, *a, **kw)
+                ...
+
+        장점: 사용자 코드 변경 없이 데드락 방지
+        단점:
+        - UI 스레드에서 RMI 반환값이 항상 None (암묵적 동작 변경)
+        - 데드락이 발생하지 않는 정상 호출도 nowait로 전환됨 (과잉 방어)
+        - 디버깅 시 혼란 (호출했는데 결과가 None)
+
+        상태: 미결 — 과잉 방어 문제로 인해 도입 보류
+
+    방안 E: 경보 출력 (권장, 즉시 적용 가능)
+
+        동작을 변경하지 않고, UI 스레드에서 동기 RMI 호출 시
+        경고 메시지만 출력하여 개발자에게 알린다.
+
+        ┌──────────────────────────────────────────────────────────────┐
+        │  RmiClient._call() 진입 시 UI 스레드 감지 → 경보 출력      │
+        │                                                              │
+        │  def _call(self, m, *a, **kw):                               │
+        │      if _is_qt_ui_thread():                                  │
+        │          import warnings                                     │
+        │          warnings.warn(                                      │
+        │              f"[ALASKA] Sync RMI '{self._id}.{m}()' called " │
+        │              f"from UI thread (caller={self._caller}). "     │
+        │              f"This may cause deadlock. "                    │
+        │              f"Use .nowait() or .async_call() instead.",     │
+        │              stacklevel=3                                    │
+        │          )                                                   │
+        │      ...                                                     │
+        │                                                              │
+        │  감지 방법:                                                  │
+        │      def _is_qt_ui_thread():                                 │
+        │          try:                                                 │
+        │              from PySide6.QtWidgets import QApplication      │
+        │              from PySide6.QtCore import QThread              │
+        │              app = QApplication.instance()                    │
+        │              if app is None: return False                     │
+        │              return app.thread() == QThread.currentThread()  │
+        │          except ImportError:                                  │
+        │              return False                                    │
+        │                                                              │
+        │  ※ 경고만 출력하고 호출은 정상 진행한다.                    │
+        │    (동작 변경 없음, 개발자에게 알림 목적)                    │
+        │  ※ Qt 미설치 환경에서는 항상 False (무영향)                 │
+        └──────────────────────────────────────────────────────────────┘
+
+7.6 권장 패턴
+
+    UI Task에서 다른 Task 호출 시 판단 기준:
+
+        상황                                  권장 방안
+        ──────────────────────────────────  ──────────────────────────
+        반환값 불필요 (커맨드 전달)            방안 A: .nowait()
+        반환값 필요 + UI 갱신                  방안 C: 별도 스레드 + signal
+        단순 변수 조회 (signal emit 없음)      동기 RMI OK (데드락 없음)
+
+    안전한 코드 예시:
+
+        class MyUI(QWidget):
+            # ✕ 위험: 동기 RMI → 대상이 @ui_thread signal을 emit하면 데드락
+            def on_start(self):
+                self.rmi.worker.start_job()
+
+            # ○ 안전: nowait (반환값 불필요)
+            def on_start(self):
+                self.rmi.worker.start_job.nowait()
+
+            # ○ 안전: 별도 스레드 (반환값 필요)
+            def on_query(self):
+                threading.Thread(target=self._query, daemon=True).start()
+
+            def _query(self):
+                result = self.rmi.worker.get_status()
+                self.signal.emit("status.updated", result)
+
+            @ui_thread
+            def on_status_updated(self, signal):
+                self.status_label.setText(str(signal.data))
+
+
+8. 일반론: UI 버튼에서 Long-term 작업 처리 패턴
+----------------------------------------------------------------------------
+
+    UI 프레임워크(Qt, WPF, WinForms, Electron 등)는 공통적으로
+    "UI 스레드(메인 스레드)를 블록하면 안 된다"는 제약을 갖는다.
+    아래는 프레임워크에 관계없이 널리 사용되는 일반적 처리 패턴이다.
+
+8.1 패턴 1: 별도 스레드 + 완료 콜백 (가장 기본)
+
+    UI 스레드에서 워커 스레드를 생성하고, 작업 완료 시 UI를 갱신한다.
+
+        [버튼 클릭] → [워커 스레드 생성] → [작업 수행] → [UI 갱신 콜백]
+
+    예시 (Qt/Python):
+
+        def on_button_clicked(self):
+            self.btn.setEnabled(False)                    # 중복 클릭 방지
+            thread = threading.Thread(target=self._work, daemon=True)
+            thread.start()
+
+        def _work(self):
+            result = heavy_computation()                  # 워커 스레드
+            QMetaObject.invokeMethod(                     # UI 스레드로 전달
+                self, "_on_done",
+                Qt.QueuedConnection,
+                Q_ARG(object, result)
+            )
+
+        @pyqtSlot(object)
+        def _on_done(self, result):
+            self.label.setText(str(result))
+            self.btn.setEnabled(True)
+
+    핵심 원칙:
+    - 작업은 워커 스레드에서 수행
+    - UI 갱신은 반드시 UI 스레드에서 수행 (직접 접근 금지)
+    - 결과 전달은 Signal/Invoke/Dispatcher 등 스레드 안전 메커니즘 사용
+
+8.2 패턴 2: async/await (현대적 접근)
+
+    이벤트 루프 기반 비동기 패턴. UI 스레드를 블록하지 않으면서
+    동기 코드처럼 읽히는 장점이 있다.
+
+        # Python (asyncio + Qt, qasync 라이브러리 등)
+        async def on_button_clicked(self):
+            self.btn.setEnabled(False)
+            result = await asyncio.to_thread(heavy_computation)
+            self.label.setText(str(result))
+            self.btn.setEnabled(True)
+
+        # C# (WPF/WinForms)
+        async void OnButtonClick(object sender, EventArgs e) {
+            btn.IsEnabled = false;
+            var result = await Task.Run(() => HeavyComputation());
+            label.Content = result.ToString();
+            btn.IsEnabled = true;
+        }
+
+        # JavaScript (Electron/Web)
+        async onButtonClick() {
+            this.btn.disabled = true;
+            const result = await fetch('/api/heavy-work');
+            this.label.textContent = result;
+            this.btn.disabled = false;
+        }
+
+    장점: 코드 가독성 우수, 콜백 지옥 회피
+    단점: 런타임/프레임워크의 async 지원 필요
+
+8.3 패턴 3: 스레드 풀 / Worker Pool
+
+    매번 스레드를 생성하지 않고, 미리 생성된 풀에 작업을 제출한다.
+
+        # Python (concurrent.futures)
+        executor = ThreadPoolExecutor(max_workers=4)
+
+        def on_button_clicked(self):
+            future = executor.submit(heavy_computation)
+            future.add_done_callback(self._on_done)
+
+        # Qt QThreadPool
+        class Worker(QRunnable):
+            def run(self):
+                result = heavy_computation()
+                # signal로 결과 전달
+
+        QThreadPool.globalInstance().start(Worker())
+
+    장점: 스레드 생성/소멸 오버헤드 감소, 동시 작업 수 제한 가능
+    적합: 빈번한 버튼 클릭, 다수의 독립 작업
+
+8.4 패턴 4: 진행률 보고 (Progress Reporting)
+
+    장시간 작업 시 사용자에게 진행 상태를 표시한다.
+
+        [버튼] → [워커 시작] → [진행률 Signal] → [ProgressBar 갱신]
+                                    ↓
+                              [완료 Signal] → [결과 표시]
+
+    핵심 요소:
+    - 진행률 콜백/signal을 워커에서 주기적으로 발행
+    - UI 스레드에서 ProgressBar/상태 텍스트 갱신
+    - 갱신 빈도 조절 (너무 잦으면 UI 부하 → 100ms~500ms 간격 권장)
+
+8.5 패턴 5: 취소 지원 (Cancellation)
+
+    장시간 작업은 사용자가 중단할 수 있어야 한다.
+
+        # 취소 플래그 방식
+        class Worker:
+            def __init__(self):
+                self._cancelled = threading.Event()
+
+            def cancel(self):
+                self._cancelled.set()
+
+            def run(self):
+                for i in range(total):
+                    if self._cancelled.is_set():
+                        return None          # 조기 종료
+                    do_step(i)
+
+        # UI 측
+        def on_cancel_clicked(self):
+            self.worker.cancel()
+            self.btn_cancel.setEnabled(False)
+
+    핵심 요소:
+    - threading.Event 또는 bool 플래그로 취소 신호 전달
+    - 워커 내부에서 주기적으로 취소 여부 확인
+    - 취소 후 리소스 정리 (파일 핸들, DB 커넥션 등)
+
+8.6 패턴 6: UI 상태 관리 (공통 필수사항)
+
+    모든 패턴에 공통으로 적용해야 하는 UI 상태 관리 항목:
+
+    ┌─────────────────────┬──────────────┬──────────────┐
+    │ 항목                │ 작업 시작 시  │ 작업 완료 시  │
+    ├─────────────────────┼──────────────┼──────────────┤
+    │ 실행 버튼            │ 비활성화      │ 활성화        │
+    │ 취소 버튼            │ 활성화        │ 비활성화      │
+    │ 프로그레스바          │ 표시          │ 숨김          │
+    │ 상태 텍스트          │ "처리 중..."  │ "완료"        │
+    │ 커서                 │ WaitCursor   │ ArrowCursor  │
+    └─────────────────────┴──────────────┴──────────────┘
+
+    ※ 예외/에러 발생 시에도 UI를 원래 상태로 복원해야 한다 (try-finally).
+
+8.7 ALASKA 적용 시 비교
+
+    일반 패턴               ALASKA 대응                비고
+    ─────────────────────  ─────────────────────────  ──────────────
+    별도 스레드 + 콜백      방안 C (threading + signal) 가장 범용
+    Fire-and-Forget        방안 A (.nowait())          반환값 불필요 시
+    async/await            미지원 (향후 검토)           프레임워크 확장 필요
+    스레드 풀              미사용 (Task당 스레드 1개)    구조상 불필요
+    진행률 보고            signal.emit() 활용           기존 인프라 활용
+    취소 지원              signal 기반 중단 가능         별도 설계 필요
+
+
+9. 상태
+----------------------------------------------------------------------------
+
+    상태: 확정 (v2.6)
+    등록일: 2026-03-03
+    분류: IPC / RMI 설계 문서
+    관련: doc/3080____InvokeDispenser설계.txt
+          doc/4500____SmInfra설계.txt

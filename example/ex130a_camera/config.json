@@ -7,7 +7,7 @@
   "platform_config": {
     "_smblock": {
       "smblock2048": {
-        "shape": [2048, 2448, 3],
+        "shape": [2048, 2448],
         "maxsize": 100
       }
     },
@@ -26,7 +26,7 @@
       "exposure": 15000,
       "trigger_source": "hardware",
       "trigger_mode": false,
-      "debug": "sig"
+      "debug": false
     },
     "viewer/ImiCameraView": {
       "@import": "example.ex130a_camera.task_viewer",

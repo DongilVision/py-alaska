@@ -21,6 +21,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(title)
         self.resize(900, 700)
         self.setMinimumSize(800, 600)
+        self.setStyleSheet("QMainWindow { background-color: #222222; }")
 
         # Setup GUI widget after TaskManager is ready
         QTimer.singleShot(100, self._setup_gui)
@@ -38,8 +39,9 @@ class MainWindow(QMainWindow):
             # Inject RMI clients
             try:
                 gui.p1 = AlaskaApp.get_client("p1")
-                gui.t1 = AlaskaApp.get_client("t1")
-                print("[MainWindow] RMI clients injected")
+                gui.p2 = AlaskaApp.get_client("p2")
+                gui.p3 = AlaskaApp.get_client("p3")
+                print("[MainWindow] P1/P2/P3 clients injected")
             except Exception as e:
                 print(f"[MainWindow] Client injection error: {e}")
         else:

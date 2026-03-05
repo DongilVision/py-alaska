@@ -3,8 +3,8 @@
 ║  IPC / Signal 통합 단일 디스패처 + CPU 절감 최적화                         ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  Version : 2.6.0                                                           ║
-║  Date    : 2026-03-01                                                      ║
-║  Ref     : 1101.구조설명서, 2014.SmAsset설계                               ║
+║  Date    : 2026-03-04                                                      ║
+║  Ref     : 1101.구조설명서, 4500.SmInfra설계                               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -780,16 +780,25 @@
   ├────────────────────────────────────┼────────────────────────────────────┤
   │ task_signal.py (SignalClient)      │ start() headless 모드 추가         │
   │                                    │ emit() → send_queue 위임 유지      │
+  │ _signal_core.py                    │ QoS, Signal, PriorityScheduler 분리│
   ├────────────────────────────────────┼────────────────────────────────────┤
   │ task_manager.py (TaskRuntime)      │ _invoke_dispenser() 메서드 신규    │
   │                                    │ _rmi_handler() 제거                │
   │                                    │ run()에서 InvokeDispenser 시작     │
   ├────────────────────────────────────┼────────────────────────────────────┤
-  │ task_manager.py (RmiClient)        │ _notify_event 참조 추가            │
+  │ _rmi_client.py (RmiClient)         │ task_manager.py에서 분리 (v2.6)    │
+  │                                    │ _notify_event 참조 추가            │
   │                                    │ _call() 후 notify_event.set()      │
+  ├────────────────────────────────────┼────────────────────────────────────┤
+  │ _task_client.py (DirectClient)     │ task_manager.py에서 분리 (v2.6)    │
   ├────────────────────────────────────┼────────────────────────────────────┤
   │ task_manager.py (exceptions)       │ InvokeDeadlockError 추가           │
   └────────────────────────────────────┴────────────────────────────────────┘
+
+  v2.6 모듈 분리 참고:
+    RmiClient, _RmiProxy → core/_rmi_client.py
+    DirectClient, _SignalEmitter → core/_task_client.py
+    task_manager.py가 re-import하므로 외부 API 변경 없음.
 
   API 변경 없음:
     - _call(), _call_nowait(), emit(), on(), off() 시그니처 무변경
@@ -959,5 +968,5 @@
 
 
 ================================================================================
-  End of Document - 2016.InvokeDispenser설계 v2.6
+  End of Document - 3080.InvokeDispenser설계 v2.6 (2026-03-04)
 ================================================================================

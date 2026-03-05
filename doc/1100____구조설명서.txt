@@ -3,7 +3,7 @@
 ║  System Architecture Specification                                          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  Version : 2.6.0                                                             ║
-║  Date    : 2026-03-01                                                        ║
+║  Date    : 2026-03-05                                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -61,7 +61,7 @@ v2.6 변경:
   - InvokeDispenser 응답 후 caller.response_event.set() 호출
   - 조건부 notify: target.is_sleeping == 1일 때만 notify_event.set()
 
-파일: task_manager.py
+파일: task_manager.py, _rmi_client.py (RmiProtocol + RmiClient + DirectClient)
 
 
 2.2 Signal (이벤트 통신 및 QoS)
@@ -83,7 +83,7 @@ v2.6 변경:
   - SignalClient     : 태스크별 송수신 및 QoS 엔진
   - SmSignalRegistry : 전역 구독 비트맵 레지스트리 (O(1) 조회)
 
-파일: task_signal.py, sm_signal_registry.py
+파일: task_signal.py, _signal_core.py, sm_signal.py
 
 
 2.3 Task (태스크 및 자가 치유)
@@ -99,7 +99,7 @@ v2.6 변경:
   - add_task()     : 런타임 중 Thread 모드 Task 동적 추가
   - remove_task()  : 런타임 중 Task 동적 삭제
 
-파일: task_manager.py, task_decoration.py
+파일: task_manager.py, task_decorator.py, _task_validator.py
 
 
 2.4 SmAsset (공유메모리 통합 자원)
@@ -112,7 +112,8 @@ v2.6 변경:
 │                                                                             │
 │  1. 데이터 전달: SmBlock(이미지), SmRingBuffer(메시지), SmQueue(IPC)        │
 │  2. 상태 제어: SmValue(스칼라), SmSignalRegistry(구독), SmKernelEvent(통지) │
-│  3. 감시 통계: SmSignalStats(성능), SmBlackBox(세션 감시)                   │
+│  3. 동기화: SmMutex(Named Mutex), SmLockFreeEvent(스핀 이벤트)             │
+│  4. 감시 통계: SmSignalStats(성능), SmBlackBox(세션 감시)                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 핵심 클래스:
@@ -120,7 +121,7 @@ v2.6 변경:
   - SmKernelEvent   : Win32 커널 이벤트 (CPU 0% 대기, notify/response)
   - SmSignalStats   : 실시간 시그널 성능 통계소
 
-파일: sm_block.py, sm_value.py, sm_kernel_event.py, sm_signal_stats.py
+파일: sm_block.py, sm_value.py, sm_sync.py, sm_signal.py
 
 
 2.5 InvokeDispenser (v2.5~, 단일 스레드 통합 디스패처)
@@ -136,9 +137,9 @@ v2.6 변경:
 
 v2.6: ① Signal SEND 단계 제거 (Direct Emit으로 대체)
 
-상세 설계: 2016.InvokeDispenser설계.txt 참조
+상세 설계: 3080.InvokeDispenser설계.txt 참조
 
-파일: task_manager.py (_invoke_dispenser 메서드)
+파일: _task_runtime.py (_invoke_dispenser 메서드)
 
 
 3. 구현 구조
@@ -150,15 +151,49 @@ v2.6: ① Signal SEND 단계 제거 (Direct Emit으로 대체)
 ┌──────────────────────────┬──────────────────────────────────────────────────┐
 │ 파일                     │ 역할                                             │
 ├──────────────────────────┼──────────────────────────────────────────────────┤
-│ sm_block.py              │ 이미지 블록 풀 관리 (SmBlock)                    │
+│ _base.py                 │ 공통 베이스 + SHM 유틸 (_ShmBase)                │
 │ sm_value.py              │ 고속 스칼라 값 공유 (SmValue)                    │
 │ sm_ring_buffer.py        │ Lock-free 메시지 전달 (SmRingBuffer)             │
-│ sm_queue.py              │ SharedMemory IPC 큐 (SmQueue, SmSignalQueue)     │
-│ sm_signal_stats.py       │ 실시간 시그널 통계 집계 (SmSignalStats)          │
-│ sm_signal_registry.py    │ 구독 비트맵 및 태스크 등록 (SmSignalRegistry)    │
+│ sm_queue.py              │ SharedMemory IPC 큐 (SmQueue)                    │
+│ sm_block.py              │ 이미지 블록 풀 + 팩토리 (SmBlock, SmBlockHandler)│
+│ sm_signal.py             │ 시그널 인프라 (SmSignalRegistry, SmSignalStats)  │
 │ sm_blackbox.py           │ 시그널 체인 세션 감시 (SmBlackBox)               │
-│ sm_kernel_event.py       │ Win32 커널 이벤트 (SmKernelEvent)                │
-│ sm_lock_free_event.py    │ 초저지연 스핀락 이벤트 (SmLockFreeEvent)         │
+│ sm_sync.py               │ 동기화 프리미티브 (SmKernelEvent, SmLockFreeEvent│
+│                          │   SmMutex)                                       │
+└──────────────────────────┴──────────────────────────────────────────────────┘
+
+3.2 core 파일 구성 (v2.6, 17파일)
+--------------------------------------------------------------------------------
+
+  외부 API 변경 없음 (re-import 유지).
+
+  Public 모듈:
+┌──────────────────────────┬──────────────────────────────────────────────────┐
+│ 파일                     │ 역할                                             │
+├──────────────────────────┼──────────────────────────────────────────────────┤
+│ task_manager.py          │ TaskManager, TaskInfo, ShmResourceFactory        │
+│ task_signal.py           │ SignalBroker, SignalClient, SubscriberCache      │
+│ task_decorator.py        │ @task, @rmi_task 데코레이터                       │
+│ task_error.py            │ 예외 클래스 11종                                  │
+│ task_performance.py      │ PerformanceCollector, TimingRecorder             │
+│ task_log.py              │ 중앙 로깅 시스템 (RmiLogger, LogTask)            │
+│ task_profiler.py         │ 코드 블록 프로파일링 (TaskProfiler)              │
+│ gconfig.py               │ GConfig 싱글턴 설정 관리                         │
+│ __init__.py              │ 패키지 export 정의                               │
+└──────────────────────────┴──────────────────────────────────────────────────┘
+
+  Internal 모듈:
+┌──────────────────────────┬──────────────────────────────────────────────────┐
+│ 파일                     │ 역할                                             │
+├──────────────────────────┼──────────────────────────────────────────────────┤
+│ _rmi_client.py           │ RmiProtocol + RmiClient + DirectClient 통합      │
+│ _task_runtime.py         │ TaskRuntime, InvokeDispenser (디스패치 루프)     │
+│ _signal_core.py          │ QoS, Signal, PriorityScheduler, 상수             │
+│ _config_infra.py         │ ConfigError 11종 + PathParser, FileLock 등 인프라│
+│ _task_validator.py       │ TaskValidator (태스크 검증)                       │
+│ _log_handler.py          │ SafeRotatingFileHandler (파일 로깅)              │
+│ _comm_utils.py           │ 공통 유틸리티 (순환 import 방지)                 │
+│ _banner.py               │ 배너 출력 유틸리티                                │
 └──────────────────────────┴──────────────────────────────────────────────────┘
 
 
@@ -210,5 +245,5 @@ v2.6: ① Signal SEND 단계 제거 (Direct Emit으로 대체)
 
 
 ================================================================================
-  End of Document - 1101.구조설명서 (v2.6 Update)
+  End of Document - 1101.구조설명서 (v2.6 Update, 2026-03-05)
 ================================================================================

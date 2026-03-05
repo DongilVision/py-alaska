@@ -1,0 +1,460 @@
+============================================================================
+  ALASKA v2.6 - Task 일반
+  Date: 2026-03-03
+============================================================================
+
+
+1. Task 개념
+----------------------------------------------------------------------------
+
+1.1 Task란
+
+    ALASKA는 기능을 Task 단위로 분리한다.
+    각 Task는 독립된 실행 단위(스레드 또는 프로세스)에서 동작하며,
+    자체 메인 루프(run)를 가진다.
+
+        ┌──────────────────────────────────────────────────┐
+        │  Task = 클래스 + 실행 컨텍스트 + 통신 인터페이스  │
+        │                                                   │
+        │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │
+        │  │ Sensor  │  │ Worker  │  │ ViewerUI│          │
+        │  │ (process)│  │ (process)│  │ (thread) │          │
+        │  └─────────┘  └─────────┘  └─────────┘          │
+        │       │              │             │              │
+        │       └──── IPC / Signal ──────────┘              │
+        └──────────────────────────────────────────────────┘
+
+1.2 Task가 제공하는 것
+
+    사용자가 작성하는 것          ALASKA가 자동 처리하는 것
+    ────────────────────────    ──────────────────────────────
+    클래스 정의 (@task)          스레드/프로세스 생성·관리
+    run() 메인 루프              IPC 클라이언트 주입
+    Signal 핸들러                Signal 구독·디스패치
+    비즈니스 로직                생명주기 (시작→실행→종료)
+                                 예외 처리 및 자동 재시작
+                                 디버그 로깅
+
+
+2. Task 종류
+----------------------------------------------------------------------------
+
+2.1 Thread 모드
+
+    현재 프로세스 내 별도 스레드에서 실행된다.
+
+        @task(mode="thread")
+        class Worker:
+            def run(self):
+                while self.running:
+                    self.do_work()
+
+    특징:
+    - 같은 프로세스 메모리 공유 (직접 참조 가능)
+    - GIL 제약 (CPU 바운드 작업에 불리)
+    - QObject/QWidget 상속 가능
+    - mode 생략 시 기본값
+
+2.2 Process 모드
+
+    독립된 프로세스에서 실행된다.
+
+        @task(mode="process")
+        class HeavyWorker:
+            def run(self):
+                while self.running:
+                    self.compute()
+
+    특징:
+    - GIL 우회, 진정한 병렬 실행
+    - IPC(SmRingBuffer)를 통한 통신
+    - 데이터는 pickle 직렬화 필요
+    - QObject 상속 불가
+
+2.3 선택 기준
+
+    상황                              권장 모드
+    ──────────────────────────────  ──────────
+    Qt UI 위젯                       thread
+    I/O 바운드 작업                   thread
+    CPU 바운드 연산 (영상처리 등)     process
+    GIL 회피가 필요한 경우            process
+    다른 Task와 메모리 직접 공유      thread
+    격리·안정성 우선                  process
+
+
+3. @task 데코레이터
+----------------------------------------------------------------------------
+
+3.1 기본 사용법
+
+    @task 데코레이터는 일반 클래스를 ALASKA Task로 등록한다.
+
+        from py_alaska import task
+
+        @task()
+        class MyJob:
+            def run(self):
+                while self.running:
+                    pass
+
+3.2 파라미터
+
+    파라미터        타입        기본값      설명
+    ──────────── ──────────  ──────────  ──────────────────────────
+    mode          str         (자동)      실행 모드 ("thread"/"process")
+                                          QObject 상속 시 → "thread"
+                                          그 외 → "process"
+    restart       bool        False       예외 시 자동 재시작
+    restart_delay float       3.0         재시작 대기 시간 (초)
+    debug         bool/str    False       디버그 로깅 활성화
+    main_thread   bool        (자동)      메인 스레드에서 인스턴스 생성
+
+    사용 예:
+
+        @task(mode="process", restart=True, restart_delay=2.0)
+        class RobustWorker:
+            def run(self):
+                ...
+
+3.3 debug 옵션
+
+    debug 파라미터로 카테고리별 로깅을 제어한다:
+
+        값                  출력 내용
+        ────────────────  ──────────────────────
+        True              전체 (msg + signal + method + variable + task)
+        "msg"             self.print() 사용자 메시지
+        "signal"          Signal emit/recv 추적
+        "method"          RMI 메서드 호출 추적
+        "variable"        RMI 변수 get/set 추적
+        "task"            Task 생명주기 추적
+        "signal,method"   복합 지정 가능
+        False             비활성화 (기본)
+
+    약어 지원: sig=signal, ipc/rmi=method, var=variable, all=전체
+
+        @task(debug="signal,method")
+        class DebugTask:
+            ...
+
+3.4 main_thread 옵션
+
+    QObject를 상속하는 Task는 자동으로 main_thread=True가 설정된다.
+    __init__은 메인(UI) 스레드에서, run()은 워커 스레드에서 실행된다.
+
+        @task()                         # QWidget → main_thread 자동 True
+        class Dashboard(QWidget):
+            def __init__(self):
+                super().__init__()      # 메인 스레드에서 실행
+                self.label = QLabel()
+
+            def run(self):              # 워커 스레드에서 실행
+                ...
+
+
+4. Signal 관련 데코레이터
+----------------------------------------------------------------------------
+
+4.1 @rmi_signal — Signal 핸들러 등록
+
+    특정 Signal을 수신하는 핸들러를 등록한다.
+
+        from py_alaska.core.task_decoration import rmi_signal
+
+        @task()
+        class Monitor:
+            @rmi_signal("sensor.temperature")
+            def on_temp(self, signal):
+                print(f"Temp: {signal.data}")
+
+            @rmi_signal("sensor.humidity")
+            def handle_humidity(self, signal):
+                print(f"Humidity: {signal.data}")
+
+    특징:
+    - 메서드명은 자유 (데코레이터의 signal 이름이 매핑 기준)
+    - 한 클래스에 여러 개 사용 가능
+    - config.json에 별도 설정 불필요 (자동 구독)
+
+4.2 @ui_thread — UI 스레드 안전 실행
+
+    다른 스레드에서 호출해도 Qt UI 스레드에서 실행되도록 보장한다.
+
+        from py_alaska.qt import ui_thread
+
+        @task()
+        class Viewer(QWidget):
+            @rmi_signal("frame.ready")
+            @ui_thread
+            def on_frame(self, signal):
+                self.label.setPixmap(signal.data)   # UI 스레드에서 안전
+
+    특징:
+    - Qt Signal(invoke_signal)을 통해 UI 스레드로 전달
+    - 비동기 실행 (반환값 없음)
+    - @rmi_signal과 함께 사용 시 @rmi_signal을 먼저 선언
+
+4.3 @rmi_run — 메인 루프 지정
+
+    run() 외의 메서드를 메인 루프로 지정한다.
+
+        from py_alaska.core.task_decoration import rmi_run
+
+        @task()
+        class CustomTask:
+            @rmi_run
+            def main_loop(self):        # run() 대신 이 메서드가 실행됨
+                while self.running:
+                    ...
+
+    특징:
+    - 클래스당 1개만 가능
+    - run() 메서드가 있으면 자동 적용되므로 보통 생략
+
+
+5. Signal 구독 방법 (3가지)
+----------------------------------------------------------------------------
+
+5.1 방법 비교
+
+    방법                    설정 위치      자동 매핑  UI 안전
+    ──────────────────────  ────────────  ────────  ────────
+    @rmi_signal             데코레이터     ○         △ (*)
+    signal_subscribe        @task 파라미터  ○         △ (*)
+    signal_forward          @task 파라미터  ○         ○
+
+    (*) @ui_thread 추가 필요
+
+5.2 @rmi_signal (권장)
+
+    데코레이터로 Signal 이름과 핸들러를 직접 연결한다.
+
+        @task()
+        class Logger:
+            @rmi_signal("sensor.temp")
+            def on_temp(self, signal):
+                print(signal.data)
+
+5.3 signal_subscribe (규칙 기반)
+
+    @task 파라미터로 구독 목록을 지정하고,
+    on_{signal_name} 메서드가 자동 매핑된다.
+
+        @task(signal_subscribe=["sensor.temp", "system.status"])
+        class Logger:
+            def on_sensor_temp(self, signal):       # 자동 매핑
+                print(signal.data)
+
+            def on_system_status(self, signal):     # 자동 매핑
+                print(signal.data)
+
+    매핑 규칙: "a.b.c" → on_a_b_c (점 → 언더스코어)
+
+5.4 signal_forward (Qt Signal 브리지)
+
+    ALASKA Signal을 Qt Signal로 변환하여 UI 스레드에서 수신한다.
+
+        @task(signal_forward={"frame.ready": "frameReady"})
+        class Viewer(QWidget):
+            frameReady = Signal(object)     # Qt Signal
+
+            def __init__(self):
+                super().__init__()
+                self.frameReady.connect(self.on_frame)
+
+            def on_frame(self, data):       # UI 스레드에서 실행
+                self.display(data)
+
+
+6. config.json Task 설정
+----------------------------------------------------------------------------
+
+6.1 기본 구조
+
+    {
+        "tasks": {
+            "task_id": {
+                "class": "ClassName",
+                "injection": { ... },
+                ... 추가 속성 ...
+            }
+        }
+    }
+
+6.2 injection (의존성 주입)
+
+    ■ client: — IPC 클라이언트 주입
+
+        "injection": {
+            "worker": "client:worker_task"
+        }
+
+        → self.worker가 worker_task의 RMI 클라이언트가 됨
+        → self.worker.method() / self.worker.method.nowait() 사용 가능
+
+    ■ task: — 인스턴스 직접 주입 (Thread 모드 전용)
+
+        "injection": {
+            "sensor": "task:sensor_task"
+        }
+
+        → self.sensor가 sensor_task의 실제 인스턴스 참조
+
+    ■ 상수값 주입
+
+        "injection": {
+            "interval": 0.5,
+            "name": "sensor_01",
+            "enabled": true
+        }
+
+        → self.interval = 0.5 등으로 설정됨
+
+6.3 config.json 예시
+
+    {
+        "tasks": {
+            "sensor": {
+                "class": "SensorJob",
+                "injection": {
+                    "interval": 1.0
+                }
+            },
+            "processor": {
+                "class": "ProcessorJob",
+                "injection": {
+                    "sensor": "client:sensor"
+                }
+            },
+            "dashboard": {
+                "class": "DashboardUI",
+                "injection": {
+                    "processor": "client:processor"
+                }
+            }
+        }
+    }
+
+
+7. Task 인스턴스 속성
+----------------------------------------------------------------------------
+
+7.1 자동 제공 속성
+
+    ALASKA가 Task 인스턴스에 자동으로 제공하는 속성:
+
+    속성              타입            설명
+    ──────────────  ──────────────  ────────────────────────────
+    self.running    bool (property) Task 실행 상태 (읽기 전용)
+    self.task_name  str (property)  Task ID (읽기 전용)
+    self.signal     SignalEmitter   Signal 발행 인터페이스
+    self.runtime    TaskRuntime     런타임 제어 객체
+
+7.2 Signal 발행
+
+    # 기본 형식
+    self.signal.emit("event.name", data)
+
+    # 체인 형식
+    self.signal.event.name.emit(data)
+
+    # QoS 지정
+    self.signal.emit("event.name", data, qos="REALTIME")
+
+7.3 run() 메인 루프 패턴
+
+    @task()
+    class MyJob:
+        def run(self):
+            # 초기화
+            self.setup()
+
+            # 메인 루프
+            while self.running:
+                self.process()
+                time.sleep(0.1)
+
+            # 정리
+            self.cleanup()
+
+
+8. 데코레이터 조합 패턴
+----------------------------------------------------------------------------
+
+8.1 Signal 수신 + UI 갱신
+
+    @task()
+    class Dashboard(QWidget):
+        @rmi_signal("sensor.temp")
+        @ui_thread
+        def on_temp(self, signal):
+            self.label.setText(f"{signal.data}°C")
+
+8.2 IPC 호출 + Signal 수신
+
+    @task()
+    class Controller:
+        def on_start_clicked(self):
+            self.worker.start_job.nowait()      # IPC (비동기)
+
+        @rmi_signal("worker.done")
+        def on_done(self, signal):
+            print(f"완료: {signal.data}")        # Signal 수신
+
+8.3 Process + 자동 재시작
+
+    @task(mode="process", restart=True, restart_delay=2.0)
+    class RobustSensor:
+        def run(self):
+            while self.running:
+                data = self.read_sensor()       # 예외 발생 가능
+                self.signal.emit("sensor.data", data)
+                time.sleep(0.5)
+
+8.4 디버그 + Signal 구독
+
+    @task(debug="signal", signal_subscribe=["data.ready"])
+    class DebugConsumer:
+        def on_data_ready(self, signal):
+            print(signal.data)
+
+
+9. 제약 사항
+----------------------------------------------------------------------------
+
+9.1 Process 모드 제약
+
+    - QObject/QWidget 상속 불가
+    - 전달 데이터는 pickle 가능해야 함
+    - lambda, 로컬 함수 전달 불가
+
+        ✕  self.signal.emit("evt", lambda x: x+1)     # pickle 불가
+        ○  self.signal.emit("evt", {"fn": "add", "val": 1})
+
+9.2 Thread 모드 제약
+
+    - GIL로 인해 CPU 바운드 작업 성능 제한
+    - UI 스레드에서 동기 RMI 호출 시 데드락 위험
+
+        ✕  def on_click(self):
+               result = self.worker.process()       # 데드락 위험
+        ○  def on_click(self):
+               self.worker.process.nowait()          # 안전
+
+9.3 공통 제약
+
+    - __init__은 파라미터 없이 정의 (injection으로 값 전달)
+    - 클래스당 @rmi_run은 1개만 가능
+    - self.running이 False가 되면 run() 루프를 종료해야 함
+
+
+10. 상태
+----------------------------------------------------------------------------
+
+    상태: 확정 (v2.6)
+    등록일: 2026-03-03
+    분류: Task 일반
+    관련: doc/2020____생명주기설계.txt (생명주기 상세)
+          doc/2030____동적생성.txt (동적 생성/소멸)
+          doc/1200____개발자가이드.txt (API 사용 가이드)

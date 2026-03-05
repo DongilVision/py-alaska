@@ -21,7 +21,6 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import cv2
 import numpy as np
 
 from py_alaska import task
@@ -110,11 +109,11 @@ class imi_cam_dp:
         self.rx_count = 0
         self.handle = None
         self.trigger_source = "software"
-        # 콜백 최적화 캐시
-        self._buf_type_size = -1
-        self._buf_type = None
-        self._sm_channels = None
-        self._convert_fn = None
+        # 콜백 캐시 안전 기본값 (연결 전 콜백 방어)
+        self._dst_addrs = None
+        self._emit_received = None
+        self._frame_payload = None
+        self._frame_size = 0
 
     # ═══════════════════════════════════════════════════════════════════════
     # Resync Session (acquisition stop/start)
@@ -233,11 +232,33 @@ class imi_cam_dp:
         #   → _session_close (acq start)
         #   기존 _lazy_reset()을 완전히 대체
         self.is_connect = True
-        self._sm_channels = None    # 재연결 시 초기화
-        self._convert_fn = None
+        self._warm_callback_cache()
         self.print("Connected")
         self._emit_connected()
         return True
+
+    def _warm_callback_cache(self):
+        """콜백 핫 패스용 캐시 프리워밍 (연결 시 1회)"""
+        # ① dst 주소 테이블: get_buffer(i).ctypes.data를 매 프레임 호출 제거
+        n = self.smblock.maxsize
+        self._dst_addrs = [self.smblock.get_buffer(i).ctypes.data for i in range(n)]
+        # ② signal emit 함수 직접 참조: getattr + 속성 체인 제거
+        self._emit_received = (self.signal.camera.received.emit
+                               if getattr(self, 'signal', None) else None)
+        # ③ 재사용 dict: 매 프레임 dict 생성 + key 해싱 제거
+        self._frame_payload = {
+            "sm_index": 0, "trigger_mode": False,
+            "rx_sequence": 0, "rx_timestamp": 0,
+            "rx_count": 0, "rx_drop": 0,
+        }
+        # ④ 프레임 크기 캐시 (첫 프레임에서 설정)
+        self._frame_size = 0
+
+    def _invalidate_callback_cache(self):
+        """연결 해제 시 콜백 캐시 무효화 — 콜백이 stale 참조 사용 방지"""
+        self._dst_addrs = None
+        self._emit_received = None
+        self._frame_size = 0
 
     def close(self):
         self.print(f"Close called, connected={self.is_connect}")
@@ -292,12 +313,14 @@ class imi_cam_dp:
                 self.print(f"cmd: {action} (from {source})")
 
                 if action == "close":
+                    self._invalidate_callback_cache()
                     self._emit_disconnected(f"close:{source}")
                     self.is_connect = False
                     break
                 elif action == "connect":
                     self.re_connect()
                 elif action == "disconnect":
+                    self._invalidate_callback_cache()
                     self._emit_disconnected(f"disconnect:{source}")
                     self.is_connect = False
             except queue.Empty:
@@ -316,6 +339,14 @@ class imi_cam_dp:
                         self.print(f"reconnecting... ({elapsed}s)")
                     self.re_connect()
 
+        # 종료 정리: 콜백 캐시 무효화 → 카메라 닫기 → SDK 해제
+        self._invalidate_callback_cache()
+        if self.handle and self.is_connect:
+            ntcSetAcquisition(self.handle,
+                              ENeptuneBoolean.NEPTUNE_BOOL_FALSE.value)
+            ntcClose(self.handle)
+            self.handle = None
+        self.is_connect = False
         self._emit_disconnected("end_of_run")
         self.print("run stopped")
 
@@ -338,8 +369,8 @@ class imi_cam_dp:
     def RecvFrameCallBack(self, pImage, pContext=None):
         self.rx_count += 1
 
-        if self.smblock is None:
-            self.print("WARN SmBlock not initialized")
+        # 캐시 미초기화 또는 SmBlock 없음 → 무시
+        if self._dst_addrs is None or self.smblock is None:
             return
 
         index = self.smblock.alloc()
@@ -348,65 +379,36 @@ class imi_cam_dp:
             return
 
         try:
-            # ① ctypes 타입 캐시 (크기 변경 시만 재생성)
-            if self._buf_type_size != pImage.uiSize:
-                self._buf_type = ctypes.c_uint8 * pImage.uiSize
-                self._buf_type_size = pImage.uiSize
-                self._sm_channels = None
+            # ① 프레임 크기 캐시 (첫 프레임 1회만 ctypes 접근)
+            sz = self._frame_size
+            if not sz:
+                sz = pImage.uiSize
+                self._frame_size = sz
 
-            # ② Zero-copy numpy 뷰 (buffer_ptr.contents 복사 제거)
-            rx_frame = np.frombuffer(
-                self._buf_type.from_address(pImage.pData), dtype=np.uint8)
+            # ② Raw memcpy: 프리캐시 주소 + 직접 memmove
+            ctypes.memmove(
+                self._dst_addrs[index],
+                ctypes.cast(pImage.pData, ctypes.c_void_p).value,
+                sz)
 
-            dst_buffer = self.smblock.get_buffer(index)
-
-            # ③ sm_channels 캐시
-            if self._sm_channels is None:
-                self._sm_channels = (self.smblock.shape[2]
-                                     if len(self.smblock.shape) > 2 else 1)
-
-            # ④ 변환 함수 캐시 (매 프레임 분기 제거)
-            if self._convert_fn is None:
-                self._convert_fn = self._select_convert_fn(pImage)
-
-            self._convert_fn(rx_frame, pImage, dst_buffer)
-
-            if getattr(self, 'signal', None):
-                self.signal.camera.received.emit({
-                    "sm_index": index,
-                    "trigger_mode": self._cache.get("trigger_mode", False),
-                    "rx_sequence": self.rx_count,
-                    "rx_timestamp": time.time(),
-                    "rx_count": self.rx_count,
-                    "rx_drop": self.rx_drop,
-                })
+            # ③ 프리캐시 emit + dict 재사용
+            emit = self._emit_received
+            if emit:
+                d = self._frame_payload
+                d["sm_index"] = index
+                d["rx_sequence"] = self.rx_count
+                d["rx_timestamp"] = pImage.uiTimestamp
+                d["rx_count"] = self.rx_count
+                d["rx_drop"] = self.rx_drop
+                emit(d)
             else:
                 self.smblock.mfree(index)
         except Exception as e:
-            self.smblock.mfree(index)
-            self.print(f"ERROR Frame processing error: {e}")
-
-    def _select_convert_fn(self, pImage):
-        """연결 후 1회만 호출 — 변환 함수 결정 및 캐시"""
-        ch = self._sm_channels
-        bd = pImage.uiBitDepth
-        if ch == 1:
-            if bd != 8:
-                return lambda f, img, dst: dst.__setitem__(
-                    slice(None), f.reshape(img.uiHeight, img.uiWidth))
-            else:
-                return lambda f, img, dst: cv2.cvtColor(
-                    f.reshape(img.uiHeight, img.uiWidth, -1),
-                    cv2.COLOR_BGR2GRAY, dst=dst)
-        else:
-            if bd != 8:
-                return lambda f, img, dst: cv2.cvtColor(
-                    f.reshape(img.uiHeight, img.uiWidth),
-                    cv2.COLOR_GRAY2BGR, dst=dst)
-            else:
-                return lambda f, img, dst: cv2.cvtColor(
-                    f.reshape(img.uiHeight, img.uiWidth, -1),
-                    cv2.COLOR_BayerGB2BGR, dst=dst)
+            # emit 실패 (뷰어 다운 등) → SmBlock 슬롯 직접 회수
+            try:
+                self.smblock.mfree(index)
+            except Exception:
+                pass
 
     def RecvFrameDropCallBack(self, _=None):
         self.rx_drop += 1

@@ -5,12 +5,12 @@
     "version": "1.0.0"
   },
   "platform_config": {
+    "rmi": {"timeout": 300},
     "_monitor": {"port": 7000, "exit_hook": true}
   },
   "task_config": {
     "gui/PerformanceGui": {
-      "@import": "example.ex140_performance.task_gui",
-      "iterations": 100
+      "@import": "example.ex140_performance.task_gui"
     },
     "p1/Process1": {
       "@import": "example.ex140_performance.task_process",
@@ -22,19 +22,10 @@
     },
     "p3/Process3": {
       "@import": "example.ex140_performance.task_process",
-      "next_task": "client:gui"
+      "next_task": "client:p4"
     },
-    "t1/Thread1": {
-      "@import": "example.ex140_performance.task_thread",
-      "next_task": "client:t2"
-    },
-    "t2/Thread2": {
-      "@import": "example.ex140_performance.task_thread",
-      "next_task": "client:t3"
-    },
-    "t3/Thread3": {
-      "@import": "example.ex140_performance.task_thread",
-      "next_task": "client:gui"
+    "p4/Process4": {
+      "@import": "example.ex140_performance.task_process"
     }
   }
 }

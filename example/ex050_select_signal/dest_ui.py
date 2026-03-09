@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QObject
 from PySide6.QtGui import QFont
 from py_alaska import task
 from py_alaska import ui_thread
+from py_alaska.core.task_signal_decl import on
 
 _window = None
 
@@ -86,6 +87,7 @@ class DestTask(QObject):
         while self.running:
             time.sleep(0.1)
 
+    @on("result")
     @ui_thread
     def on_result(self, signal):
         if _window:

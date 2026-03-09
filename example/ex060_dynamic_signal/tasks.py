@@ -3,16 +3,20 @@
 import random
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 
 @task(name="SensorTask", mode="process")
 class SensorTask:
     """0.3초마다 온도/습도 시그널 발행"""
 
+    sensor_temp = TSignal(float, name="sensor.temp")
+    sensor_humidity = TSignal(float, name="sensor.humidity")
+
     def run(self):
         while self.running:
-            self.signal.sensor.temp.emit(round(random.uniform(20, 40), 1))
-            self.signal.sensor.humidity.emit(round(random.uniform(30, 80), 1))
+            self.sensor_temp.emit(round(random.uniform(20, 40), 1))
+            self.sensor_humidity.emit(round(random.uniform(30, 80), 1))
             time.sleep(0.3)
 
 

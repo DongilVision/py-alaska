@@ -1,14 +1,14 @@
 # Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
 """
-ALASKA v2.0 - Qt Signal 예제
+ALASKA v2.7 - Qt Signal 예제
 ============================
-main_thread=True, signal_subscribe+on_, signal_bridge, self.signal 체인 문법 데모
+TSignal 선언형 시그널 + @on 구독 + signal_forward 자동 매핑 데모
 
 주요 기능:
 1. main_thread=True: 메인 스레드에서 Task 인스턴스 생성 (QObject 지원, 자동 감지)
-2. signal_subscribe + on_ 메서드: 시그널 자동 구독 및 핸들러 매핑
-3. signal_bridge: @task 파라미터로 RMI Signal → Qt Signal 자동 매핑
-4. self.signal.xxx.emit(): 체인 문법으로 Signal 발신
+2. TSignal + @on: 선언적 시그널 구독
+3. signal_forward: TSignal → Qt Signal 자동 매핑
+4. self.xxx.emit(): TSignal 인스턴스로 Signal 발신
 """
 
 import sys
@@ -21,20 +21,98 @@ import time
 from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout
 from PySide6.QtCore import Signal, QObject
 from py_alaska import TaskManager, gconfig, task, rmi_run
+from py_alaska.core.task_signal_decl import TSignal, on
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  방법 1: main_thread=True + signal_subscribe + on_ 메서드
+#  Signal 발신 Task (먼저 정의 — @on 참조를 위해)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@task(name="sensor_ui", mode="thread", main_thread=True,
-      signal_subscribe=["sensor.temperature", "sensor.humidity", "sensor.alert"])
+@task(name="sensor_worker", mode="thread")
+class SensorWorker:
+    """센서 데이터 생성 워커 - TSignal 발신"""
+    sensor_temperature = TSignal(float, name="sensor.temperature")
+    sensor_humidity = TSignal(float, name="sensor.humidity")
+    sensor_alert = TSignal(str, name="sensor.alert")
+
+    def __init__(self):
+        self.interval = 1.0
+
+    @rmi_run
+    def run(self):
+        import random
+        print(f"[{self.runtime.name}] SensorWorker started")
+
+        count = 0
+        while not self.runtime.should_stop():
+            # 센서 데이터 생성
+            temp = 20.0 + random.random() * 15.0  # 20~35
+            humidity = 40.0 + random.random() * 30.0  # 40~70
+
+            # TSignal 발신 (SensorUI가 수신)
+            self.sensor_temperature.emit(temp)
+            self.sensor_humidity.emit(humidity)
+
+            # 경고 조건
+            if temp > 32.0:
+                self.sensor_alert.emit(f"High temperature: {temp:.1f}°C")
+
+            count += 1
+            if count % 5 == 0:
+                print(f"[{self.runtime.name}] Emitted {count} signals (temp={temp:.1f}, hum={humidity:.1f})")
+
+            time.sleep(self.interval)
+
+
+@task(name="device_worker", mode="thread")
+class DeviceWorker:
+    """디바이스 상태 생성 워커 - TSignal 발신"""
+    device_connected = TSignal(object, name="device.connected")
+    device_disconnected = TSignal(object, name="device.disconnected")
+    device_error = TSignal(str, name="device.error")
+    device_status = TSignal(dict, name="device.status")
+
+    def __init__(self):
+        self.interval = 2.0
+
+    @rmi_run
+    def run(self):
+        import random
+        print(f"[{self.runtime.name}] DeviceWorker started")
+
+        # 디바이스 연결 시뮬레이션
+        time.sleep(1.0)
+        self.device_connected.emit({"name": "Camera-01", "ip": "192.168.1.100"})
+
+        count = 0
+        while not self.runtime.should_stop():
+            # 상태 업데이트
+            status = {
+                "fps": 25 + random.randint(-5, 5),
+                "frames": count * 30,
+                "errors": random.randint(0, 2),
+            }
+            self.device_status.emit(status)
+
+            # 오류 시뮬레이션
+            if random.random() < 0.1:
+                self.device_error.emit("Frame drop detected")
+
+            count += 1
+            time.sleep(self.interval)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  방법 1: main_thread=True + @on(TSignal) 구독
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@task(name="sensor_ui", mode="thread", main_thread=True)
 class SensorUI(QObject):
     """센서 UI Task - main_thread=True로 QObject 직접 사용
 
     main_thread=True 옵션으로 인스턴스가 메인 스레드에서 생성되어
     QObject를 상속하고 Qt Signal을 직접 emit할 수 있습니다.
-    signal_subscribe + on_ 메서드 네이밍으로 자동 연결됩니다.
+    @on(TSignal) 데코레이터로 명시적 구독합니다.
     """
 
     # Qt Signals
@@ -47,16 +125,18 @@ class SensorUI(QObject):
         self.temperature = 25.0
         self.humidity = 50.0
 
-    # on_ 메서드: signal_subscribe에 등록된 시그널 자동 매핑
+    @on(SensorWorker.sensor_temperature)
     def on_sensor_temperature(self, signal):
-        """RMI Signal 수신 → Qt Signal emit"""
+        """TSignal 수신 → Qt Signal emit"""
         self.temperature = signal.data
         self.temperature_changed.emit(signal.data)
 
+    @on(SensorWorker.sensor_humidity)
     def on_sensor_humidity(self, signal):
         self.humidity = signal.data
         self.humidity_changed.emit(signal.data)
 
+    @on(SensorWorker.sensor_alert)
     def on_sensor_alert(self, signal):
         self.alert_triggered.emit(signal.data)
 
@@ -69,19 +149,19 @@ class SensorUI(QObject):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  방법 2: signal_bridge 데코레이터 파라미터 (자동 매핑)
+#  방법 2: signal_forward (TSignal → Qt Signal 자동 매핑)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@task(name="device_ui", mode="thread", signal_bridge={
+@task(name="device_ui", mode="thread", signal_forward={
     "device.connected": "device_connected",
     "device.disconnected": "device_disconnected",
     "device.error": "device_error",
     "device.status": "status_updated",
 })
 class DeviceUI(QObject):
-    """디바이스 UI Task - signal_bridge 파라미터로 자동 매핑
+    """디바이스 UI Task - signal_forward로 TSignal → Qt Signal 자동 매핑
 
-    @task의 signal_bridge 파라미터로 RMI Signal → Qt Signal을 선언적으로 매핑합니다.
+    @task의 signal_forward 파라미터로 TSignal → Qt Signal을 선언적으로 매핑합니다.
     (QObject 상속 시 main_thread=True 자동 설정)
     """
 
@@ -99,80 +179,9 @@ class DeviceUI(QObject):
     @rmi_run
     def run(self):
         print(f"[{self.runtime.name}] DeviceUI started (main_thread instance)")
-        print(f"[{self.runtime.name}] signal_bridge: {self._rmi_signal_bridge}")
+        print(f"[{self.runtime.name}] signal_forward: {self._rmi_signal_forward}")
         while not self.runtime.should_stop():
             time.sleep(0.1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Signal 발신 Task (process 모드)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@task(name="sensor_worker", mode="thread")
-class SensorWorker:
-    """센서 데이터 생성 워커 - Signal 발신"""
-
-    def __init__(self):
-        self.interval = 1.0
-
-    @rmi_run
-    def run(self):
-        import random
-        print(f"[{self.runtime.name}] SensorWorker started")
-
-        count = 0
-        while not self.runtime.should_stop():
-            # 센서 데이터 생성
-            temp = 20.0 + random.random() * 15.0  # 20~35
-            humidity = 40.0 + random.random() * 30.0  # 40~70
-
-            # RMI Signal 발신 (SensorUI가 수신) - 체인 문법 사용
-            self.signal.sensor.temperature.emit(temp)
-            self.signal.sensor.humidity.emit(humidity)
-
-            # 경고 조건
-            if temp > 32.0:
-                self.signal.sensor.alert.emit(f"High temperature: {temp:.1f}°C")
-
-            count += 1
-            if count % 5 == 0:
-                print(f"[{self.runtime.name}] Emitted {count} signals (temp={temp:.1f}, hum={humidity:.1f})")
-
-            time.sleep(self.interval)
-
-
-@task(name="device_worker", mode="thread")
-class DeviceWorker:
-    """디바이스 상태 생성 워커 - Signal 발신"""
-
-    def __init__(self):
-        self.interval = 2.0
-
-    @rmi_run
-    def run(self):
-        import random
-        print(f"[{self.runtime.name}] DeviceWorker started")
-
-        # 디바이스 연결 시뮬레이션
-        time.sleep(1.0)
-        self.signal.device.connected.emit({"name": "Camera-01", "ip": "192.168.1.100"})
-
-        count = 0
-        while not self.runtime.should_stop():
-            # 상태 업데이트 (signal_bridge가 자동 처리)
-            status = {
-                "fps": 25 + random.randint(-5, 5),
-                "frames": count * 30,
-                "errors": random.randint(0, 2),
-            }
-            self.signal.device.status.emit(status)
-
-            # 오류 시뮬레이션
-            if random.random() < 0.1:
-                self.signal.device.error.emit("Frame drop detected")
-
-            count += 1
-            time.sleep(self.interval)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -192,7 +201,7 @@ class DemoWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # 센서 UI 영역
-        layout.addWidget(QLabel("=== Sensor (signal_subscribe + on_) ==="))
+        layout.addWidget(QLabel("=== Sensor (@on(TSignal) 구독) ==="))
         self.temp_label = QLabel("Temperature: --")
         self.humidity_label = QLabel("Humidity: --")
         self.alert_label = QLabel("Alert: None")
@@ -204,7 +213,7 @@ class DemoWindow(QMainWindow):
         layout.addSpacing(20)
 
         # 디바이스 UI 영역
-        layout.addWidget(QLabel("=== Device (signal_bridge) ==="))
+        layout.addWidget(QLabel("=== Device (signal_forward) ==="))
         self.device_status_label = QLabel("Device: Disconnected")
         self.device_info_label = QLabel("Status: --")
         self.device_error_label = QLabel("Last Error: None")
@@ -285,9 +294,9 @@ def main():
     app.aboutToQuit.connect(manager.stop_all)
 
     print("\n" + "=" * 60)
-    print("  ALASKA Qt Signal Demo")
-    print("  - SensorUI: signal_subscribe + on_ → Qt Signal")
-    print("  - DeviceUI: signal_bridge 파라미터 (자동 매핑)")
+    print("  ALASKA Qt Signal Demo (v2.7 TSignal)")
+    print("  - SensorUI: @on(TSignal) → Qt Signal")
+    print("  - DeviceUI: signal_forward (자동 매핑)")
     print("  - Monitor: http://localhost:7100")
     print("=" * 60 + "\n")
 

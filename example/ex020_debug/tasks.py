@@ -2,11 +2,14 @@
 """Debug Option - 디버그 출력 예제"""
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal, on
 
 
 @task(name="ProducerTask", mode="process", debug="signal")
 class ProducerTask:
     """debug="signal": emit 시 시그널 이름/데이터 출력"""
+
+    data_ready = TSignal(dict, name="data.ready")
 
     def __init__(self):
         self.count = 0
@@ -14,7 +17,7 @@ class ProducerTask:
     def run(self):
         while self.running:
             self.count += 1
-            self.signal.data.ready.emit({"count": self.count})
+            self.data_ready.emit({"count": self.count})
             time.sleep(1.0)
 
 
@@ -33,6 +36,7 @@ class ConsumerTask:
             count = self.producer.count
             print(f"[Consumer] producer.count = {count}, received = {self.received}")
 
+    @on("data.ready")
     def on_data_ready(self, signal):
         """자동 구독: data.ready (debug="signal"로 수신 로그 출력)"""
         self.received += 1

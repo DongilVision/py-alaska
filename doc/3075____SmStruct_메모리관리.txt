@@ -1,0 +1,790 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.6 — SmStruct 및 공유 메모리 구조체 관리 설계서                   ║
+║  사전정의 Struct 기반 SM 직렬화, Ring Pool, 강제속성 통합 Task 정의        ║
+║  문서 버전: 2026-03-06 (초안)                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. 필요성 (Motivation)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1.1 현재 문제점
+  ─────────────
+
+  ALASKA의 Signal/RMI는 pickle을 기본 직렬화로 사용한다.
+  M-03(Signal), M-08(RMI)에서 struct fast-path를 도입했으나,
+  사용자 정의 구조체(예: FrameInfo)는 여전히 pickle + dict로 전달된다.
+
+  현재 카메라 예제 (ex130a_camera):
+
+      # 매 프레임마다 dict 생성 → pickle 직렬화 → SM 전송
+      emit({"sm_index": N, "trigger_mode": True, "rx_count": 1500, ...})
+
+  ┌──────────────────────┬─────────────────────────────────────────────────┐
+  │ 문제                 │ 영향                                            │
+  ├──────────────────────┼─────────────────────────────────────────────────┤
+  │ dict 키 해싱 반복    │ 매 emit마다 6개 키 해싱 + dict 생성 오버헤드    │
+  │ pickle 직렬화        │ ~2-10μs/회 + 150-300B payload (고정 33B 가능)   │
+  │ pickle 역직렬화      │ ~3-15μs/회 + Python 객체 트리 생성 (GIL 경합)   │
+  │ 크기 가변            │ SM 슬롯 사전 할당 불가, fragment 발생           │
+  │ 스키마 불명확        │ 송/수신측 키 이름 오타 시 런타임 KeyError       │
+  │ 타입 불안전          │ int 기대 필드에 str 들어와도 무시               │
+  └──────────────────────┴─────────────────────────────────────────────────┘
+
+  1.2 목표
+  ────────
+
+  ① struct.pack/unpack 기반의 고정 크기 바이너리 직렬화
+  ② 구조체 정의 → 인코더/디코더 자동 생성 (SmStruct 베이스 클래스)
+  ③ Ring Pool 기반 SM 메모리 관리 (zero-fragmentation)
+  ④ zero-copy memoryview 읽기 지원
+  ⑤ DEVICE_PROPERTY + SmStruct + 강제속성을 하나의 Task 선언으로 통합
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. 속도 검토 (Performance Analysis)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  2.1 직렬화 방식별 비교 (FrameInfo 6필드 기준)
+  ──────────────────────────────────────────────
+
+  ┌───────────────────┬──────────┬──────────┬──────────┬─────────────────────┐
+  │ 항목              │ pickle   │ json     │ struct   │ struct + memoryview │
+  ├───────────────────┼──────────┼──────────┼──────────┼─────────────────────┤
+  │ 직렬화 (encode)   │ 2-10 μs  │ 5-20 μs  │ 0.1-0.3μs│ 0.1-0.3 μs         │
+  │ 역직렬화 (decode)  │ 3-15 μs  │ 8-30 μs  │ 0.1-0.3μs│ 0 μs (zero-copy)   │
+  │ payload 크기      │ 150-300B │ 120-200B │ 33B      │ 33B                │
+  │ GIL 영향          │ 높음     │ 높음     │ 최소     │ 최소               │
+  │ Python 객체 생성  │ dict+6값 │ dict+6값 │ tuple(6) │ 0 (memoryview)     │
+  │ zero-copy 가능    │ X        │ X        │ X        │ O                  │
+  │ SM 직접 쓰기      │ X        │ X        │ O        │ O                  │
+  └───────────────────┴──────────┴──────────┴──────────┴─────────────────────┘
+
+  결론: struct는 pickle 대비 직렬화 10~50x, 역직렬화 30~150x 빠르다.
+
+  2.2 기존 프로젝트 증거
+  ──────────────────────
+
+  M-03 (Signal struct encoding, 0xA3):
+    - Signal 헤더를 struct로 전환 → 헤더 인코딩 5μs → 0.2μs (25x 개선)
+    - payload는 여전히 pickle (사용자 데이터)
+
+  M-08 (RMI struct fast-path, 0xB1/0xB2):
+    - int/float 단일 인자: pickle 건너뛰고 struct 직접 → 3~5μs 절감
+    - 응답 status 3~7: struct 직접 반환 → pickle.loads 0회
+
+  SmRingBuffer (sm_ring_buffer.py):
+    - 이미 struct + memoryview로 구현 → RTT 0.001ms
+
+  2.3 예상 개선 효과 (FrameInfo 기준)
+  ────────────────────────────────────
+
+  ┌───────────────────────────────┬──────────────┬──────────────┬───────────┐
+  │ 구간                         │ 현재 (pickle) │ SmStruct     │ 개선     │
+  ├───────────────────────────────┼──────────────┼──────────────┼───────────┤
+  │ emit() 직렬화                │ ~5 μs        │ ~0.2 μs      │ 25x      │
+  │ 수신측 역직렬화               │ ~8 μs        │ ~0.2 μs      │ 40x      │
+  │ 왕복 (emit→recv)             │ ~13 μs       │ ~0.4 μs      │ 32x      │
+  │ payload 크기                 │ ~200 B       │ 33 B         │ 6x 절감  │
+  │ SM Ring 슬롯 활용률          │ 가변 (낭비)  │ 100% (고정)  │ 최적     │
+  └───────────────────────────────┴──────────────┴──────────────┴───────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. SmStruct 인코더/디코더 (Auto-generated Encoder/Decoder)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  3.1 SmStruct 베이스 클래스
+  ─────────────────────────
+
+  서브클래스가 _fields_를 선언하면, __init_subclass__()에서
+  format string, Struct 객체, 필드명 목록, 크기를 자동 생성한다.
+
+      from struct import Struct
+
+      class SmStruct:
+          """사전정의 구조체 — SM 직접 읽기/쓰기 베이스"""
+          _fields_: list  # [('name', 'type_key'), ...]
+
+          # 타입 → struct format 매핑
+          _TYPE_MAP = {
+              'bool8':  '?',   # 1B
+              'int8':   'b',   # 1B signed
+              'uint8':  'B',   # 1B unsigned
+              'int16':  'h',   # 2B
+              'uint16': 'H',   # 2B
+              'int32':  'i',   # 4B
+              'uint32': 'I',   # 4B
+              'int64':  'q',   # 8B
+              'uint64': 'Q',   # 8B
+              'float32':'f',   # 4B
+              'float64':'d',   # 8B
+          }
+
+          def __init_subclass__(cls, **kw):
+              super().__init_subclass__(**kw)
+              if not hasattr(cls, '_fields_'):
+                  return
+              fmt = '<' + ''.join(cls._TYPE_MAP[t] for _, t in cls._fields_)
+              cls._struct = Struct(fmt)          # 자동 생성된 Struct
+              cls._size   = cls._struct.size     # 고정 크기 (bytes)
+              cls._names  = tuple(n for n, _ in cls._fields_)
+              cls._types  = tuple(t for _, t in cls._fields_)
+
+          def __init__(self, **kwargs):
+              for name, _ in self._fields_:
+                  setattr(self, name, kwargs.get(name, 0))
+
+          # ── 인코더 (Encoder) ─────────────────────────────
+          def pack(self) -> bytes:
+              """Python → bytes (새 버퍼)"""
+              return self._struct.pack(
+                  *(getattr(self, n) for n in self._names))
+
+          def pack_into(self, buf, offset=0):
+              """Python → SM 버퍼 직접 쓰기 (zero-copy write)"""
+              self._struct.pack_into(buf, offset,
+                  *(getattr(self, n) for n in self._names))
+
+          # ── 디코더 (Decoder) ─────────────────────────────
+          @classmethod
+          def unpack(cls, data: bytes):
+              """bytes → SmStruct 인스턴스"""
+              vals = cls._struct.unpack(data)
+              return cls(**dict(zip(cls._names, vals)))
+
+          @classmethod
+          def unpack_from(cls, buf, offset=0):
+              """SM 버퍼 → SmStruct 인스턴스 (zero-copy read)"""
+              vals = cls._struct.unpack_from(buf, offset)
+              return cls(**dict(zip(cls._names, vals)))
+
+          @classmethod
+          def unpack_tuple(cls, buf, offset=0) -> tuple:
+              """SM 버퍼 → tuple (객체 생성 없이 최고 속도)"""
+              return cls._struct.unpack_from(buf, offset)
+
+          # ── 유틸리티 ─────────────────────────────────────
+          def __repr__(self):
+              fields = ', '.join(f'{n}={getattr(self, n)!r}' for n in self._names)
+              return f'{type(self).__name__}({fields})'
+
+          def to_dict(self) -> dict:
+              return {n: getattr(self, n) for n in self._names}
+
+  3.2 사용자 구조체 정의 예시
+  ──────────────────────────
+
+      class FrameInfo(SmStruct):
+          _fields_ = [
+              ('sm_index',     'uint32'),     # 4B  SmBlock 슬롯 인덱스
+              ('trigger_mode', 'bool8'),      # 1B  트리거 모드
+              ('time',         'int64'),      # 8B  타임스탬프 (ns)
+              ('rx_count',     'uint32'),     # 4B  수신 카운터
+              ('drop_count',   'uint32'),     # 4B  드롭 카운터
+              ('uptime',       'uint64'),     # 8B  가동 시간 (ms)
+          ]
+          # 자동 생성:
+          #   _struct = Struct('<I?qIIQ')
+          #   _size   = 33
+          #   _names  = ('sm_index','trigger_mode','time','rx_count','drop_count','uptime')
+
+  3.3 인코더/디코더 사용법
+  ────────────────────────
+
+  (A) 인코더 — Python 객체 → SM 버퍼
+
+      # 방법 1: 새 bytes 반환 (IPC 전송용)
+      info = FrameInfo(sm_index=42, trigger_mode=True, time=1709712000)
+      data = info.pack()                    # → 33 bytes
+
+      # 방법 2: SM 버퍼에 직접 쓰기 (zero-copy)
+      info.pack_into(shm.buf, offset=0)     # memcpy 1회, 할당 0회
+
+  (B) 디코더 — SM 버퍼 → Python 객체
+
+      # 방법 1: SmStruct 인스턴스로 복원
+      info = FrameInfo.unpack_from(shm.buf, offset=0)
+      print(info.sm_index)                  # 42
+      print(info.trigger_mode)              # True
+
+      # 방법 2: tuple로 최고속 읽기 (객체 생성 없음)
+      vals = FrameInfo.unpack_tuple(shm.buf, offset=0)
+      sm_index, trigger_mode, time_val, rx_count, drop_count, uptime = vals
+
+      # 방법 3: bytes에서 복원 (IPC 수신 후)
+      info = FrameInfo.unpack(data)
+
+  3.4 기존 Signal emit과의 통합
+  ────────────────────────────
+
+  현재:
+      self.signal.camera.received.emit({
+          "sm_index": N, "trigger_mode": True, ...})
+      # → pickle.dumps(dict) → SM 전송 → pickle.loads → dict
+
+  SmStruct 적용 후:
+      info = FrameInfo(sm_index=N, trigger_mode=True, ...)
+      self.signal.camera.received.emit_struct(info)
+      # → info.pack() → SM 전송 → FrameInfo.unpack() → SmStruct
+
+  또는 Ring Pool 사용 시:
+      pool.write(info)                      # SM 직접 쓰기
+      signal.emit(slot_index)               # index만 전달 (4B)
+      # 수신측: FrameInfo.unpack_from(pool.buf, pool.slot_offset(idx))
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. Zero-Copy를 위한 SM 구조 제안 (SmRingPool)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  4.1 Fragment 문제와 Ring 해결
+  ─────────────────────────────
+
+  가변 크기 malloc 방식:
+
+      [ FrameInfo 33B ][ Image 1MB ][ 해제 ][ FrameInfo 33B ][ Image 2MB ]
+                                     ^^^^^^
+                                     fragment → 재사용 불가
+
+  고정 크기 Ring 방식:
+
+      [ slot 0 ][ slot 1 ][ slot 2 ] ... [ slot N-1 ] → wrap → [ slot 0 ]
+       ← 33B →  ← 33B →  ← 33B →
+       W=5       R=3       (available = W - R = 2)
+
+      장점: 동일 크기 슬롯 → fragment 0, malloc/free 0, w/r 인덱스만 관리
+
+  4.2 타입별 Ring 분리 (SmMemoryManager)
+  ──────────────────────────────────────
+
+      ┌─────────────────────────────────────────────────────────┐
+      │  SmMemoryManager (prefix='cam01')                      │
+      │                                                         │
+      │  ┌─ SmRingPool: FrameInfo ──────────────────────────┐  │
+      │  │  name = 'cam01_FrameInfo'                        │  │
+      │  │  slot_size = 33B, slot_count = 64                │  │
+      │  │  [HDR 16B][slot0][slot1]...[slot63] → wrap       │  │
+      │  └──────────────────────────────────────────────────┘  │
+      │                                                         │
+      │  ┌─ SmRingPool: ImageMeta ──────────────────────────┐  │
+      │  │  name = 'cam01_ImageMeta'                        │  │
+      │  │  slot_size = 64B, slot_count = 32                │  │
+      │  │  [HDR 16B][slot0][slot1]...[slot31] → wrap       │  │
+      │  └──────────────────────────────────────────────────┘  │
+      │                                                         │
+      │  (이미지 실 데이터는 SmBlock으로 별도 관리)              │
+      └─────────────────────────────────────────────────────────┘
+
+  4.3 SmRingPool 메모리 레이아웃
+  ─────────────────────────────
+
+      ┌──────────────────────────────────────────────────────────────────┐
+      │                        SharedMemory                             │
+      ├────────────┬───────────┬─────────────┬─────────────┬───────────┤
+      │ write_idx  │ read_idx  │ slot_count  │ slot_size   │ DATA ...  │
+      │ uint32 (4B)│ uint32(4B)│ uint32 (4B) │ uint32 (4B) │ N × S    │
+      ├────────────┴───────────┴─────────────┴─────────────┼───────────┤
+      │              Header (16B)                          │ Slots     │
+      └───────────────────────────────────────────────────┴───────────┘
+
+      offset(slot_i) = 16 + (i % slot_count) × slot_size
+
+  4.4 SmRingPool API
+  ──────────────────
+
+      class SmRingPool:
+          HDR = Struct('<IIII')  # write_idx, read_idx, slot_count, slot_size
+
+          # 생성/연결
+          __init__(name, slot_size, slot_count, create=True)
+
+          # 쓰기: SmStruct → 다음 슬롯
+          write(sm_struct) → slot_index          # BufferError if full
+
+          # 읽기: 다음 미읽은 슬롯의 offset 반환 (read_idx 전진)
+          read() → offset or None                # None if empty
+
+          # 특정 슬롯 읽기 (read_idx 변경 없음)
+          peek(slot_idx) → offset
+
+          # 상태
+          available → int                        # write_idx - read_idx
+          is_full → bool
+          is_empty → bool
+
+  4.5 Zero-Copy 읽기/쓰기 흐름
+  ────────────────────────────
+
+      Producer (카메라):
+      ┌────────────────────────────────────────────────────────────┐
+      │  info = FrameInfo(sm_index=42, time=now(), ...)           │
+      │  pool.write(info)                                         │
+      │    → info.pack_into(shm.buf, slot_offset)                 │
+      │    → struct.pack_into(buf, offset, val1, val2, ...)       │
+      │    → memcpy 1회 (33B), Python 할당 0회                     │
+      └────────────────────────────────────────────────────────────┘
+
+      Consumer (image_writer):
+      ┌────────────────────────────────────────────────────────────┐
+      │  offset = pool.read()                                     │
+      │  if offset is not None:                                   │
+      │      info = FrameInfo.unpack_from(pool._shm.buf, offset)  │
+      │        → struct.unpack_from(buf, offset)                  │
+      │        → memcpy 1회 (33B), dict 생성 0회                   │
+      │                                                            │
+      │  # 또는 최고속: tuple로 직접 받기                           │
+      │  vals = FrameInfo.unpack_tuple(pool._shm.buf, offset)     │
+      │  sm_idx, trigger, ts, rx, drop, up = vals                 │
+      └────────────────────────────────────────────────────────────┘
+
+  4.6 SmBlock과의 역할 분리
+  ─────────────────────────
+
+  ┌─────────────┬─────────────────────────┬────────────────────────────┐
+  │ 컴포넌트     │ 용도                    │ 크기                       │
+  ├─────────────┼─────────────────────────┼────────────────────────────┤
+  │ SmBlock     │ 이미지 원본 데이터 풀    │ N × H × W × C (대용량)    │
+  │ SmRingPool  │ 메타데이터 Ring 전달     │ N × struct_size (소용량)   │
+  │ Signal      │ 이벤트 알림 (슬롯 인덱스)│ 4B (index만 전달)         │
+  └─────────────┴─────────────────────────┴────────────────────────────┘
+
+  프레임 수신 흐름:
+
+      Camera HW → 프레임 콜백
+        ① SmBlock.alloc() → image_idx
+        ② memmove(SmBlock[image_idx], raw_frame)        ← 이미지 대용량
+        ③ FrameInfo(sm_index=image_idx, ...).pack_into(ring)  ← 메타 33B
+        ④ signal.emit(ring_slot_idx)                     ← 알림 4B
+
+      Viewer ← signal 수신
+        ① ring_slot = pool.read()
+        ② info = FrameInfo.unpack_from(ring, slot_offset)
+        ③ image = SmBlock.get_buffer(info.sm_index)      ← zero-copy
+        ④ display(image)
+        ⑤ SmBlock.mfree(info.sm_index)                   ← 해제
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. 강제속성 + SmStruct 통합 Task 정의 방법론
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  5.1 현재 문제: 분산된 정의
+  ─────────────────────────
+
+  현재 카메라 Task는 3가지가 별도로 선언된다:
+
+      ① @task + DEVICE_PROPERTY         → 태스크 + HW 속성
+      ② @dataclass FrameInfo            → 시그널 전달 구조 (dict, pickle)
+      ③ cam_id, trigger_source 등       → 필수 설정값 (런타임 검증 없음)
+
+  문제:
+  - FrameInfo가 dataclass로 정의되지만 실제 전달은 dict → 타입 불일치
+  - cam_id가 없어도 태스크가 시작됨 → 런타임 에러
+  - 구조체와 태스크 사이에 명시적 연결 없음
+
+  5.2 통합 선언 제안: TASK_SCHEMA
+  ──────────────────────────────
+
+      @task(name="imi_cam_dp", mode="process", restart=True)
+      class imi_cam_dp:
+
+          # ── 강제 속성 (필수 설정, 없으면 TaskConfigError) ──
+          REQUIRED_PROPERTY = {
+              "cam_id:str":         {"doc": "카메라 MAC 주소"},
+              "trigger_source:str": {"doc": "트리거 소스", "default": "software",
+                                     "choices": ["software", "hardware"]},
+          }
+
+          # ── 디바이스 속성 (기존 DEVICE_PROPERTY) ──
+          DEVICE_PROPERTY = {
+              "is_connect:bool=false": {},
+              "trigger_mode:bool=false": {"setter": "_hw_set_trigger"},
+              "fps:float=900.0":        {"setter": "_hw_set_fps"},
+              "exposure:int=15000":     {"setter": "_hw_set_exposure"},
+              "@resync": {
+                  "open": "_session_open",
+                  "close": "_session_close",
+                  "condition": {"Eq": ["is_connect", True]},
+                  "order": ["trigger_mode", "fps", "exposure"]
+              }
+          }
+
+          # ── 구조체 선언 (Signal payload용) ──
+          class FrameInfo(SmStruct):
+              _fields_ = [
+                  ('sm_index',     'uint32'),
+                  ('trigger_mode', 'bool8'),
+                  ('time',         'int64'),
+                  ('rx_count',     'uint32'),
+                  ('drop_count',   'uint32'),
+                  ('uptime',       'uint64'),
+              ]
+
+          # ── 시그널 선언 (구조체 바인딩) ──
+          SIGNAL = {
+              "camera.connected":    {},
+              "camera.disconnected": {},
+              "camera.received":     {"struct": "FrameInfo"},  # ← SmStruct 바인딩
+          }
+
+  5.3 프레임워크 검증 흐름
+  ────────────────────────
+
+      TaskManager.start("imi_cam_dp", cam_id="AA:BB:CC:DD:EE:FF")
+                  │
+                  ▼
+      ┌─ REQUIRED_PROPERTY 검증 ────────────────────────────┐
+      │  ✓ cam_id 존재 + str 타입 확인                       │
+      │  ✓ trigger_source: "software" (default 적용)         │
+      │  ✗ cam_id 없으면 → TaskConfigError 즉시 발생         │
+      └──────────────────────────────────────────────────────┘
+                  │
+                  ▼
+      ┌─ DEVICE_PROPERTY 초기화 ─────────────────────────────┐
+      │  캐시 생성, @resync 파서, setter 바인딩              │
+      └──────────────────────────────────────────────────────┘
+                  │
+                  ▼
+      ┌─ SIGNAL + SmStruct 바인딩 ───────────────────────────┐
+      │  camera.received → emit_struct() 자동 활성화         │
+      │  수신측 → FrameInfo.unpack_from() 자동 디코딩        │
+      └──────────────────────────────────────────────────────┘
+                  │
+                  ▼
+      Task.run() 시작
+
+  5.4 사용 코드 변화
+  ──────────────────
+
+  Before (현재):
+
+      # 송신 — dict + pickle
+      d = self._frame_payload
+      d["sm_index"] = index
+      d["rx_count"] = self.rx_count
+      ...
+      self._emit_received(d)
+
+      # 수신 — dict 키 접근
+      def on_received(self, data):
+          idx = data["sm_index"]          # KeyError 위험
+          count = data["rx_count"]
+
+  After (SmStruct 통합):
+
+      # 송신 — struct 직접 쓰기
+      info = self.FrameInfo(
+          sm_index=index, trigger_mode=self.trigger_mode,
+          time=time_ns(), rx_count=self.rx_count,
+          drop_count=self.rx_drop, uptime=self.uptime)
+      self.signal.camera.received.emit_struct(info)
+
+      # 수신 — 타입 안전 접근
+      def on_received(self, info: FrameInfo):
+          idx = info.sm_index              # AttributeError if 오타
+          count = info.rx_count            # int 보장
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. 추가 사항 (Additional Considerations)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  6.1 Endianness
+  ──────────────
+
+  SmStruct는 '<' (Little-Endian)을 기본으로 사용한다.
+  ALASKA는 Windows x86_64 전용이므로 LE가 네이티브이다.
+  혹시 ARM이나 네트워크 전송이 필요하면 '>' 또는 '!' (BE)로 전환 가능.
+
+  6.2 Alignment / Padding
+  ───────────────────────
+
+  struct 모듈의 '<' prefix는 패딩 없이 packed 배치한다.
+  FrameInfo 예시:
+      uint32(4) + bool8(1) + int64(8) + uint32(4) + uint32(4) + uint64(8) = 29B
+
+  ※ '=' (native alignment) 사용 시 bool8 뒤에 7B 패딩 삽입 → 36B.
+     ALASKA는 SM 공간 절약을 위해 packed('<')를 기본으로 한다.
+
+  6.3 가변 길이 필드
+  ──────────────────
+
+  SmStruct는 고정 크기 필드만 지원한다.
+  가변 길이 데이터(문자열, 리스트)가 필요한 경우:
+
+      방법 A: 고정 길이 char 배열로 선언
+          _fields_ = [('name', 'char32')]  # 32B 고정 문자열
+
+      방법 B: 별도 SmBlock에 가변 데이터, SmStruct에 인덱스만 저장
+          _fields_ = [('data_index', 'uint32'), ('data_size', 'uint32')]
+
+      방법 C: pickle fallback (성능 트레이드오프 인지)
+          SmStruct 필드 + 추가 pickle payload 하이브리드
+
+  6.4 버전 관리
+  ─────────────
+
+  구조체 변경 시 Producer/Consumer 간 호환성:
+
+      class FrameInfo(SmStruct):
+          _version_ = 2                    # 구조체 버전
+          _fields_ = [
+              ('_version',     'uint8'),   # 헤더로 버전 내장
+              ('sm_index',     'uint32'),
+              ...
+          ]
+
+  버전 불일치 감지:
+      info = FrameInfo.unpack_from(buf)
+      if info._version != FrameInfo._version_:
+          raise IncompatibleStructError(...)
+
+  6.5 다중 Consumer
+  ─────────────────
+
+  SmRingPool은 SPSC (Single Producer, Single Consumer) 설계이다.
+  다중 Consumer가 필요한 경우:
+
+      방법 A: Consumer별 Ring 복제 (Fan-out)
+          Producer → Ring_A (consumer 1용)
+                   → Ring_B (consumer 2용)
+
+      방법 B: SmRingPool + 브로드캐스트
+          Producer → SmRingPool.write() → Signal 브로드캐스트
+          Consumer들은 peek(slot_idx)로 읽기 (read_idx 이동 없음)
+          Producer가 모든 Consumer ACK 후 read_idx 전진
+
+      방법 C: MPSC가 필요하면 기존 SmSignalQueue + SmMutex 사용
+
+  6.6 Shared Variable Pool — Global 변수 + Lock 기반 프로세스 간 공유 구조
+  ──────────────────────────────────────────────────────────────────────
+
+  SmRingPool은 SPSC Ring 방식의 스트리밍 전달에 특화되어 있다.
+  반면, 여러 프로세스가 동일한 상태 변수 집합을 읽기/쓰기해야 하는 경우,
+  SharedMemory + global 변수 + SmMutex(Named Mutex)로
+  Shared Variable Pool을 구성할 수 있다.
+
+  Shared Variable Pool이란:
+  - 여러 상태 변수를 하나의 SM 영역에 SmStruct로 고정 배치하고
+  - SmMutex(프로세스 간 Named Mutex)로 원자적 접근을 보장하여
+  - 복수 프로세스가 동일한 상태 풀을 안전하게 공유하는 구조이다.
+
+  SmRingPool과의 차이:
+  - SmRingPool: 시계열 데이터 스트림 (FIFO, write_idx/read_idx 전진)
+  - SharedPool: 최신 상태 스냅샷 공유 (덮어쓰기, 항상 최신 값 유지)
+
+  패턴:
+
+      from multiprocessing.shared_memory import SharedMemory
+      from py_alaska.sm_infra import SmMutex
+
+      class SharedPool:
+          """프로세스 간 공유 변수 풀 — SM + Named Mutex 동기화"""
+          def __init__(self, name: str, struct_cls, create=True):
+              self._cls = struct_cls
+              self._mutex = SmMutex(f'{name}_lock')
+              self._shm = SharedMemory(
+                  name=name, create=create, size=struct_cls._size)
+
+          def write(self, info):
+              """상태 갱신 (최신 값 덮어쓰기)"""
+              with self._mutex:
+                  info.pack_into(self._shm.buf, 0)
+
+          def read(self):
+              """최신 상태 읽기"""
+              with self._mutex:
+                  return self._cls.unpack_from(self._shm.buf, 0)
+
+          def close(self):
+              self._shm.close()
+
+      # ── Producer 프로세스 ──
+      pool = SharedPool('cam01_state', FrameInfo, create=True)
+      pool.write(info)
+
+      # ── Consumer 프로세스 (여러 개 가능) ──
+      pool = SharedPool('cam01_state', FrameInfo, create=False)
+      info = pool.read()
+
+  다중 변수 풀 (복합 상태):
+
+      class CameraState(SmStruct):
+          _fields_ = [
+              ('is_connect',    'bool8'),
+              ('trigger_mode',  'bool8'),
+              ('fps',           'float32'),
+              ('exposure',      'int32'),
+              ('frame_count',   'uint64'),
+              ('error_code',    'uint16'),
+          ]
+          # _size = 20B, 고정 크기 → SM 슬롯에 정확히 배치
+
+      # 모든 프로세스가 동일한 카메라 상태를 공유
+      state_pool = SharedPool('cam01_state', CameraState)
+
+  ┌─────────────────┬───────────────────────┬────────────────────────────────┐
+  │ 방식            │ 적용 범위              │ 특징                           │
+  ├─────────────────┼───────────────────────┼────────────────────────────────┤
+  │ SmRingPool      │ 프로세스 간 스트림     │ SPSC FIFO, zero-copy           │
+  │ SharedPool      │ 프로세스 간 상태 공유  │ SM + Named Mutex, 덮어쓰기     │
+  │ SmValue (기존)  │ 프로세스 간 단일 값    │ ctypes SM, 원자적 접근          │
+  └─────────────────┴───────────────────────┴────────────────────────────────┘
+
+  주의:
+  - SharedPool은 Named Mutex를 사용하므로 프로세스 간 동기화가 보장된다.
+  - 덮어쓰기 방식이므로 이력(history)이 필요하면 SmRingPool을 사용할 것.
+  - SmValue 대비 장점: 여러 필드를 하나의 원자적 단위로 읽기/쓰기 가능.
+    (SmValue는 필드별 개별 접근 → 필드 간 일관성 미보장)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. 예외 사항 (Exception Handling)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  7.1 신규 예외 클래스
+  ────────────────────
+
+  ┌─────────────────────────┬─────────────────────────────────────────────┐
+  │ 예외                    │ 발생 조건                                    │
+  ├─────────────────────────┼─────────────────────────────────────────────┤
+  │ TaskConfigError         │ REQUIRED_PROPERTY 누락 시 (cam_id 없음 등)  │
+  │ StructSizeMismatchError │ SM 슬롯 크기 ≠ SmStruct._size              │
+  │ IncompatibleStructError │ _version 불일치 (Producer/Consumer 버전 차) │
+  │ RingFullError           │ SmRingPool write 시 Consumer 지연으로 포화  │
+  │ RingEmptyError          │ SmRingPool read 시 데이터 없음 (정보성)     │
+  └─────────────────────────┴─────────────────────────────────────────────┘
+
+  7.2 기존 예외와의 관계
+  ──────────────────────
+
+  - RingFullError는 QueueFullError와 동일한 C5(Backpressure) 정책을 따른다.
+    → 데이터 손실 대신 예외를 발생시켜 호출자가 속도를 조절하게 한다.
+  - StructSizeMismatchError는 SpscViolationError와 같은 계열의 안전 예외이다.
+    → 잘못된 구조체로 SM을 손상시키는 것을 방지한다.
+  - TaskConfigError는 @resync condition 미충족과 별개이다.
+    → REQUIRED_PROPERTY는 태스크 시작 전 검증, @resync는 런타임 조건.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. 버그 가능성 및 주의 사항 (Known Risks)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  8.1 write_idx / read_idx 원자성
+  ───────────────────────────────
+
+  위험: uint32 write_idx를 struct.pack_into로 쓸 때, x86에서 4B aligned
+        쓰기는 원자적이지만, Python memoryview를 통한 접근이 C레벨에서
+        단일 MOV 명령으로 보장되는지는 CPython 구현에 의존한다.
+
+  완화:
+  - SPSC에서는 Producer만 write_idx, Consumer만 read_idx를 쓰므로
+    동시 쓰기(write-write conflict)는 없다.
+  - read-write 경합: write_idx를 읽는 Consumer가 tearing을 볼 경우
+    → 최악에도 "아직 안 쓰여짐"으로 간주하여 안전 (stale read)
+  - 추가 안전: ctypes.c_uint32를 SM에 직접 매핑하면 원자성 보장
+
+  8.2 Ring Wrap-around Overflow
+  ─────────────────────────────
+
+  위험: write_idx가 uint32 최대값(4,294,967,295)에 도달하면 overflow.
+
+  완화:
+  - 초당 1000회 write 기준 → 49.7일 후 overflow
+  - 해결: uint64로 변경하거나, 주기적으로 양쪽 인덱스를 동기 리셋
+  - slot_offset 계산은 modulo이므로 overflow 자체는 안전:
+    (4294967295 + 1) % 64 = 0 (uint32 wrap 시 올바름)
+  - 단, (write_idx - read_idx) 계산이 unsigned에서 올바르려면
+    Python int의 무한 정밀도 고려 필요 → uint32 마스킹 적용
+
+  8.3 Producer/Consumer 속도 불일치
+  ─────────────────────────────────
+
+  위험: Producer가 Consumer보다 빠르면 Ring이 가득 차서 데이터 유실.
+
+  완화:
+  - RingFullError 예외 발생 (C5 정책: 손실보다 예외)
+  - Producer 측 대응 전략:
+      ① drop: 가장 오래된 프레임 skip (카메라: 최신 프레임만 중요)
+      ② block: Consumer가 빌 때까지 대기 (실시간에는 부적합)
+      ③ overwrite: read_idx를 강제 전진 (circular overwrite)
+  - 카메라 시나리오에서는 ①이 최적 (최신 프레임 우선)
+
+  8.4 프로세스 비정상 종료 시 SM 잔류
+  ────────────────────────────────────
+
+  위험: Producer 프로세스 crash → SharedMemory가 OS에 잔류.
+        Consumer가 stale 데이터를 읽을 수 있다.
+
+  완화:
+  - SmMemoryManager에 heartbeat 필드 추가 (마지막 write 시간)
+  - Consumer가 heartbeat timeout 감지 시 ring 무효화
+  - TaskManager의 기존 Self-Healing이 프로세스 재시작 → SM 재생성
+  - Windows: 프로세스 종료 시 SharedMemory 핸들 자동 해제됨
+    (단, 다른 프로세스가 참조 중이면 유지)
+
+  8.5 구조체 필드 순서 변경 시 호환성
+  ────────────────────────────────────
+
+  위험: FrameInfo v1에서 필드 순서를 바꾸면 기존 SM 데이터가 깨진다.
+
+  완화:
+  - _version_ 필드로 버전 감지 (§6.4)
+  - 필드 추가는 항상 끝에 (기존 offset 유지)
+  - 필드 삭제/재배치는 버전 번호를 올리고, 양쪽 동시 업데이트 필수
+  - 개발 중에는 SM name에 버전 포함: 'cam01_FrameInfo_v2'
+
+  8.6 bool8 패킹 특이사항
+  ───────────────────────
+
+  위험: struct.pack('?', value)에서 value가 0/1이 아닌 정수일 때
+        truthy 판정 → 예상치 못한 동작 가능.
+
+  완화:
+  - SmStruct.__init__에서 bool8 필드는 bool() 캐스팅 적용
+  - pack 시 이미 0 또는 1로 정규화됨
+
+  8.7 memoryview 생존 주기
+  ────────────────────────
+
+  위험: SharedMemory.close() 후 memoryview 접근 → segfault/access violation.
+
+  완화:
+  - SmRingPool.close()에서 _buf = None 설정
+  - unpack_from에서 buf is None 체크 → PoolClosedError
+  - SmMemoryManager.close_all()은 모든 Consumer가 완료된 후에만 호출
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. 구현 우선순위
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────┬────────────────────────────────────────┬────────┬──────────────┐
+  │ 순서 │ 항목                                    │ 효과   │ 의존성       │
+  ├──────┼────────────────────────────────────────┼────────┼──────────────┤
+  │  1   │ SmStruct 베이스 클래스 (§3.1)           │ ★★★★★ │ 없음         │
+  │  2   │ SmRingPool (§4.3, §4.4)                │ ★★★★☆ │ SmStruct     │
+  │  3   │ SmMemoryManager (§4.2)                 │ ★★★☆☆ │ SmRingPool   │
+  │  4   │ REQUIRED_PROPERTY 검증 (§5.2)          │ ★★★★☆ │ 없음         │
+  │  5   │ Signal emit_struct 통합 (§3.4)         │ ★★★☆☆ │ SmStruct     │
+  │  6   │ FrameInfo SmStruct 전환 (§5.4)         │ ★★★☆☆ │ 1, 5         │
+  │  7   │ 버전 관리 + 예외 클래스 (§6.4, §7.1)   │ ★★☆☆☆ │ 1            │
+  └──────┴────────────────────────────────────────┴────────┴──────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. 참고 문서
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - 3060____IPC설계.txt         — RMI 프로토콜, struct fast-path (M-08)
+  - 3070____Signal설계.txt      — Signal 인코딩, struct 헤더 (M-03)
+  - 4500____SmInfra설계.txt     — SmRingBuffer, SmBlock, SmValue 설계
+  - 4510____SmInfra성능검토.txt — 성능 벤치마크 기준선
+  - 4520____SmInfra수정계획.txt — M-01~M-10 최적화 항목
+  - ex130a_camera/README.md     — FrameInfo 원본 정의, 카메라 시퀀스
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  END OF DOCUMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

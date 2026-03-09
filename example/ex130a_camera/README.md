@@ -110,3 +110,21 @@ DEVICE_PROPERTY = {
 ```bash
 python main.py
 ```
+
+cam_id 는 반드시 지정해야 한다.
+trigger_source
+trigger_mode
+expose
+
+signal 
+  camera.connect
+  cammea.disconnect
+  cammra.recived
+
+frame_info
+- sm_index : u_int
+- trigger_mode : bool
+- time : long_int --> image_writer에서 이시간으로 쓰여진다.
+- rx_count : u_int
+- drop_count : u_int
+- uptime : 

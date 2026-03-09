@@ -44,11 +44,15 @@ import cv2
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 
 @task(name="saver", mode="process")
 class SaveImage:
     """이미지 저장 워커 (process 모드)."""
+
+    saver_saved = TSignal(dict, name="saver.saved")
+    saver_session = TSignal(dict, name="saver.session")
 
     def __init__(self):
         # config.json 주입 속성
@@ -150,7 +154,7 @@ class SaveImage:
                 self.print(f"WARN imwrite failed: {filepath}")
                 return
             with self._emit_lock:
-                self.signal.saver.saved.emit({
+                self.saver_saved.emit({
                     "path": filepath,
                     "seq": seq,
                     "dropped": dropped,
@@ -213,7 +217,7 @@ class SaveImage:
         self._session_seq = 0
         self._dropped_count = 0
 
-        self.signal.saver.session.emit({
+        self.saver_session.emit({
             "action": "open",
             "path": str(self._session_dir),
             "continued": 0,
@@ -223,7 +227,7 @@ class SaveImage:
     def stop_saving(self):
         """저장 중지 + 세션 닫기."""
         self._saving = False
-        self.signal.saver.session.emit({
+        self.saver_session.emit({
             "action": "close",
             "saved_count": self._session_seq,
             "dropped_count": self._dropped_count,
@@ -269,7 +273,7 @@ class SaveImage:
                 futures_wait(self._write_futures)
                 self._write_futures.clear()
 
-            self.signal.saver.session.emit({
+            self.saver_session.emit({
                 "action": "close",
                 "saved_count": self._session_seq,
                 "dropped_count": self._dropped_count,

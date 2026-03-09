@@ -1,0 +1,73 @@
+{
+  "app_info": {
+    "name": "sim_cam_example",
+    "id": "node-sim-cam-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_smblock": {
+      "smblock2048": {
+        "shape": [2048, 2448, 3],
+        "maxsize": 100
+      }
+    },
+    "_monitor": {
+      "port": 7001,
+      "exit_hook": true,
+      "measurement": true
+    }
+  },
+  "task_config": {
+    "sim/sim_cam": {
+      "@import": "example.ex510_save_image.task_sim_cam",
+      "smblock": "smblock:smblock2048",
+      "replay_path": "D:/images_test",
+      "session": "",
+      "replay_mode": "realtime",
+      "fps": 30,
+      "loop": true,
+      "start_frame": 0,
+      "end_frame": -1
+    },
+    "cam/imi_cam_dp": {
+      "@import": "example.ex510_save_image.task_cam_driver",
+      "smblock": "smblock:smblock2048",
+      "mac_address": "00:09:7e:35:80:38",
+      "fps": 900,
+      "exposure": 15000,
+      "trigger_source": "hardware",
+      "trigger_mode": false,
+      "debug": false
+    },
+
+    "viewer_sim/ImiCameraView": {
+      "@import": "example.ex510_save_image.task_viewer",
+      "target": "client:sim",
+      "smblock": "smblock:smblock2048"
+    },
+    "viewer_cam/ImiCameraView": {
+      "@import": "example.ex510_save_image.task_viewer",
+      "target": "client:cam",
+      "smblock": "smblock:smblock2048"
+    },
+
+    "sim_ui/SimUI": {
+      "@import": "example.ex510_save_image.task_sim_cam_ui",
+      "target": "client:sim"
+    },
+
+    "saver/saver": {
+      "@import": "example.ex510_save_image.task_save_image",
+      "smblock": "smblock:smblock2048",
+      "save_path": "D:/images_replay",
+      "retain_days": 30,
+      "image_format": "png",
+      "max_fps": 10,
+      "debug": false
+    },
+    "save_ui/SaveImageUI": {
+      "@import": "example.ex510_save_image.task_save_image_ui",
+      "target": "client:saver"
+    }
+  }
+}

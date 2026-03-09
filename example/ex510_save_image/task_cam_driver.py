@@ -1,6 +1,7 @@
 # Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
 # Project : ALASKA 2.0 — Multiprocess Task Framework
 # Date    : 2026-03-02
+
 """
 IMI Camera Driver (DEVICE_PROPERTY 버전)
 ========================================
@@ -25,6 +26,7 @@ import cv2
 import numpy as np
 
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 try:
     from py_alaska import SmBlock
@@ -79,6 +81,11 @@ class imi_cam_dp:
       - 비연결 상태에서 값 설정 → 캐시만 저장 (opstate 미충족)
       - is_connect=True 시 @resync → _session_open → 순서대로 HW 적용 → _session_close
     """
+
+    # ─── TSignal 선언 ───────────────────────────────────────────────────
+    camera_connected    = TSignal(dict, name="camera.connected")
+    camera_disconnected = TSignal(dict, name="camera.disconnected")
+    camera_received     = TSignal(dict, name="camera.received")
 
     # ─── DEVICE_PROPERTY 선언 ────────────────────────────────────────────
     DEVICE_PROPERTY = {
@@ -262,21 +269,19 @@ class imi_cam_dp:
     # Signal Emit
     # ═══════════════════════════════════════════════════════════════════════
     def _emit_connected(self):
-        if getattr(self, 'signal', None):
-            self.signal.camera.connected.emit({
-                "source": self.runtime.name,
-                "mode": "real",
-                "fps": self._cache.get("fps", 900.0)
-            })
+        self.camera_connected.emit({
+            "source": self.runtime.name,
+            "mode": "real",
+            "fps": self._cache.get("fps", 900.0)
+        })
 
     def _emit_disconnected(self, reason="stopped"):
-        if getattr(self, 'signal', None):
-            self.signal.camera.disconnected.emit({
-                "source": self.runtime.name,
-                "reason": reason,
-                "captured": self.rx_count,
-                "dropped": self.rx_drop
-            })
+        self.camera_disconnected.emit({
+            "source": self.runtime.name,
+            "reason": reason,
+            "captured": self.rx_count,
+            "dropped": self.rx_drop
+        })
 
     # ═══════════════════════════════════════════════════════════════════════
     # Task Loop
@@ -378,17 +383,14 @@ class imi_cam_dp:
 
             self._convert_fn(rx_frame, pImage, dst_buffer)
 
-            if getattr(self, 'signal', None):
-                self.signal.camera.received.emit({
-                    "sm_index": index,
-                    "trigger_mode": self._cache.get("trigger_mode", False),
-                    "rx_sequence": self.rx_count,
-                    "rx_timestamp": time.time(),
-                    "rx_count": self.rx_count,
-                    "rx_drop": self.rx_drop,
-                })
-            else:
-                self.smblock.mfree(index)
+            self.camera_received.emit({
+                "sm_index": index,
+                "trigger_mode": self._cache.get("trigger_mode", False),
+                "rx_sequence": self.rx_count,
+                "rx_timestamp": time.time(),
+                "rx_count": self.rx_count,
+                "rx_drop": self.rx_drop,
+            })
         except Exception as e:
             self.smblock.mfree(index)
             self.exception(e)

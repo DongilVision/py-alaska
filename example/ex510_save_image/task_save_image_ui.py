@@ -36,13 +36,13 @@ SaveImageUI 시그널 수신 (@ui_thread):
 """
 
 import shutil
+import threading
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from py_alaska import task, ui_thread
-
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTableWidget, QTableWidgetItem, QSplitter,
@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QMenu,
 )
 from PySide6.QtGui import QImage, QPixmap, QColor
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -430,12 +430,15 @@ class SaveImageUI(QWidget):
         target  — inject("client:saver") — saver RMI 프록시
     """
 
+    _save_done = Signal(bool, bool)  # (checked, success)
+
     def __init__(self):
         super().__init__()
         self.target = None
         self._saving = False
         self._save_path = ""
         self._session_row = -1
+        self._save_done.connect(self._on_save_done)
         self._init_ui()
 
     def run(self):
@@ -502,21 +505,39 @@ class SaveImageUI(QWidget):
     # 버튼 핸들러
     # ═══════════════════════════════════════════════════════════════════
     def _on_save_toggle(self, checked):
-        """Save/Stop 토글 → saver RMI 호출."""
+        """Save/Stop 토글 → saver RMI async 호출 (UI 블로킹 방지)."""
         if not self.target:
             self.save_btn.setChecked(False)
             return
+        self.save_btn.setEnabled(False)
+        threading.Thread(
+            target=self._do_save_rmi, args=(checked,), daemon=True
+        ).start()
+
+    def _do_save_rmi(self, checked):
+        """백그라운드 스레드: RMI 호출 → 완료 시 Signal emit."""
         try:
             if checked:
                 self.target.start_saving()
+            else:
+                self.target.stop_saving()
+            self._save_done.emit(checked, True)
+        except Exception:
+            self._save_done.emit(checked, False)
+
+    def _on_save_done(self, checked, success):
+        """UI 스레드: RMI 완료 후 버튼 상태 갱신."""
+        if success:
+            if checked:
                 self.save_btn.setText("Stop")
                 self._saving = True
             else:
-                self.target.stop_saving()
                 self.save_btn.setText("Save")
                 self._saving = False
-        except Exception:
+        else:
             self.save_btn.setChecked(False)
+            self._saving = False
+        self.save_btn.setEnabled(True)
 
     def _on_scan_click(self):
         """Scan 버튼 → 세션 디렉토리 재스캔 (기존 행 갱신 + 새 세션 추가)."""

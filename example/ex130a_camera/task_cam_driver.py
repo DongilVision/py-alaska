@@ -24,6 +24,7 @@ from typing import Optional
 import numpy as np
 
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 try:
     from py_alaska import SmBlock
@@ -96,6 +97,11 @@ class imi_cam_dp:
             "order": ["trigger_mode", "fps", "exposure"]
         }
     }
+
+    # ─── TSignal Declarations ─────────────────────────────────────────────
+    camera_connected = TSignal(dict, name="camera.connected")
+    camera_disconnected = TSignal(dict, name="camera.disconnected")
+    camera_received = TSignal(dict, name="camera.received")
 
     # ─── Class Variables ─────────────────────────────────────────────────
     DriverInit = False
@@ -242,9 +248,8 @@ class imi_cam_dp:
         # ① dst 주소 테이블: get_buffer(i).ctypes.data를 매 프레임 호출 제거
         n = self.smblock.maxsize
         self._dst_addrs = [self.smblock.get_buffer(i).ctypes.data for i in range(n)]
-        # ② signal emit 함수 직접 참조: getattr + 속성 체인 제거
-        self._emit_received = (self.signal.camera.received.emit
-                               if getattr(self, 'signal', None) else None)
+        # ② signal emit 함수 직접 참조: TSignal 바인딩
+        self._emit_received = self.camera_received.emit
         # ③ 재사용 dict: 매 프레임 dict 생성 + key 해싱 제거
         self._frame_payload = {
             "sm_index": 0, "trigger_mode": False,
@@ -276,21 +281,19 @@ class imi_cam_dp:
     # Signal Emit
     # ═══════════════════════════════════════════════════════════════════════
     def _emit_connected(self):
-        if getattr(self, 'signal', None):
-            self.signal.camera.connected.emit({
-                "source": self.runtime.name,
-                "mode": "real",
-                "fps": self._cache.get("fps", 900.0)
-            })
+        self.camera_connected.emit({
+            "source": self.runtime.name,
+            "mode": "real",
+            "fps": self._cache.get("fps", 900.0)
+        })
 
     def _emit_disconnected(self, reason="stopped"):
-        if getattr(self, 'signal', None):
-            self.signal.camera.disconnected.emit({
-                "source": self.runtime.name,
-                "reason": reason,
-                "captured": self.rx_count,
-                "dropped": self.rx_drop
-            })
+        self.camera_disconnected.emit({
+            "source": self.runtime.name,
+            "reason": reason,
+            "captured": self.rx_count,
+            "dropped": self.rx_drop
+        })
 
     # ═══════════════════════════════════════════════════════════════════════
     # Task Loop

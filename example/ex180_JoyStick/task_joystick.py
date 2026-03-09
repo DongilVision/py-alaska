@@ -9,6 +9,7 @@
 import ctypes, time
 from ctypes import wintypes
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 # ── ctypes 구조체 ──
 
@@ -39,6 +40,12 @@ _DEADZONE = 0.3
 class JoyStickTask:
     """BT HID 게임패드 → jog signal 발행"""
 
+    jog_inc = TSignal(float, name="jog.inc")
+    jog_connect = TSignal(bool, name="jog.connect")
+    jog_pos = TSignal(dict, name="jog.pos")
+    jog_raw = TSignal(str, name="jog.raw")
+    jog_shot = TSignal(int, name="jog.shot")
+
     def __init__(self):
         self._bt = self._hid = self._idle = None
         self._x = self._y = self._z = self._a = self._b = self._c = 0.0
@@ -58,8 +65,8 @@ class JoyStickTask:
         except OSError: pass
 
     def run(self):
-        self.signal.jog.inc.emit(_INC_LIST[self._inc_idx])
-        self.signal.jog.connect.emit(False)
+        self.jog_inc.emit(_INC_LIST[self._inc_idx])
+        self.jog_connect.emit(False)
 
         while self.running:
             if self._try_connect():
@@ -76,14 +83,14 @@ class JoyStickTask:
         """HID open → read loop → close. 연결 성공 시 True."""
         if not self._open_hid():
             return False
-        self.signal.jog.connect.emit(True)
+        self.jog_connect.emit(True)
         self._read_loop()
-        self.signal.jog.connect.emit(False)
+        self.jog_connect.emit(False)
         return True
 
     def _emit_pos(self):
         """현재 6축 좌표 signal 발행."""
-        self.signal.jog.pos.emit({
+        self.jog_pos.emit({
             "x": round(self._x, 2), "y": round(self._y, 2),
             "z": round(self._z, 2), "a": round(self._a, 2),
             "b": round(self._b, 2), "c": round(self._c, 2),
@@ -92,7 +99,7 @@ class JoyStickTask:
     def _change_inc(self, delta):
         """증분 인덱스 변경 (+1/-1) 후 signal 발행."""
         self._inc_idx = max(0, min(self._inc_idx + delta, len(_INC_LIST) - 1))
-        self.signal.jog.inc.emit(_INC_LIST[self._inc_idx])
+        self.jog_inc.emit(_INC_LIST[self._inc_idx])
 
     # ── signal 수신 ──
 
@@ -101,7 +108,7 @@ class JoyStickTask:
         val = signal.data
         if val in _INC_LIST:
             self._inc_idx = _INC_LIST.index(val)
-            self.signal.jog.inc.emit(_INC_LIST[self._inc_idx])
+            self.jog_inc.emit(_INC_LIST[self._inc_idx])
 
     # ── HID ──
 
@@ -144,7 +151,7 @@ class JoyStickTask:
         raw = [f"[{i}]={b:02X}" for i, b in enumerate(data)
                if b != (idle[i] if i < len(idle) else 0)]
         if raw:
-            self.signal.jog.raw.emit(" | ".join(raw))
+            self.jog_raw.emit(" | ".join(raw))
 
         # [1] Bitmask Rising Edge
         b1 = data[1] if len(data) > 1 else 0
@@ -152,7 +159,7 @@ class JoyStickTask:
 
         if rising & 0x40:                           # Bit 6 → 카메라 샷
             self._shot_count += 1
-            self.signal.jog.shot.emit(self._shot_count)
+            self.jog_shot.emit(self._shot_count)
 
         c_changed = False                           # Bit 1/2 → C축
         if rising & 0x02:

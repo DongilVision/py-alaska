@@ -3,11 +3,14 @@
 import random
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 
 @task(debug="rmi, signal")
 class SumProcess:
     """1초 간격으로 랜덤 점수를 누적하고 score.update signal 발행"""
+
+    score_update = TSignal(dict, name="score.update")
 
     def __init__(self):
         self.total = 0
@@ -18,7 +21,7 @@ class SumProcess:
             score = random.randint(1, 100)
             self.total += score
             self.count += 1
-            self.signal.score.update.emit({
+            self.score_update.emit({
                 "score": score,
                 "total": self.total,
                 "count": self.count,

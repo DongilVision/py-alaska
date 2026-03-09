@@ -1,0 +1,1171 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ALASKA v2.6 — SmConfig 설계서                                             ║
+║  SharedMemory 기반 고속 설정 공유 (GConfig 보완)                           ║
+║  문서 버전: 2026-03-07 (초안)                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. GConfig 현황 분석
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1.1 현재 아키텍처
+  ─────────────────
+
+      Process A                   Disk                    Process B
+      ─────────                   ────                    ─────────
+      gconfig.data_get("fps")     config.json             gconfig.data_get("fps")
+          │                           ▲                       │
+          ├─ mtime 체크 ──────────────┤                       ├─ mtime 체크
+          ├─ stale → 파일 읽기 ───────┤                       ├─ stale → 파일 읽기
+          ├─ JSON 파싱                │                       ├─ JSON 파싱
+          └─ 캐시에서 반환            │                       └─ 캐시에서 반환
+
+      gconfig.data_set("fps", 30)
+          ├─ FileLock 획득 (msvcrt)
+          ├─ 파일 리로드 → 머지
+          ├─ JSON 직렬화
+          ├─ tmpfile 쓰기 → fsync → atomic replace
+          └─ FileLock 해제
+
+  1.2 GConfig의 강점
+  ──────────────────
+
+  ┌─────────────────────────────────────────────────┐
+  │  ✓ JSON/YAML 범용 포맷                          │
+  │  ✓ 계층적 데이터 (dot notation)                 │
+  │  ✓ 백업/복구, 체크섬, 감사 로그                 │
+  │  ✓ 사람이 읽고 수정 가능                        │
+  │  ✓ 프레임워크 시작 설정에 최적                  │
+  └─────────────────────────────────────────────────┘
+
+  1.3 GConfig의 병목
+  ──────────────────
+
+  ┌──────────────────────┬────────────────────────────────────────────────┐
+  │ 병목                 │ 원인                                           │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 읽기 비용            │ 매 data_get마다 os.path.getmtime() 시스콜      │
+  │                      │ stale이면 open → read → json.loads 전체 재파싱 │
+  │ 쓰기 비용            │ FileLock + reload + merge + dump + fsync       │
+  │                      │ 1회 set에 ~1-5ms (파일 크기 비례)              │
+  │ 전파 지연            │ Process B가 알려면 mtime 폴링 필요             │
+  │                      │ auto_refresh=True여도 data_get 호출 시에만 감지│
+  │ 타입 불안전          │ dict → Any, 런타임에 타입 오류 발견            │
+  │ 고빈도 접근          │ 프레임 콜백에서 설정 읽기 → 매 프레임 mtime    │
+  └──────────────────────┴────────────────────────────────────────────────┘
+
+  핵심: GConfig는 "시작 시 로드, 가끔 변경"에 적합.
+        "런타임 중 빈번한 읽기/쓰기 공유"에는 과도한 오버헤드.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. SmConfig 개요
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  2.1 핵심 아이디어
+  ─────────────────
+
+  설정값을 SmStruct로 정의하고 SharedMemory에 배치한다.
+  모든 프로세스가 동일 SM을 참조하므로 파일 I/O 없이 즉시 읽기.
+  SmMutex(Named Mutex)로 원자적 쓰기.
+
+      Process A                   SharedMemory              Process B
+      ─────────                   ────────────              ─────────
+      smconfig.fps                [struct 직접 읽기]         smconfig.fps
+          │                       ┌──────────────┐              │
+          └── unpack_from(buf) ───│ fps: float32 │──── unpack_from(buf)
+                                  │ exp: int32   │
+          smconfig.fps = 30       │ trig: bool8  │
+          └── pack_into(buf) ─────│ ...          │──→ 즉시 가시
+              (SmMutex)           └──────────────┘
+
+  2.2 GConfig vs SmConfig 역할 분리
+  ──────────────────────────────────
+
+  ┌──────────────┬───────────────────────────┬───────────────────────────┐
+  │ 항목         │ GConfig (유지)             │ SmConfig (신규)            │
+  ├──────────────┼───────────────────────────┼───────────────────────────┤
+  │ 저장소        │ 파일 (JSON/YAML)          │ SharedMemory              │
+  │ 용도          │ 시작 설정, 영구 보존       │ 런타임 공유, 빈번 접근    │
+  │ 읽기 비용     │ mtime + 파일 I/O          │ memcpy (~0.1μs)           │
+  │ 쓰기 비용     │ lock + dump + fsync       │ SmMutex + pack_into       │
+  │ 전파 속도     │ 폴링 (다음 data_get 시)   │ 즉시 (SM 직접 참조)       │
+  │ 타입 안전     │ Any (런타임 에러)          │ SmStruct (선언적 타입)    │
+  │ 데이터 구조   │ 계층적 dict (무제한)       │ 고정 필드 (SmStruct)      │
+  │ 영속성        │ ✓ 파일 저장               │ ✗ 프로세스 종료 시 소멸   │
+  │ 사람 수정     │ ✓ 텍스트 편집기           │ ✗ 바이너리                │
+  └──────────────┴───────────────────────────┴───────────────────────────┘
+
+  GConfig를 대체하는 것이 아니라 보완한다:
+  - 시작: GConfig에서 JSON 로드 → SmConfig에 초기값 기록
+  - 런타임: SmConfig에서 직접 읽기/쓰기 (파일 I/O 0)
+  - 종료: (선택) SmConfig → GConfig 저장 (영속화)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. SmConfig 설계
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  3.1 설정 구조체 정의
+  ────────────────────
+
+  사용자가 SmStruct로 설정 스키마를 정의한다:
+
+      class CameraConfig(SmStruct):
+          _fields_ = [
+              ('fps',           'float32'),    # 4B
+              ('exposure',      'int32'),      # 4B
+              ('trigger_mode',  'bool8'),      # 1B
+              ('gain',          'float32'),    # 4B
+              ('is_connect',    'bool8'),      # 1B
+              ('error_code',    'uint16'),     # 2B
+          ]
+          # _size = 16B, 고정
+
+      class SystemConfig(SmStruct):
+          _fields_ = [
+              ('log_level',     'uint8'),      # 1B
+              ('monitor_port',  'uint16'),     # 2B
+              ('max_fps',       'float32'),    # 4B
+              ('debug_mode',    'bool8'),      # 1B
+          ]
+          # _size = 8B
+
+  3.2 SmConfig 클래스
+  ───────────────────
+
+      from multiprocessing.shared_memory import SharedMemory
+      from py_alaska.sm_infra import SmMutex
+
+      class SmConfig:
+          """SharedMemory 기반 고속 설정 공유
+
+          GConfig 보완 — 런타임 중 프로세스 간 빈번한 설정 읽기/쓰기.
+          SmStruct로 타입 안전, SmMutex로 원자적 접근.
+          """
+
+          def __init__(self, name: str, struct_cls, create=True):
+              self._cls = struct_cls
+              self._names = struct_cls._names
+              self._mutex = SmMutex(f'smcfg_{name}')
+              self._shm = SharedMemory(
+                  name=f'smcfg_{name}', create=create,
+                  size=struct_cls._size)
+              self._buf = self._shm.buf
+
+              if create:
+                  # 0으로 초기화
+                  default = struct_cls()
+                  default.pack_into(self._buf, 0)
+
+          # ── 전체 읽기/쓰기 ────────────────────────────
+          def read(self):
+              """전체 설정 스냅샷 (원자적)"""
+              with self._mutex:
+                  return self._cls.unpack_from(self._buf, 0)
+
+          def write(self, config):
+              """전체 설정 갱신 (원자적)"""
+              with self._mutex:
+                  config.pack_into(self._buf, 0)
+
+          # ── 필드별 접근 (property 동적 생성) ──────────
+          def get(self, field_name):
+              """단일 필드 읽기 (lock 없음 — 단일 값은 원자적)"""
+              idx = self._names.index(field_name)
+              offset = self._cls._struct.offset(idx)  # 필드 offset
+              # 개별 필드 unpack은 SmStruct 확장 필요
+              with self._mutex:
+                  return self._cls.unpack_from(self._buf, 0).__dict__[field_name]
+
+          def set(self, field_name, value):
+              """단일 필드 쓰기 (read-modify-write → lock 필수)"""
+              with self._mutex:
+                  current = self._cls.unpack_from(self._buf, 0)
+                  setattr(current, field_name, value)
+                  current.pack_into(self._buf, 0)
+
+          # ── GConfig 연동 ──────────────────────────────
+          def load_from_gconfig(self, gconfig, mapping: dict):
+              """GConfig에서 초기값 로드
+
+              mapping: {'fps': 'task_config.camera1.fps', ...}
+              """
+              kwargs = {}
+              for field, gpath in mapping.items():
+                  val = gconfig.data_get(gpath)
+                  if val is not None:
+                      kwargs[field] = val
+              config = self._cls(**kwargs)
+              self.write(config)
+
+          def save_to_gconfig(self, gconfig, mapping: dict):
+              """SmConfig → GConfig 저장 (영속화)"""
+              current = self.read()
+              for field, gpath in mapping.items():
+                  gconfig.data_set(gpath, getattr(current, field))
+
+          # ── 정리 ──────────────────────────────────────
+          def close(self):
+              self._shm.close()
+
+          def unlink(self):
+              self._shm.unlink()
+
+  3.3 메모리 레이아웃
+  ───────────────────
+
+      SharedMemory: smcfg_cam01
+      ┌────────────────────────────────────────────────┐
+      │ fps(4B) │ exposure(4B) │ trig(1B) │ gain(4B) │ is_connect(1B) │ err(2B) │
+      │  float32 │   int32      │  bool8   │ float32  │    bool8       │ uint16  │
+      └────────────────────────────────────────────────┘
+      ← CameraConfig._size = 16B →
+
+      모든 프로세스가 동일 메모리를 참조.
+      SmMutex('smcfg_cam01')로 동기화.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. 사용법
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  4.1 기본 사용
+  ─────────────
+
+      # ── 메인 프로세스 (create=True) ──
+      cam_cfg = SmConfig('cam01', CameraConfig, create=True)
+      cam_cfg.write(CameraConfig(fps=30.0, exposure=15000, trigger_mode=False))
+
+      # ── 카메라 프로세스 (create=False) ──
+      cam_cfg = SmConfig('cam01', CameraConfig, create=False)
+      cfg = cam_cfg.read()
+      print(cfg.fps)           # 30.0
+      print(cfg.exposure)      # 15000
+
+      # ── UI 프로세스에서 설정 변경 ──
+      cam_cfg.set('exposure', 20000)
+      # → 카메라 프로세스의 다음 read()에서 즉시 반영
+
+  4.2 GConfig 연동
+  ────────────────
+
+      # 시작 시: GConfig → SmConfig
+      gconfig.load("config.json")
+      cam_cfg = SmConfig('cam01', CameraConfig, create=True)
+      cam_cfg.load_from_gconfig(gconfig, {
+          'fps':          'task_config.camera1.fps',
+          'exposure':     'task_config.camera1.exposure',
+          'trigger_mode': 'task_config.camera1.trigger_mode',
+      })
+
+      # 종료 시: SmConfig → GConfig (영속화)
+      cam_cfg.save_to_gconfig(gconfig, {
+          'fps':          'task_config.camera1.fps',
+          'exposure':     'task_config.camera1.exposure',
+      })
+
+  4.3 DEVICE_PROPERTY 연동
+  ─────────────────────────
+
+  현재 DEVICE_PROPERTY는 Task 내부 _cache(dict)에 값을 저장한다.
+  SmConfig와 연동하면 다른 프로세스에서도 직접 접근 가능:
+
+      현재:
+      Process A (카메라)              Process B (UI)
+      _cache["fps"] = 30             target.fps   ← RMI 호출 (왕복 ~0.04ms)
+
+      SmConfig 연동 후:
+      Process A (카메라)              Process B (UI)
+      smconfig.set("fps", 30)        cfg = smconfig.read()
+                                     cfg.fps      ← SM 직접 읽기 (~0.1μs)
+
+  RMI 왕복 없이 설정값을 읽을 수 있다.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. Lock 전략 (핵심 설계)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  SmConfig의 성능은 lock 전략에 의해 결정된다.
+  struct unpack 자체는 ~0.1μs이지만, lock이 지배적 비용이 된다.
+
+  5.1 Lock 전략 비교
+  ──────────────────
+
+  ┌──────────────────┬──────────┬──────────┬────────┬─────────────────────┐
+  │ 전략             │ 읽기     │ 쓰기     │ 안전성 │ 적합 시나리오        │
+  ├──────────────────┼──────────┼──────────┼────────┼─────────────────────┤
+  │ A. SmMutex 전체  │ ~2-4 μs  │ ~2-4 μs  │ 최고   │ 쓰기 빈번, 다중 W   │
+  │ B. Lock-free     │ ~0.1 μs  │ ~0.1 μs  │ 제한적 │ 단일 Writer만        │
+  │ C. SeqLock       │ ~0.3 μs  │ ~2-4 μs  │ 높음   │ 읽기 >> 쓰기 (설정)  │
+  └──────────────────┴──────────┴──────────┴────────┴─────────────────────┘
+
+  5.2 전략 A — SmMutex 전체 Lock (기본)
+  ──────────────────────────────────────
+
+  현재 SmMutex(Win32 Named Mutex) 사용. 읽기/쓰기 모두 lock.
+
+      읽기: WaitForSingleObject → unpack_from → ReleaseMutex
+            ~~~1-2μs~~~~~~~~~~~   ~~~0.1μs~~~   ~~~1μs~~~~~~~
+            총 ~2-4μs (커널 전환 2회)
+
+      쓰기: WaitForSingleObject → pack_into → ReleaseMutex
+            총 ~2-4μs
+
+  장점: 단순, 안전, 다중 Writer 지원, crash 시 abandoned 감지
+  단점: 읽기에도 커널 전환 → 초당 1000회 읽기 시 2-4ms 소모
+  적합: 읽기 빈도 < 1000/sec 이거나, 다중 Writer가 필요한 경우
+
+  5.3 전략 B — Lock-free 읽기 (단일 Writer 전용)
+  ───────────────────────────────────────────────
+
+  단일 Writer가 보장되면, Reader는 lock 없이 읽을 수 있다.
+  x86에서 자연 정렬된 4B/8B 쓰기는 원자적이므로, 개별 필드 읽기는 안전.
+
+      읽기: unpack_from(buf)  — lock 없음
+            ~0.1μs
+
+      쓰기: SmMutex lock → pack_into → unlock
+            ~2-4μs (또는 단일 Writer면 lock도 불필요)
+
+  장점: 읽기 최고 속도
+  단점: 복합 필드 읽기 시 tearing 가능
+        (fps를 읽는 도중 Writer가 fps+exposure를 동시에 변경 →
+         새 fps + 옛 exposure 조합이 보일 수 있음)
+  적합: 개별 필드 읽기만 필요하고, 필드 간 일관성이 불필요한 경우
+
+  5.4 전략 C — SeqLock (★ 권장)
+  ─────────────────────────────
+
+  읽기 빈번, 쓰기 드문 설정 공유에 최적인 SeqLock.
+  Writer만 lock을 잡고, Reader는 sequence number로 tearing을 감지한다.
+
+  메모리 레이아웃:
+
+      SharedMemory: smcfg_cam01
+      ┌──────────────────────────────────────────────────────┐
+      │ seq(4B) │ fps(4B) │ exp(4B) │ trig(1B) │ ...        │
+      │ uint32  │ struct payload                              │
+      └──────────────────────────────────────────────────────┘
+
+  Writer 흐름:
+
+      def write(self, config):
+          with self._mutex:                  # 다중 Writer 보호
+              seq = self._read_seq()
+              self._write_seq(seq + 1)       # 홀수 → 쓰기 중 표시
+              config.pack_into(self._buf, 4) # payload 쓰기
+              self._write_seq(seq + 2)       # 짝수 → 쓰기 완료
+
+  Reader 흐름 (lock 없음):
+
+      def read(self):
+          while True:
+              seq1 = self._read_seq()
+              if seq1 & 1:                   # 홀수 = Writer 쓰기 중
+                  continue                   # 재시도 (spin)
+              data = self._cls.unpack_from(self._buf, 4)
+              seq2 = self._read_seq()
+              if seq1 == seq2:               # tearing 없음 확인
+                  return data
+              # seq 변경됨 → 읽기 중에 Writer가 썼음 → 재시도
+
+  비용:
+
+      읽기: seq 읽기(0.05μs) + unpack(0.1μs) + seq 읽기(0.05μs)
+            = ~0.2-0.3μs  (lock 없음, 커널 전환 0회)
+            쓰기 경합 시 재시도 1-2회 (설정 변경은 드물므로 거의 발생 안 함)
+
+      쓰기: SmMutex(2-4μs) + seq 2회 + pack(0.1μs)
+            = ~3-5μs  (다중 Writer 안전)
+
+  5.5 SeqLock 구현 상세
+  ─────────────────────
+
+      import struct as _struct
+
+      _SEQ_FMT = _struct.Struct('<I')  # uint32 sequence counter
+      _SEQ_SIZE = _SEQ_FMT.size       # 4B
+
+      class SmConfig:
+          def __init__(self, name, struct_cls, create=True):
+              self._cls = struct_cls
+              total_size = _SEQ_SIZE + struct_cls._size
+              self._mutex = SmMutex(f'smcfg_{name}')
+              self._shm = SharedMemory(
+                  name=f'smcfg_{name}', create=create, size=total_size)
+              self._buf = self._shm.buf
+              if create:
+                  _SEQ_FMT.pack_into(self._buf, 0, 0)   # seq = 0
+                  struct_cls().pack_into(self._buf, _SEQ_SIZE)
+
+          def _read_seq(self):
+              return _SEQ_FMT.unpack_from(self._buf, 0)[0]
+
+          def _write_seq(self, val):
+              _SEQ_FMT.pack_into(self._buf, 0, val)
+
+          # ── SeqLock 읽기 (lock 없음) ────────────────
+          def read(self):
+              """설정 읽기 — lock-free, ~0.2-0.3μs"""
+              while True:
+                  seq1 = self._read_seq()
+                  if seq1 & 1:
+                      continue               # Writer 쓰기 중
+                  data = self._cls.unpack_from(self._buf, _SEQ_SIZE)
+                  seq2 = self._read_seq()
+                  if seq1 == seq2:
+                      return data             # 일관된 스냅샷
+                  # tearing → 재시도 (설정 변경은 드물어 거의 1회에 성공)
+
+          # ── SeqLock 쓰기 (Mutex lock) ───────────────
+          def write(self, config):
+              """설정 쓰기 — SmMutex, ~3-5μs"""
+              with self._mutex:
+                  seq = self._read_seq()
+                  self._write_seq(seq + 1)       # 홀수 (쓰기 시작)
+                  config.pack_into(self._buf, _SEQ_SIZE)
+                  self._write_seq(seq + 2)       # 짝수 (쓰기 완료)
+
+          def set(self, field_name, value):
+              """단일 필드 변경 — read-modify-write"""
+              with self._mutex:
+                  seq = self._read_seq()
+                  self._write_seq(seq + 1)
+                  current = self._cls.unpack_from(self._buf, _SEQ_SIZE)
+                  setattr(current, field_name, value)
+                  current.pack_into(self._buf, _SEQ_SIZE)
+                  self._write_seq(seq + 2)
+
+  5.6 전략 선택 가이드
+  ────────────────────
+
+      읽기/쓰기 빈도 비율에 따라 선택:
+
+      읽기 : 쓰기 = 1000 : 1  →  SeqLock (전략 C) ★
+      읽기 : 쓰기 = 10 : 1    →  SmMutex (전략 A) 도 충분
+      다중 Writer 없음         →  Lock-free (전략 B) 가능
+
+      ALASKA 설정 시나리오:
+      - 카메라 fps/exposure → 프레임당 읽기(1000/sec), UI 변경(1/sec)
+      - 읽기:쓰기 = 1000:1 → SeqLock 최적
+
+  5.7 Lock 안전성 요약
+  ────────────────────
+
+  ┌─────────────────────┬───────────┬───────────┬───────────┐
+  │ 위험 요소           │ SmMutex   │ Lock-free │ SeqLock   │
+  ├─────────────────────┼───────────┼───────────┼───────────┤
+  │ tearing (부분 읽기) │ ✗ 불가    │ 가능      │ ✗ 감지    │
+  │ 다중 Writer 충돌    │ ✗ Mutex   │ 불안전    │ ✗ Mutex   │
+  │ Writer crash        │ abandoned │ 무영향    │ 홀수 seq  │
+  │                     │ 감지      │           │ → 재시도  │
+  │ Reader starvation   │ 가능      │ ✗ 없음   │ ✗ 없음    │
+  │ priority inversion  │ 가능      │ ✗ 없음   │ Writer만  │
+  └─────────────────────┴───────────┴───────────┴───────────┘
+
+  SeqLock의 Writer crash 대응:
+  - crash 시 seq가 홀수로 남음 → Reader가 무한 spin
+  - 완화: Reader에 max_retry 또는 timeout 추가
+
+      def read(self, max_spin=10000):
+          for _ in range(max_spin):
+              seq1 = self._read_seq()
+              if seq1 & 1:
+                  continue
+              data = self._cls.unpack_from(self._buf, _SEQ_SIZE)
+              if seq1 == self._read_seq():
+                  return data
+          raise TimeoutError("SmConfig read timeout — Writer may have crashed")
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. 속도 비교 (Lock 비용 포함, 수정)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌────────────────────┬──────────────┬──────────────┬──────────────────────┐
+  │ 연산               │ GConfig      │ RMI 변수읽기 │ SmConfig             │
+  │                    │              │              │ (Mutex / SeqLock)    │
+  ├────────────────────┼──────────────┼──────────────┼──────────────────────┤
+  │ 읽기 (캐시 hit)    │ ~1 μs        │ —            │ 2-4μs / 0.3μs       │
+  │ 읽기 (캐시 miss)   │ ~500 μs      │ —            │ 2-4μs / 0.3μs       │
+  │ 읽기 (cross-proc)  │ ~500 μs      │ ~40 μs       │ 2-4μs / 0.3μs       │
+  │ 쓰기               │ ~1-5 ms      │ ~40 μs       │ 2-4μs / 3-5μs       │
+  │ 전파 지연          │ 폴링 의존    │ 즉시         │ 즉시                 │
+  │ 타입 안전          │ ✗            │ ✗            │ ✓                    │
+  │ 파일 I/O           │ 매번 가능    │ 0            │ 0                    │
+  └────────────────────┴──────────────┴──────────────┴──────────────────────┘
+
+  SeqLock 적용 시:
+  - 읽기: GConfig miss 대비 ~1600x, RMI 대비 ~130x 빠름
+  - 쓰기: GConfig 대비 ~200-1000x 빠름
+  - Lock 오버헤드 없이 다수 Reader가 동시 접근 가능
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. 필요성 판단
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  6.1 필요한 경우
+  ───────────────
+
+  ① 여러 프로세스가 같은 설정을 빈번히 읽는 경우
+     예: 카메라 프레임 콜백에서 trigger_mode 확인 (초당 1000회)
+
+  ② 설정 변경이 즉시 다른 프로세스에 반영되어야 하는 경우
+     예: UI에서 exposure 변경 → 카메라가 다음 프레임부터 적용
+
+  ③ RMI 왕복 없이 다른 프로세스의 상태를 읽고 싶은 경우
+     예: 모니터가 모든 카메라의 fps, error_code를 폴링
+
+  6.2 불필요한 경우
+  ─────────────────
+
+  ① 시작 시 한 번 읽고 거의 변경하지 않는 설정
+     → GConfig 캐시로 충분 (mtime 체크 비용 무시 가능)
+
+  ② 계층적, 가변 길이 설정 (JSON 트리 구조)
+     → SmStruct는 고정 필드만 지원, GConfig이 적합
+
+  ③ 사람이 수동으로 편집해야 하는 설정
+     → 바이너리 SM은 직접 편집 불가, JSON이 적합
+
+  6.3 결론
+  ────────
+
+  SmConfig는 "런타임 고빈도 설정 공유"라는 특정 시나리오에서 가치가 있다.
+  GConfig를 대체하는 것이 아니라, §3075 SharedPool의 설정 특화 버전이다.
+
+      GConfig  → 시작/종료 설정 (파일 영속)
+      SmConfig → 런타임 설정 공유 (SM 고속)
+      둘은 load_from_gconfig / save_to_gconfig 로 연결
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. 흐름 요약
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+      ┌─ 시작 ──────────────────────────────────────────────────┐
+      │  config.json ──(GConfig.load)──→ GConfig._cache (dict)  │
+      │                                      │                  │
+      │                            load_from_gconfig()          │
+      │                                      ▼                  │
+      │                                 SmConfig (SM)           │
+      └─────────────────────────────────────────────────────────┘
+                              │
+      ┌─ 런타임 ────────────────────────────────────────────────┐
+      │  카메라 Task:  cfg = smconfig.read()    ← 0.1μs        │
+      │  UI Task:      smconfig.set('fps', 60)  ← 0.5μs        │
+      │  모니터 Task:  cfg = smconfig.read()    ← 0.1μs        │
+      │                                                          │
+      │  파일 I/O = 0, RMI 호출 = 0                              │
+      └─────────────────────────────────────────────────────────┘
+                              │
+      ┌─ 종료 ──────────────────────────────────────────────────┐
+      │  SmConfig ──(save_to_gconfig)──→ config.json (영속화)   │
+      │  SmConfig.unlink()                                       │
+      └─────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. config.changed 시그널
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  8.1 문제: SeqLock만으로는 변경 시점을 모른다
+  ─────────────────────────────────────────────
+
+  SeqLock은 "읽을 때 일관성 보장"이지, "언제 바뀌었는지 알림"은 아니다.
+
+      카메라 Task:
+          while running:
+              cfg = smconfig.read()     # 매 프레임 폴링 (1000/sec)
+              if cfg.fps != last_fps:   # 직접 비교해야 변경 감지
+                  apply_fps(cfg.fps)
+
+  문제:
+  - 변경이 없어도 매 프레임 read() 호출 → 불필요한 0.3μs × 1000 = 300μs/sec
+  - 변경 빈도가 1/sec 미만이면 999회는 낭비
+  - 대기 모드 Task는 폴링 루프가 CPU 소모
+
+  8.2 해결: SmKernelEvent 결합
+  ────────────────────────────
+
+  SmConfig.write()/set() 시 SmKernelEvent를 set → Reader는 CPU 0% 대기.
+  SmKernelEvent는 sm_infra 동일 레이어이므로 의존성 문제 없음.
+
+      Writer                    SmKernelEvent              Reader
+      ──────                    ─────────────              ──────
+      smconfig.write(cfg)
+        ├ SeqLock write
+        └ event.set() ─────────→ [Signaled] ────────────→ wait() 해제
+                                                           cfg = smconfig.read()
+                                                           (SeqLock lock-free)
+
+  8.3 구현 — SmConfig + config.changed
+  ─────────────────────────────────────
+
+      class SmConfig:
+          def __init__(self, name, struct_cls, create=True):
+              # ... 기존 SeqLock 초기화 ...
+              self._changed = SmKernelEvent(
+                  f'smcfg_{name}_chg',
+                  create=create,
+                  manual_reset=True,   # 다중 Reader 동시 깨움
+                  initial=False
+              )
+
+          # ── 쓰기 (SeqLock + 알림) ──────────────────
+          def write(self, config):
+              """설정 쓰기 + 변경 알림"""
+              with self._mutex:
+                  seq = self._read_seq()
+                  self._write_seq(seq + 1)
+                  config.pack_into(self._buf, _SEQ_SIZE)
+                  self._write_seq(seq + 2)
+              self._changed.set()           # ★ 모든 대기자 깨움
+
+          def set(self, field_name, value):
+              """단일 필드 변경 + 알림"""
+              with self._mutex:
+                  seq = self._read_seq()
+                  self._write_seq(seq + 1)
+                  current = self._cls.unpack_from(self._buf, _SEQ_SIZE)
+                  setattr(current, field_name, value)
+                  current.pack_into(self._buf, _SEQ_SIZE)
+                  self._write_seq(seq + 2)
+              self._changed.set()           # ★ 알림
+
+          # ── 변경 대기 (CPU 0%) ─────────────────────
+          def wait_changed(self, timeout=None):
+              """설정 변경까지 커널 대기 (CPU 0%)
+
+              Returns:
+                  bool: 변경 발생 True, 타임아웃 False
+              """
+              return self._changed.wait(timeout=timeout)
+
+          def read_changed(self, timeout=None):
+              """변경 대기 + 읽기 (편의 메서드)
+
+              Returns:
+                  (data, changed): data는 현재 설정, changed는 변경 여부
+              """
+              changed = self._changed.wait(timeout=timeout)
+              if changed:
+                  self._changed.clear()     # 이벤트 소비
+              return self.read(), changed
+
+          # ── 변경 여부 즉시 확인 (non-blocking) ─────
+          def has_changed(self):
+              """변경 발생 여부 즉시 확인 (CPU 0%)"""
+              return self._changed.is_set()
+
+          def acknowledge(self):
+              """변경 이벤트 소비 (clear)"""
+              self._changed.clear()
+
+  8.4 다중 Reader 패턴
+  ─────────────────────
+
+  manual_reset=True이므로 event.set() 시 모든 대기 Reader가 동시에 깨어남.
+
+  패턴 A — 단일 Consumer (1:1):
+
+      # Reader 1개만 이벤트를 소비
+      cfg, changed = smconfig.read_changed(timeout=1.0)
+      if changed:
+          apply_config(cfg)
+      # → 다음 write()까지 다시 대기
+
+  패턴 B — 다중 Observer (1:N):
+
+      여러 Reader가 동일 변경을 관찰해야 할 때:
+      각 Reader가 자신의 last_seq를 추적한다.
+
+      class ConfigObserver:
+          """개별 Reader의 변경 추적기"""
+          def __init__(self, smconfig):
+              self._cfg = smconfig
+              self._last_seq = 0         # 마지막으로 읽은 seq
+
+          def wait_update(self, timeout=None):
+              """새 변경이 있을 때까지 대기"""
+              while True:
+                  self._cfg.wait_changed(timeout=timeout)
+                  current_seq = self._cfg._read_seq()
+                  if current_seq != self._last_seq:
+                      data = self._cfg.read()
+                      self._last_seq = current_seq
+                      return data
+                  # 이미 소비한 변경 → 다시 대기
+              return None
+
+      사용:
+          observer_cam = ConfigObserver(smconfig)
+          observer_mon = ConfigObserver(smconfig)
+
+          # 카메라 Task
+          cfg = observer_cam.wait_update(timeout=5.0)
+
+          # 모니터 Task (독립적으로 동일 변경 수신)
+          cfg = observer_mon.wait_update(timeout=5.0)
+
+  패턴 C — 프레임 루프 혼합 (가장 일반적):
+
+      프레임 처리 중에는 read()로 최신값 사용,
+      유휴 시에만 wait_changed()로 대기:
+
+      # 카메라 Task
+      while running:
+          frame = grab_frame()
+
+          if smconfig.has_changed():         # non-blocking 확인
+              cfg = smconfig.read()
+              smconfig.acknowledge()
+              apply_new_config(cfg)
+
+          process_frame(frame, cfg)
+
+  8.5 이벤트 라이프사이클
+  ───────────────────────
+
+      Writer                    Event 상태            Reader(s)
+      ──────                    ──────────            ─────────
+                                [Non-signaled]        wait() 대기 중 (CPU 0%)
+      write(cfg)
+        ├ SeqLock write
+        └ event.set() ────────→ [Signaled] ──────→   wait() 반환 = True
+                                                      read() → 새 설정
+                                                      acknowledge()
+                                [Non-signaled]        wait() 대기 중 ...
+      set('fps', 60)
+        ├ SeqLock write
+        └ event.set() ────────→ [Signaled] ──────→   wait() 반환 = True
+                                                      ...
+
+  주의: Reader가 acknowledge() 전에 Writer가 또 write() 하면?
+  → 이벤트가 이미 Signaled이므로 set()은 무해 (중복 set 안전)
+  → Reader는 read()로 최신 스냅샷만 받음 (중간 값 건너뜀 가능)
+  → 설정 특성상 "최신값만 중요"하므로 문제 없음
+
+  8.6 ALASKA 시그널 시스템 연동 (선택)
+  ─────────────────────────────────────
+
+  SmKernelEvent는 "무언가 바뀜"만 알린다. 무엇이 바뀌었는지 알려면
+  ALASKA 시그널 시스템(SignalBroker)과 연동할 수 있다:
+
+      # Task 코드에서 (application layer)
+      smconfig.set('fps', 60)
+      signal.emit('config.changed', data={'field': 'fps', 'value': 60})
+
+  두 계층 분리:
+  ┌────────────────┬───────────────────────┬────────────────────────────┐
+  │ 계층            │ 메커니즘              │ 용도                       │
+  ├────────────────┼───────────────────────┼────────────────────────────┤
+  │ Infrastructure │ SmKernelEvent         │ "바뀜" 즉시 감지 (0μs CPU)│
+  │ (SmConfig 내장)│ (wait_changed)        │ 타입, 메타데이터 없음      │
+  ├────────────────┼───────────────────────┼────────────────────────────┤
+  │ Application    │ SignalBroker.emit()   │ "fps=60으로 바뀜" 알림     │
+  │ (Task 코드)    │ ("config.changed")    │ data 포함, QoS 지원       │
+  └────────────────┴───────────────────────┴────────────────────────────┘
+
+  일반적으로 SmKernelEvent(Infrastructure)만으로 충분하다.
+  변경 내역 추적이 필요한 경우에만 Application 레벨 시그널을 추가한다.
+
+  8.7 속도 비교 (알림 포함)
+  ─────────────────────────
+
+  ┌──────────────────────┬──────────┬──────────────────────────────────┐
+  │ 방식                 │ 감지 지연│ CPU (대기 중)                     │
+  ├──────────────────────┼──────────┼──────────────────────────────────┤
+  │ GConfig mtime 폴링   │ ~500 μs  │ data_get 호출 시에만 확인        │
+  │ SmConfig 폴링 (read) │ ~0.3 μs  │ 루프 필요 (sleep 0 → 0.1% CPU)  │
+  │ SmConfig + KernelEvt │ ~20-50μs │ 0% (커널 대기)              ★    │
+  │ ALASKA 시그널        │ ~80 μs   │ 0% (커널 대기, 큐 경유)          │
+  └──────────────────────┴──────────┴──────────────────────────────────┘
+
+  SmKernelEvent는 ~20-50μs 반응으로 설정 변경 감지에 충분하며,
+  CPU 점유율 0%이므로 장기 대기에 최적이다.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. DEVICE_PROPERTY _cache 역할과 SmConfig 연동
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  9.1 DEVICE_PROPERTY _cache 현재 구조
+  ─────────────────────────────────────
+
+  DEVICE_PROPERTY는 descriptor 기반으로 동작한다:
+
+      @task(DEVICE_PROPERTY={
+          "fps:float=900.0":    {"setter": "_hw_set_fps"},
+          "exposure:int=15000": {"setter": "_hw_set_exposure"},
+          "is_connect:bool=false": {},
+          "@resync": { "order": ["trigger_mode", "fps", "exposure"], ... }
+      })
+      class CamDriver: ...
+
+  내부 저장소:
+
+      instance._cache = {}          # 프로세스 로컬 Python dict
+                                     # _device_init()에서 생성
+
+  __set__ 흐름 (7단계 파이프라인):
+
+      self.fps = 30.0
+        ① readonly 검사
+        ② dtype 변환 (float)
+        ③ validator 실행
+        ④ change detection (같은 값 → 무시)
+        ⑤ _cache["fps"] = 30.0          ← 캐시 갱신 (먼저)
+        ⑥ signal emit (notify_mode="immediate" 시)
+        ⑦ _apply_hw → _hw_set_fps(30.0)  ← HW 쓰기 (나중)
+        ⑧ @resync 트리거 확인
+
+  __get__ 흐름:
+
+      val = self.fps
+        → getter 있으면: HW 읽기 → _cache 갱신 → 반환
+        → getter 없으면: _cache.get("fps", 900.0) 반환
+
+  9.2 _cache의 한계: 프로세스 로컬
+  ─────────────────────────────────
+
+  _cache는 해당 Task 프로세스의 메모리에만 존재한다.
+  다른 프로세스에서 접근하려면 RMI 왕복이 필수:
+
+      Process A (카메라)                Process B (모니터)
+      ─────────────────                ──────────────────
+      _cache["fps"] = 30.0            cam.fps
+                                        │
+                                        ├─ RmiClient.__getattr__
+                                        ├─ _call('__getvar__', 'fps')
+                                        ├─ SmRingBuffer write → 대기
+                                        ├─ InvokeDispenser 처리
+                                        ├─ getattr(job, 'fps') → _cache 읽기
+                                        ├─ SmRingBuffer 응답 → 반환
+                                        └─ ~40μs 왕복
+
+      cam.exposure = 20000
+        ├─ RmiClient.__setattr__
+        ├─ _call('__setvar__', 'exposure', 20000)
+        ├─ SmRingBuffer write → 대기
+        ├─ InvokeDispenser → DeviceProperty.__set__
+        ├─ _cache 갱신 + HW 쓰기
+        └─ ~40μs 왕복
+
+  문제점:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  1. 읽기마다 RMI 왕복 ~40μs (모니터가 5개 속성 폴링 = 200μs)  │
+  │  2. InvokeDispenser 점유 → 다른 RMI/Signal 처리 지연           │
+  │  3. 모니터 Task가 N개 카메라 × M개 속성 = N×M회 RMI 호출       │
+  └─────────────────────────────────────────────────────────────────┘
+
+  9.3 SmConfig 연동: _cache → SM 미러링
+  ──────────────────────────────────────
+
+  DEVICE_PROPERTY의 _cache 변경을 SmConfig에 동시 기록하면,
+  다른 프로세스가 RMI 없이 SM 직접 읽기로 속성값에 접근할 수 있다.
+
+      Process A (카메라)                    Process B (모니터)
+      ─────────────────                    ──────────────────
+      self.fps = 30.0
+        ├ _cache["fps"] = 30.0  (로컬)
+        ├ smconfig.set("fps", 30.0)  (SM)
+        │   ├ SeqLock write
+        │   └ event.set()  ─────────────→  wait_changed() 해제
+        ├ _hw_set_fps(30.0)  (HW)          cfg = smconfig.read()
+        └ 완료                              cfg.fps → 30.0  (~0.3μs)
+
+  속도 비교:
+
+      RMI 경유 읽기:    ~40 μs (왕복)
+      SmConfig 읽기:    ~0.3 μs (SeqLock lock-free)
+      개선:             ~130x 빠름
+
+  9.4 연동 구현 방법
+  ──────────────────
+
+  방법 A — DeviceProperty.__set__에 SmConfig 훅 추가:
+
+      # device_property.py __set__ 확장
+      def __set__(self, instance, value):
+          # ... 기존 ①~⑤ (캐시 갱신) ...
+
+          # ★ SmConfig 미러링 (SM에도 기록)
+          if hasattr(instance, '_smconfig') and instance._smconfig:
+              instance._smconfig.set(self.name, value)
+
+          # ... 기존 ⑥~⑧ (signal, HW, resync) ...
+
+  방법 B — _device_init에서 SmConfig 자동 생성:
+
+      # device_infra.py 확장
+      def _device_init(self):
+          self._cache = {}
+          self._resync_guard = False
+          self._delay_timers = {}
+
+          # ★ DEVICE_PROPERTY → SmStruct 자동 생성
+          if hasattr(type(self), '_dp_cache'):
+              struct_cls = _build_struct_from_dp(type(self))
+              task_name = getattr(self, 'task_name', type(self).__name__)
+              self._smconfig = SmConfig(
+                  f'dp_{task_name}', struct_cls, create=True)
+          else:
+              self._smconfig = None
+
+      def _build_struct_from_dp(cls):
+          """DEVICE_PROPERTY 선언에서 SmStruct 자동 생성"""
+          fields = []
+          for name, prop in cls._dp_cache:
+              typemap = {
+                  float: 'float32', int: 'int32', bool: 'bool8',
+              }
+              sm_type = typemap.get(prop.dtype, 'int32')
+              fields.append((name, sm_type))
+          return type(f'{cls.__name__}Config', (SmStruct,),
+                       {'_fields_': fields})
+
+  방법 C — 명시적 매핑 (유연성 최대):
+
+      # Task 코드에서 직접 선언
+      class CamDriver:
+          DEVICE_PROPERTY = { ... }
+
+          SM_MIRROR = SmConfig('cam01', CameraConfig, create=True)
+          SM_MAPPING = {
+              'fps': 'fps', 'exposure': 'exposure',
+              'is_connect': 'is_connect',
+          }
+
+  권장: 방법 B (자동) + 방법 C (필요 시 커스텀 오버라이드)
+
+  9.5 읽기 전용 SmConfig (다른 프로세스)
+  ──────────────────────────────────────
+
+  카메라 Task만 _cache → SmConfig에 쓴다.
+  다른 프로세스는 SmConfig을 읽기 전용으로 사용한다.
+
+      # 모니터 Task (create=False → 기존 SM 참조)
+      cam_cfg = SmConfig('dp_CamDriver', CameraConfig, create=False)
+
+      # 방법 1: 폴링 (프레임 루프 내)
+      cfg = cam_cfg.read()                    # ~0.3μs
+      print(f"fps={cfg.fps}, exp={cfg.exposure}")
+
+      # 방법 2: 변경 대기 (유휴 시)
+      if cam_cfg.wait_changed(timeout=1.0):   # CPU 0%
+          cfg = cam_cfg.read()
+          cam_cfg.acknowledge()
+          update_dashboard(cfg)
+
+      # 방법 3: 특정 필드만 감시
+      observer = ConfigObserver(cam_cfg)
+      while True:
+          cfg = observer.wait_update(timeout=5.0)
+          if cfg:
+              log(f"Camera state: connect={cfg.is_connect}")
+
+  9.6 쓰기 방향: RMI는 유지
+  ──────────────────────────
+
+  다른 프로세스가 카메라 설정을 변경할 때는 여전히 RMI를 사용한다.
+  SmConfig에 직접 쓰면 HW 연동(@resync, setter)이 동작하지 않기 때문이다.
+
+      ┌───────────────────────────────────────────────────────────────┐
+      │  읽기: SmConfig (SM 직접)     — RMI 불필요, ~0.3μs          │
+      │  쓰기: RMI (__setvar__) 유지  — HW setter + @resync 보장    │
+      └───────────────────────────────────────────────────────────────┘
+
+      모니터 → cam.fps (읽기)  →  SmConfig.read()       ★ 신규 (빠름)
+      UI     → cam.fps = 60   →  RMI __setvar__          기존 유지
+                                    → __set__ 실행
+                                    → _cache + SmConfig + HW
+
+  이 비대칭 구조가 핵심:
+  - 읽기는 SM으로 가속 (빈번, 무해)
+  - 쓰기는 RMI로 보호 (HW 연동 + validation + @resync 필요)
+
+  9.7 데이터 흐름 전체도
+  ──────────────────────
+
+      ┌─────────────────────────────────────────────────────────────────┐
+      │  카메라 Task (Process A)                                        │
+      │                                                                  │
+      │   self.fps = 30.0                                               │
+      │     │                                                            │
+      │     ├─→ _cache["fps"] = 30.0        (프로세스 로컬)             │
+      │     ├─→ smconfig.set("fps", 30.0)   (SharedMemory 미러)        │
+      │     │     ├ SeqLock write                                        │
+      │     │     └ SmKernelEvent.set() ──→ config.changed 알림        │
+      │     └─→ _hw_set_fps(30.0)           (HW 적용)                  │
+      │                                                                  │
+      └────────────────────────────────┬────────────────────────────────┘
+                                       │ SharedMemory
+      ┌────────────────────────────────┴────────────────────────────────┐
+      │  모니터 Task (Process B)         UI Task (Process C)            │
+      │                                                                  │
+      │  cfg = smconfig.read()          smconfig.read()  (읽기: SM)    │
+      │  cfg.fps → 30.0  (~0.3μs)      cam.fps = 60     (쓰기: RMI)   │
+      │                                   └→ RmiClient.__setvar__       │
+      │  wait_changed() → 알림 수신        → InvokeDispenser            │
+      │                                     → __set__ 실행              │
+      │                                     → _cache + SmConfig + HW    │
+      └─────────────────────────────────────────────────────────────────┘
+
+  9.8 _cache와 SmConfig 일관성 보장
+  ──────────────────────────────────
+
+  _cache와 SmConfig은 항상 동일한 __set__ 경로에서 함께 갱신된다.
+
+      __set__ 내부 순서:
+          ⑤ _cache[name] = value          # 로컬 먼저
+          ★ smconfig.set(name, value)      # SM 동기
+          ⑦ _apply_hw(value)              # HW 마지막
+
+  불일치 시나리오 & 대응:
+
+  ┌────────────────────────────┬───────────────────────────────────────┐
+  │ 시나리오                    │ 결과                                 │
+  ├────────────────────────────┼───────────────────────────────────────┤
+  │ _cache 성공, SmConfig 실패 │ 로컬은 최신, SM은 이전 값             │
+  │ (SM 접근 오류)             │ → 외부 Reader는 잠시 stale (안전)     │
+  │                            │ → 다음 __set__에서 자동 복구           │
+  ├────────────────────────────┼───────────────────────────────────────┤
+  │ SmConfig 성공, HW 실패     │ SM은 최신, HW는 이전 상태             │
+  │                            │ → @resync가 재연결 시 HW 재적용       │
+  │                            │ → SM 값이 "의도"이므로 올바른 동작    │
+  ├────────────────────────────┼───────────────────────────────────────┤
+  │ 카메라 Task crash          │ SM 존재하나 갱신 중단                 │
+  │                            │ → Reader의 wait_changed() 타임아웃    │
+  │                            │ → SeqLock 홀수 감지 → TimeoutError    │
+  └────────────────────────────┴───────────────────────────────────────┘
+
+  핵심 원칙:
+  - _cache = 로컬 truth (HW 연동의 기준)
+  - SmConfig = 외부 공유용 미러 (읽기 전용 snapshot)
+  - 불일치 시 _cache가 master, SmConfig은 eventual consistency
+
+  9.9 task_context로서의 SmConfig
+  ───────────────────────────────
+
+  SmConfig + DEVICE_PROPERTY 연동의 본질적 의미는
+  각 Task가 자신의 런타임 상태를 **task_context**로 발행(publish)하는 것이다.
+
+  현재 ALASKA의 Task 상태 접근 모델:
+
+      ┌──────────────────────────────────────────────────────┐
+      │  Task A의 상태를 알고 싶은 Task B                     │
+      │                                                       │
+      │  현재: cam.fps              → RMI 호출 (요청-응답)    │
+      │        cam.is_connect       → RMI 호출                │
+      │        cam.exposure         → RMI 호출                │
+      │        (N개 속성 = N번 왕복, 동기 블로킹)              │
+      │                                                       │
+      │  task_context: ctx = cam_ctx.read()  → SM 1회 읽기    │
+      │        ctx.fps, ctx.is_connect, ctx.exposure           │
+      │        (전체 스냅샷, 비동기, lock-free)                │
+      └──────────────────────────────────────────────────────┘
+
+  task_context의 의미:
+
+  ① 상태 발행 (Publish)
+     Task가 자신의 DEVICE_PROPERTY를 SM에 구조화된 형태로 공개한다.
+     마치 센서가 데이터를 publish하듯, Task가 자신의 상태를 publish한다.
+
+  ② 관찰자 패턴 (Observer)
+     다른 Task는 RMI로 "물어보는" 것이 아니라,
+     task_context를 "관찰"하여 상태 변화를 감지한다.
+     관찰은 읽기 전용이므로 대상 Task에 부하를 주지 않는다.
+
+  ③ 원자적 스냅샷 (Atomic Snapshot)
+     RMI로 N개 속성을 개별 호출하면, 첫 번째와 마지막 속성 사이에
+     값이 변할 수 있다 (비일관 읽기). task_context는 SeqLock으로
+     전체 구조체를 원자적으로 읽어 시점 일관성을 보장한다.
+
+  ④ Task 간 결합도 감소 (Decoupling)
+     현재: Task B가 Task A의 메서드명(fps, exposure)을 알아야 한다.
+     task_context: Task B는 구조체 스키마만 알면 된다.
+     Task A의 내부 구현 변경이 Task B에 영향을 주지 않는다.
+
+  비유:
+
+      RMI 모델     = 전화로 하나씩 물어보기 (동기, 상대방 시간 소모)
+      task_context = 게시판에 상태를 써두기  (비동기, 읽는 쪽 자유)
+
+  네이밍 제안:
+
+      # Task 선언에서 context 이름 지정
+      @task(
+          DEVICE_PROPERTY = { ... },
+          TASK_CONTEXT = "cam01"          # ★ SmConfig 이름 자동 생성
+      )
+      class CamDriver: ...
+
+      # 다른 Task에서 접근
+      cam_ctx = TaskContext('cam01', CameraConfig)   # SmConfig 래퍼
+      cfg = cam_ctx.read()
+      cfg.fps  # 30.0
+
+  또는 TaskManager에서 자동 등록:
+
+      # TaskManager.start_all() 내부
+      for task in tasks:
+          if task.DEVICE_PROPERTY:
+              struct_cls = auto_build_struct(task.DEVICE_PROPERTY)
+              ctx = SmConfig(f'ctx_{task.name}', struct_cls, create=True)
+              task._context = ctx
+              self._contexts[task.name] = ctx     # 전역 레지스트리
+
+      # 다른 Task에서
+      cam_ctx = manager.get_context('cam_driver')
+      cfg = cam_ctx.read()
+
+  task_context 계층 요약:
+
+  ┌──────────────────┬──────────────────────────────────────────┐
+  │ 계층             │ 역할                                     │
+  ├──────────────────┼──────────────────────────────────────────┤
+  │ SmStruct         │ 구조체 정의 (필드, 타입, 크기)           │
+  │ SmConfig         │ SM + SeqLock + SmKernelEvent (인프라)    │
+  │ DEVICE_PROPERTY  │ __set__ 시 SmConfig 자동 미러링 (연동)   │
+  │ task_context     │ Task 상태 발행/관찰 (의미적 개념)        │
+  └──────────────────┴──────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. §3075 SharedPool과의 관계
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  SmConfig는 §3075 §6.6 SharedPool의 설정 특화 래퍼이다.
+
+  ┌─────────────┬─────────────────────┬──────────────────────────┐
+  │ 컴포넌트     │ 역할                │ 기반                     │
+  ├─────────────┼─────────────────────┼──────────────────────────┤
+  │ SmStruct    │ 구조체 정의         │ struct 모듈              │
+  │ SharedPool  │ 범용 SM 상태 공유   │ SmStruct + SmMutex + SM  │
+  │ SmConfig    │ 설정 특화 공유      │ SharedPool + SeqLock     │
+  │             │                     │ + GConfig/DEVICE_PROPERTY│
+  │ SmRingPool  │ 스트림 전달         │ SmStruct + SM + SPSC     │
+  └─────────────┴─────────────────────┴──────────────────────────┘
+
+  SmConfig은 별도 클래스로 만들 수도 있고,
+  SharedPool에 GConfig 연동 메서드만 추가하는 것도 방법이다.
+  구현 복잡도를 고려하면 후자가 간결하다.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  11. 참고 문서
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - gconfig.py, _config_infra.py       — 현재 GConfig 구현
+  - device_property.py, device_infra.py — DEVICE_PROPERTY descriptor + _cache
+  - 3075____SmStruct_메모리관리.txt §6.6 — SharedPool 설계
+  - 4500____SmInfra설계.txt            — SmMutex, SharedMemory 기반
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  END OF DOCUMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

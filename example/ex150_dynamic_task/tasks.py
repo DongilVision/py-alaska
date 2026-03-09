@@ -6,11 +6,13 @@
 """
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal, on
 
 
 @task(name="ManagerTask", mode="thread", restart=False)
 class ManagerTask:
     """정적 Task - 시스템 상태 모니터 역할"""
+    notify = TSignal(name="notify")
 
     def __init__(self):
         self.runtime = None
@@ -18,12 +20,15 @@ class ManagerTask:
     def ping(self) -> str:
         return "manager_pong"
 
+    def send_notify(self, data):
+        self.notify.emit(data)
+
     def run(self):
         while self.runtime.running:
             time.sleep(0.1)
 
 
-@task(name="WorkerTask", mode="thread", restart=False, signal_subscribe=["notify"])
+@task(name="WorkerTask", mode="thread", restart=False)
 class WorkerTask:
     """동적 생성 대상 Task"""
 
@@ -42,6 +47,7 @@ class WorkerTask:
     def get_counter(self) -> int:
         return self.counter
 
+    @on(ManagerTask.notify)
     def on_notify(self, sig):
         print(f"[{self.runtime.name}] signal received: {sig.data}")
 

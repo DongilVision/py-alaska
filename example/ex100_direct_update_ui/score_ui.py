@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from py_alaska import task
 from py_alaska import ui_thread
+from py_alaska.core.task_signal_decl import on
 
 
 @task(debug="signal")
@@ -41,6 +42,7 @@ class ScoreTask(QWidget):
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
 
+    @on("score.update")
     @ui_thread
     def on_score_update(self, signal):
         d = signal.data

@@ -3,11 +3,14 @@
 import random
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal, on
 
 
 @task(name="SensorTask", mode="process")
 class SensorTask:
     """센서 데이터 생성, 임계값 초과 시 alert 발행"""
+
+    sensor_alert = TSignal(dict, name="sensor.alert")
 
     def __init__(self):
         self.value = 25.0
@@ -17,7 +20,7 @@ class SensorTask:
         while self.running:
             self.value = round(random.uniform(20, 45), 1)
             if self.value > self.threshold:
-                self.signal.sensor.alert.emit({
+                self.sensor_alert.emit({
                     "value": self.value,
                     "threshold": self.threshold,
                 })
@@ -44,6 +47,7 @@ class DashboardTask:
         while self.running:
             time.sleep(0.1)
 
+    @on("sensor.alert")
     def on_sensor_alert(self, signal):
         """자동 구독: sensor.alert"""
         self.alert_count += 1

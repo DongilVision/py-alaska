@@ -1,0 +1,579 @@
+============================================================================
+  ALASKA v2.7 - TSignal 설계 (선언형 Signal 변수)
+  Date: 2026-03-08
+============================================================================
+
+
+1. 동기 (Motivation)
+----------------------------------------------------------------------------
+
+1.1 핵심 문제: "이 Task가 어떤 시그널을 emit하는가?"
+
+    현재 문자열 기반 Signal은 클래스 전체를 읽어야 emit 목록을 알 수 있다:
+
+        @task()
+        class Camera:
+            def run(self):
+                frame = self.capture()
+                self.signal.emit("frame.raw", frame, qos="REALTIME")  # <- 여기
+                if self.connected:
+                    self.signal.emit("camera.connected", True)        # <- 여기도
+
+            def _on_error(self, err):
+                self.signal.emit("camera.error", str(err))            # <- 여기도
+
+            def stop(self):
+                self.signal.emit("camera.disconnected")               # <- 여기도
+
+    -> 메서드 4개를 전부 읽어야 시그널 4개를 발견할 수 있다.
+    -> 프로젝트 규모가 커지면 "이 시그널을 누가 보내는가?" 추적이 불가능하다.
+
+    TSignal 도입 후, 클래스 상단만 보면 즉시 알 수 있다:
+
+        @task()
+        class Camera:
+            frame_raw           = TSignal(np.ndarray, qos="REALTIME")
+            camera_connected    = TSignal(bool)
+            camera_error        = TSignal(str)
+            camera_disconnected = TSignal()
+
+            # 클래스 정의 4줄만으로 "Camera가 emit하는 모든 시그널" 파악 완료
+
+1.2 추가 문제점
+
+    문제:
+    (1) 시그널 목록 불명: 클래스 전체를 읽어야 emit하는 시그널을 알 수 있음
+    (2) 오타 위험: "sensor.temp" vs "sensor.tepm" -> 런타임 무응답, 에러 없음
+    (3) IDE 지원 부재: 자동완성, 타입힌트, 리팩토링 불가
+    (4) 선언-사용 분리: emit 측과 subscribe 측이 문자열로만 연결
+    (5) 타입 정보 없음: emit 데이터의 타입이 암묵적
+    (6) 추적 불가: "이 시그널을 누가 emit하는가?" -> 프로젝트 전체 grep 필요
+
+1.3 목표
+
+    Qt의 Signal 패턴을 차용하여, Signal을 클래스 변수로 선언한다.
+    Legacy 문자열 API는 지원하지 않는다. TSignal 선언만이 유일한 emit 경로이다.
+
+        # Publisher -- 선언 (클래스 상단에 시그널 목록이 모인다)
+        @task()
+        class SensorJob:
+            temp_changed = TSignal(float)
+            alert_raised = TSignal(str, qos="CRITICAL")
+
+            def run(self):
+                self.temp_changed.emit(25.5)
+
+        # Subscriber -- 참조 (IDE에서 선언 위치로 점프 가능)
+        @task()
+        class DisplayJob:
+            @on(SensorJob.temp_changed)
+            def handle_temp(self, signal):
+                print(signal.data)
+
+    장점:
+    (1) 시그널 목록 가시화: 클래스 상단에 TSignal 선언 -> emit 목록 즉시 파악
+    (2) 컴파일 타임 검증: TSignal 속성이 존재하지 않으면 AttributeError
+    (3) IDE 자동완성: SensorJob. -> temp_changed 표시
+    (4) 타입 힌트: TSignal(float) -> emit(data) 타입 추론
+    (5) 코드 네비게이션: "Go to Definition"으로 Signal 선언 위치로 이동
+
+1.4 설계 원칙
+
+    (1) TSignal 선언 = 유일한 emit 경로
+        - self.signal.emit("name", data) 문자열 직접 emit은 제거한다.
+        - 선언되지 않은 시그널은 emit할 수 없다.
+        - 이로써 "클래스 = 시그널 목록" 보장이 깨지지 않는다.
+
+    (2) @rmi_signal 제거 -> @on으로 통합
+        - @rmi_signal("name") 문자열 구독은 제거한다.
+        - @on(SensorJob.temp_changed) TSignal 참조만 허용한다.
+        - 순환 참조 시 문자열 폴백: @on("SensorJob.temp_changed")
+
+    (3) 시스템 시그널은 프레임워크가 TSignal로 선언
+        - "_system.halt", "_rmi.nowait" 등 내부 시그널도 TSignal로 선언한다.
+        - 예: SystemSignals._halt = TSignal(dict, qos="CRITICAL")
+
+
+2. TSignal 클래스 설계
+----------------------------------------------------------------------------
+
+2.1 TSignal (Signal Descriptor)
+
+    class TSignal:
+        """Task Signal 선언자 -- 클래스 변수로 선언하여 사용
+
+        Args:
+            *types: Signal 데이터 타입 힌트 (문서화 및 검증용)
+            name:   시그널 이름 오버라이드 (생략 시 자동 생성)
+            qos:    기본 QoS 설정 (emit 시 오버라이드 가능)
+
+        Example:
+            class SensorJob:
+                temp_changed = TSignal(float)
+                frame_ready  = TSignal(np.ndarray, qos="REALTIME")
+                alert        = TSignal(str, dict, qos="CRITICAL")
+        """
+
+        def __init__(self, *types, name=None, qos=None):
+            self._types = types
+            self._name_override = name
+            self._default_qos = qos
+            self._attr_name = None      # __set_name__에서 설정
+            self._owner_cls = None      # __set_name__에서 설정
+            self._signal_name = None    # __set_name__에서 설정
+
+        def __set_name__(self, owner, name):
+            """Python descriptor protocol -- 클래스 정의 시 자동 호출"""
+            self._attr_name = name
+            self._owner_cls = owner
+            if self._name_override:
+                self._signal_name = self._name_override
+            else:
+                # 자동 이름 생성: "SensorJob.temp_changed"
+                self._signal_name = f"{owner.__name__}.{name}"
+
+        def __get__(self, obj, objtype=None):
+            if obj is None:
+                return self     # 클래스 레벨 접근 -> TSignal 자체 반환
+            # 인스턴스 레벨 접근 -> BoundTSignal 반환
+            cache_key = f'_tsig_{self._attr_name}'
+            bound = getattr(obj, cache_key, None)
+            if bound is None:
+                bound = BoundTSignal(self, obj)
+                object.__setattr__(obj, cache_key, bound)
+            return bound
+
+2.2 BoundTSignal (인스턴스 바인딩)
+
+    class BoundTSignal:
+        """TSignal의 인스턴스 바인딩 -- emit/on/off 제공"""
+
+        __slots__ = ('_tsignal', '_instance')
+
+        def __init__(self, tsignal, instance):
+            self._tsignal = tsignal
+            self._instance = instance
+
+        def emit(self, data=None, *, qos=None):
+            """Signal 발행"""
+            _qos = qos or self._tsignal._default_qos
+            # instance.signal은 _SignalEmitter -> _client에 접근
+            client = self._instance.signal._client
+            if client:
+                client.emit(self._tsignal._signal_name, data, qos=_qos)
+
+        def emit_batch(self, data_list, *, qos=None):
+            """배치 Signal 발행"""
+            _qos = qos or self._tsignal._default_qos
+            client = self._instance.signal._client
+            if client:
+                client.emit_batch(self._tsignal._signal_name, data_list, qos=_qos)
+
+        def on(self, handler):
+            """핸들러 구독"""
+            client = self._instance.signal._client
+            if client:
+                client.on(self._tsignal._signal_name, handler)
+
+        def off(self, handler=None):
+            """핸들러 구독 해제"""
+            client = self._instance.signal._client
+            if client:
+                client.off(self._tsignal._signal_name, handler)
+
+    BoundTSignal은 기존 SignalClient.emit()을 위임하므로,
+    SmSignalRegistry/SmRingBuffer/QoS 등 모든 인프라가 그대로 동작한다.
+
+2.3 시그널 이름 규칙
+
+    선언                                      자동 생성 이름
+    ----------------------------------------  -------------------------
+    class SensorJob:
+        temp_changed = TSignal(float)         "SensorJob.temp_changed"
+
+    class Camera:
+        frame_ready = TSignal(np.ndarray)     "Camera.frame_ready"
+
+    # 이름 오버라이드 (마이그레이션 기간 한정)
+    class SensorJob:
+        temp = TSignal(float, name="sensor.temp")  "sensor.temp"
+
+    name= 파라미터는 기존 코드 마이그레이션 시에만 사용한다.
+    마이그레이션 완료 후에는 자동 이름만 사용한다.
+
+2.4 _SignalEmitter 변경
+
+    기존 _SignalEmitter는 체인 접근자 역할만 한다.
+    TSignal 도입으로 emit/on/off는 BoundTSignal이 담당하므로,
+    _SignalEmitter의 emit() 메서드는 제거한다.
+
+    변경 전: self.signal.emit("name", data)      -- 문자열 emit (제거)
+             self.signal.sensor.temp.emit(data)  -- 체인 emit (제거)
+    변경 후: self.temp_changed.emit(data)         -- TSignal emit (유일)
+
+    _SignalEmitter에 남는 역할:
+    - self.signal._client 속성 보관 (BoundTSignal이 접근)
+    - 내부 시스템 시그널 전용 emit (프레임워크 내부만)
+
+
+3. 구독 (Subscription) 설계
+----------------------------------------------------------------------------
+
+3.1 @on 데코레이터 (유일한 구독 방법)
+
+    TSignal 참조로 핸들러를 등록한다.
+
+        @task()
+        class DisplayJob:
+            @on(SensorJob.temp_changed)
+            def handle_temp(self, signal):
+                print(f"Temperature: {signal.data}")
+
+    구현:
+
+        def on(tsignal_or_name):
+            """Signal 핸들러 데코레이터 -- TSignal 참조 필수"""
+            def decorator(func):
+                if isinstance(tsignal_or_name, TSignal):
+                    func._signal_handler = tsignal_or_name._signal_name
+                elif isinstance(tsignal_or_name, str):
+                    # 순환 참조 폴백 (문자열)
+                    func._signal_handler = tsignal_or_name
+                elif callable(tsignal_or_name):
+                    # Lazy 참조 (lambda)
+                    func._signal_handler_lazy = tsignal_or_name
+                return func
+            return decorator
+
+    내부적으로 기존 _signal_handler 속성을 설정한다.
+    따라서 TaskRuntime._auto_subscribe_signals()의 변경은 최소화된다.
+
+3.2 @rmi_signal 제거
+
+    @rmi_signal("name") 데코레이터는 제거한다.
+
+    변경 전: @rmi_signal("sensor.temp")
+    변경 후: @on(SensorJob.temp_changed)
+
+    @rmi_signal을 사용한 기존 코드는 모두 @on으로 전환해야 한다.
+
+3.3 signal_subscribe + on_ 메서드 제거
+
+    signal_subscribe 파라미터와 on_ 메서드 자동 매핑도 제거한다.
+
+    변경 전: @task(signal_subscribe=["sensor.temp"])
+             def on_sensor_temp(self, signal): ...
+
+    변경 후: @on(SensorJob.temp_changed)
+             def on_sensor_temp(self, signal): ...
+
+    이유: signal_subscribe는 문자열 기반이므로 TSignal 설계 원칙에 위배된다.
+
+3.4 동적 구독 (런타임)
+
+    런타임에 동적으로 구독/해제할 수 있다.
+
+        def setup(self):
+            # TSignal 참조로 구독
+            self.signal.on(SensorJob.temp_changed, self.handle_temp)
+
+    _SignalEmitter 수정:
+
+        def on(self, tsignal, handler):
+            """Signal 구독 -- TSignal 참조 필수"""
+            if isinstance(tsignal, TSignal):
+                self._client.on(tsignal._signal_name, handler)
+            elif isinstance(tsignal, str):
+                # 순환 참조 폴백
+                self._client.on(tsignal, handler)
+
+3.5 Qt Signal 브리지
+
+    TSignal + @on + @ui_thread 조합으로 Qt Signal 브리지를 대체한다.
+
+        @task()
+        class ViewerUI(QWidget):
+            frame_ready = Signal(object)     # Qt Signal
+
+            @on(Camera.frame_raw)
+            @ui_thread
+            def on_frame_ready(self, signal):
+                self.label.setPixmap(signal.data)
+
+    signal_forward 파라미터도 TSignal 참조로 변경:
+
+        @task(signal_forward={Camera.frame_raw: "frame_ready"})
+        class ViewerUI(QWidget):
+            frame_ready = Signal(object)
+
+
+4. 사용 패턴
+----------------------------------------------------------------------------
+
+4.1 이벤트 통지
+
+    @task()
+    class SensorJob:
+        temp_changed  = TSignal(float, qos="REALTIME")
+        alert_raised  = TSignal(str, qos="CRITICAL")
+
+        def run(self):
+            while self.running:
+                temp = self.read_sensor()
+                self.temp_changed.emit(temp)
+                if temp > 80:
+                    self.alert_raised.emit(f"과열: {temp}degC")
+
+    @task()
+    class DisplayJob:
+        @on(SensorJob.temp_changed)
+        @ui_thread
+        def on_temp(self, signal):
+            self.label.setText(f"{signal.data}degC")
+
+        @on(SensorJob.alert_raised)
+        def on_alert(self, signal):
+            print(f"[ALERT] {signal.data}")
+
+4.2 요청-응답 패턴
+
+    @task()
+    class Controller:
+        analysis_request = TSignal(dict)
+
+        def start_analysis(self):
+            self.analysis_request.emit({"mode": "full"})
+
+        @on(lambda: Analyzer.analysis_done)    # 순환 참조 방지용 lazy
+        def on_result(self, signal):
+            print(f"Result: {signal.data}")
+
+    @task()
+    class Analyzer:
+        analysis_done = TSignal(dict)
+
+        @on(Controller.analysis_request)
+        def on_request(self, signal):
+            result = self._analyze(signal.data)
+            self.analysis_done.emit(result)
+
+4.3 데이터 파이프라인
+
+    @task()
+    class Camera:
+        frame_raw = TSignal(np.ndarray, qos="REALTIME")
+
+    @task()
+    class Preprocessor:
+        frame_processed = TSignal(np.ndarray, qos="REALTIME")
+
+        @on(Camera.frame_raw)
+        def on_frame(self, signal):
+            self.frame_processed.emit(self._preprocess(signal.data))
+
+    @task()
+    class Analyzer:
+        result_ready = TSignal(dict)
+
+        @on(Preprocessor.frame_processed)
+        def on_frame(self, signal):
+            self.result_ready.emit(self._analyze(signal.data))
+
+    @task()
+    class Display:
+        @on(Analyzer.result_ready)
+        @ui_thread
+        def on_result(self, signal):
+            self.show(signal.data)
+
+    파이프라인이 코드에서 직접 보인다:
+    Camera.frame_raw -> Preprocessor.frame_processed -> Analyzer.result_ready -> Display
+
+4.4 브로드캐스트 패턴
+
+    @task()
+    class SystemManager:
+        shutdown  = TSignal(str, qos="CRITICAL")
+        config_changed = TSignal(dict)
+
+        def do_shutdown(self, reason):
+            self.shutdown.emit(reason)
+
+    @task()
+    class WorkerA:
+        @on(SystemManager.shutdown)
+        def on_shutdown(self, signal):
+            self.cleanup()
+
+    @task()
+    class WorkerB:
+        @on(SystemManager.shutdown)
+        def on_shutdown(self, signal):
+            self.save_state()
+
+
+5. 시스템 시그널
+----------------------------------------------------------------------------
+
+5.1 프레임워크 내부 시그널 선언
+
+    프레임워크 내부에서 사용하는 시그널도 TSignal로 선언한다.
+
+        class _SystemSignals:
+            """프레임워크 내부 시그널 -- 사용자 코드에서 직접 사용하지 않음"""
+            halt       = TSignal(dict, name="_system.halt", qos="CRITICAL")
+            rmi_nowait = TSignal(dict, name="_rmi.nowait", qos="LOW")
+            rmi_trace  = TSignal(dict, name="_rmi.trace")
+
+    name= 오버라이드로 기존 내부 시그널 이름을 유지한다.
+    이들은 사용자에게 노출되지 않으며, 프레임워크 내부에서만 사용된다.
+
+5.2 내부 emit 경로
+
+    프레임워크 내부 시그널은 SignalClient.emit()을 직접 호출한다.
+    (BoundTSignal 경유 불필요 -- 프레임워크가 직접 client에 접근)
+
+    예: SignalBroker.report_violation()에서의 _system.halt emit:
+        self.emit(Signal(name='_system.halt', ...))
+        -> SignalClient.emit("_system.halt", ...) 직접 호출 유지
+
+
+6. 구현 계획
+----------------------------------------------------------------------------
+
+6.1 신규 파일
+
+    src/py_alaska/core/task_signal_decl.py
+        - TSignal 클래스
+        - BoundTSignal 클래스
+        - on() 데코레이터
+        - _SystemSignals 클래스
+
+6.2 수정 파일
+
+    src/py_alaska/core/task_decorator.py
+        - @rmi_signal 클래스 제거
+        - signal_subscribe 파라미터 제거
+        - on_ 메서드 자동 감지 제거
+        - @task()에서 TSignal 클래스 변수 자동 감지 (emit 목록 수집)
+
+    src/py_alaska/core/task_signal.py
+        - _SignalEmitter.emit() 제거 (문자열 emit 차단)
+        - _SignalEmitter.on() 수정: TSignal 참조만 허용
+        - SignalClient.emit()은 내부적으로 유지 (BoundTSignal이 호출)
+
+    src/py_alaska/core/_task_runtime.py
+        - _auto_subscribe_signals() 수정:
+          - @rmi_signal 스캔 제거
+          - signal_subscribe 처리 제거
+          - @on 데코레이터의 _signal_handler 읽기 (기존과 동일)
+          - _signal_handler_lazy resolve (lambda 지원)
+
+    src/py_alaska/core/__init__.py
+        - TSignal, on 공개 export
+        - rmi_signal export 제거
+
+6.3 기존 코드 전환
+
+    모든 기존 코드를 TSignal로 전환해야 한다:
+
+    변환 규칙:
+    ---------------------------------------------------------------
+    Before                              After
+    ---------------------------------------------------------------
+    self.signal.emit("name", data)      self.name.emit(data)
+    self.signal.name.emit(data)         self.name.emit(data)
+    @rmi_signal("name")                 @on(PublisherClass.name)
+    signal_subscribe=["name"]           @on(PublisherClass.name)
+    on_name(self, signal)               @on(...) 데코레이터 사용
+    ---------------------------------------------------------------
+
+6.4 순환 참조 대응
+
+    @on(SensorJob.temp_changed) 사용 시, SensorJob 클래스가 import 가능해야 한다.
+    순환 참조 상황에서는 다음을 사용한다:
+
+        # 방법 1: 문자열 폴백
+        @on("SensorJob.temp_changed")
+        def handle_temp(self, signal): ...
+
+        # 방법 2: Lazy 참조 (lambda)
+        @on(lambda: SensorJob.temp_changed)
+        def handle_temp(self, signal): ...
+
+    Lazy 참조는 TaskRuntime._auto_subscribe_signals() 시점에 resolve된다.
+    (클래스 정의 시점이 아닌 런타임 시점)
+
+
+7. 제약 사항
+----------------------------------------------------------------------------
+
+7.1 정적 선언만 허용
+
+    TSignal은 클래스 정의 시 이름이 결정된다.
+    동적으로 시그널 이름을 생성하는 것은 불가능하다.
+
+        # 불가 (v2.7)
+        for i in range(10):
+            self.signal.emit(f"sensor.{i}", data)
+
+        # 허용 (TSignal 선언)
+        class SensorJob:
+            sensor_0 = TSignal(float)
+            sensor_1 = TSignal(float)
+            ...
+
+    동적 시그널이 필요한 경우, 데이터 구조로 해결한다:
+
+        class SensorJob:
+            sensor_data = TSignal(dict)    # {"sensor_id": 0, "value": 25.5}
+
+            def run(self):
+                for i in range(10):
+                    self.sensor_data.emit({"sensor_id": i, "value": data})
+
+7.2 시그널 이름 256개 제한
+
+    SmSignalRegistry의 256 시그널 슬롯 제한은 TSignal에도 동일하게 적용된다.
+    TSignal은 정적 선언이므로 슬롯 사용량을 예측하기 쉽다.
+
+7.3 크로스 프로세스
+
+    TSignal 참조(SensorJob.temp_changed)는 Python 객체이므로,
+    다른 프로세스에서 직접 참조할 수 없다.
+    그러나 내부적으로 문자열 이름("SensorJob.temp_changed")으로 변환되므로,
+    SmSignalRegistry를 통한 크로스 프로세스 통신에는 영향 없다.
+
+    제한 사항은 "데코레이터 시점의 import"뿐이다.
+    런타임 통신은 기존과 동일하게 문자열 기반으로 동작한다.
+
+
+8. 폐기 목록 (v2.6 -> v2.7)
+----------------------------------------------------------------------------
+
+    폐기 항목                     대체
+    ----------------------------  -----------------------------------
+    self.signal.emit("name", d)   self.name.emit(d)  (TSignal)
+    self.signal.name.emit(d)      self.name.emit(d)  (TSignal)
+    @rmi_signal("name")           @on(Class.signal)
+    signal_subscribe=["name"]     @on(Class.signal)
+    on_name() 자동 매핑            @on(Class.signal) 명시적 선언
+    signal_forward (문자열 키)     signal_forward (TSignal 키)
+
+    유지 항목:
+    - SignalClient (내부 구현)
+    - SignalBroker (내부 구현)
+    - SmSignalRegistry (공유 메모리)
+    - QoS / PriorityScheduler
+    - _SignalEmitter._client (BoundTSignal이 접근)
+    - Signal dataclass (수신 객체)
+
+
+9. 상태
+----------------------------------------------------------------------------
+
+    상태: 설계 (초안)
+    등록일: 2026-03-08
+    분류: TSignal 설계 문서
+    관련: doc/3070____Signal설계.txt
+          doc/3060____IPC설계.txt

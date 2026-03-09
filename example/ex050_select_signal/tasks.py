@@ -3,21 +3,25 @@
 import random
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal, on
 
 
 @task(name="SourceTask", mode="process", debug=True)
 class SourceTask:
     """랜덤 job 타입(a,b,c,d) 생성 및 signal 발행"""
 
+    job = TSignal(dict, name="job")
+
     def __init__(self):
         self.interval = 0.1
         self.job_count = 0
 
     def run(self):
+        self.interval = 0.001
         while self.running:
             job_type = random.choice("abcd")
             self.job_count += 1
-            getattr(self.signal.job, job_type).emit({
+            self.job.emit({
                 "id": self.job_count,
                 "type": job_type
             })
@@ -28,17 +32,21 @@ class SourceTask:
 class WorkerTask:
     """job 시그널 처리 Worker (job_type에 따라 해당 시그널 동적 구독)"""
 
+    result = TSignal(dict, name="result")
+
     def run(self):
-        job_type = getattr(self, 'job_type', 'a')
-        self.runtime.signal.on(f"job.{job_type}", self.on_job)
         while self.running:
             time.sleep(0.1)
 
+    @on("job")
     def on_job(self, signal):
-        """동적 구독 핸들러: job_type에 해당하는 시그널만 수신"""
+        """job_type 필터링 후 처리"""
+        job_type = getattr(self, 'job_type', 'a')
+        if signal.data["type"] != job_type:
+            return
         result = "ok" if random.random() < 0.8 else "ng"
-        self.signal.result.emit({
+        self.result.emit({
             "job_id": signal.data["id"],
-            "job_type": getattr(self, 'job_type', 'a'),
+            "job_type": job_type,
             "result": result
         })

@@ -15,6 +15,7 @@ Flow:
 
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import on
 
 
 @task(name="SourceTask", mode="thread")
@@ -56,6 +57,7 @@ class SourceTask:
         # 결과 출력
         self._print_stats()
 
+    @on("token.returned")
     def on_token_returned(self, signal):
         """dest에서 토큰 반환 signal 수신 (이벤트) - on_ 패턴 자동 구독"""
         token = signal.data  # {"id": "TOKEN-00", "send_time": ...}

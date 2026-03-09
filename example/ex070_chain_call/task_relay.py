@@ -12,11 +12,14 @@ config 예시:
 
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal
 
 
 @task(name="RelayTask", mode="thread")
 class RelayTask:
     """통합 Relay Task - nextTask 주입 여부로 동작 결정"""
+
+    token_returned = TSignal(dict, name="token.returned")
 
     def __init__(self):
         self.nextTask = None  # RmiClient (config에서 주입, 없으면 최종 Task)
@@ -40,7 +43,7 @@ class RelayTask:
             return self.nextTask.relay_token(token)
         else:
             # 최종: signal 발신
-            self.signal.token.returned.emit(token)
+            self.token_returned.emit(token)
             return "ok"
 
     def get_relay_count(self) -> int:
@@ -51,6 +54,8 @@ class RelayTask:
 @task(name="ProcessRelay", mode="process")
 class ProcessRelayTask:
     """Process 모드 Relay Task - Cross-mode 테스트용"""
+
+    token_returned = TSignal(dict, name="token.returned")
 
     def __init__(self):
         self.nextTask = None
@@ -68,7 +73,7 @@ class ProcessRelayTask:
         if self.nextTask:
             return self.nextTask.relay_token(token)
         else:
-            self.signal.token.returned.emit(token)
+            self.token_returned.emit(token)
             return "ok"
 
     def get_relay_count(self) -> int:

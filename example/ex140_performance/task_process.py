@@ -1,11 +1,15 @@
 # Copyright (c) 2026 동일비전(Dongil Vision Korea). All Rights Reserved.
-"""Process Tasks for IPC / Signal Performance Test (P1~P4)"""
+"""Process Tasks for IPC / Signal Performance Test (P1~P4)
+
+v2.7: TSignal 전환 — signal_subscribe 제거, @on(TSignal) 구독
+"""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import time
 from py_alaska import task
+from py_alaska.core.task_signal_decl import TSignal, on
 
 _BATCH = 500          # signal emit batch size (signal queue ~64KB)
 _CHUNK = 500          # result chunk size (RMI response ~64KB)
@@ -15,6 +19,9 @@ _BATCH_TIMEOUT = 30   # seconds to wait per batch
 @task(name="Process1", mode="process", restart=True)
 class Process1:
     """Process 1 — IPC / Signal entry point"""
+    sig_ping = TSignal(dict, name="sig_ping")
+    sig_hop1 = TSignal(dict, name="sig_hop1")
+
     def __init__(self):
         self.next_task = None  # client:p2
 
@@ -39,23 +46,21 @@ class Process1:
         """Test 3: Emit P1→P2 signals, return received count"""
         # Warmup
         for _ in range(10):
-            self.signal.sig_ping.emit({"t": time.perf_counter()})
+            self.sig_ping.emit({"t": time.perf_counter()})
         time.sleep(0.1)
         self.next_task.clear_sig_results()
         time.sleep(0.01)
 
         if contention:
-            # Contention mode: emit all without flow control
             for _ in range(iterations):
-                self.signal.sig_ping.emit({"t": time.perf_counter()})
+                self.sig_ping.emit({"t": time.perf_counter()})
                 time.sleep(0.00001)
         else:
-            # Flow-controlled: emit in batches, wait for receiver
             sent = 0
             while sent < iterations:
                 batch_end = min(sent + _BATCH, iterations)
                 for _ in range(batch_end - sent):
-                    self.signal.sig_ping.emit({"t": time.perf_counter()})
+                    self.sig_ping.emit({"t": time.perf_counter()})
                     time.sleep(0.00001)
                 sent = batch_end
 
@@ -82,23 +87,21 @@ class Process1:
         """Test 4: Emit 3-hop signals, return received count"""
         # Warmup
         for _ in range(10):
-            self.signal.sig_hop1.emit({"t": time.perf_counter()})
+            self.sig_hop1.emit({"t": time.perf_counter()})
         time.sleep(0.2)
         self.next_task.clear_hop_chain()
         time.sleep(0.01)
 
         if contention:
-            # Contention mode: emit all without flow control
             for _ in range(iterations):
-                self.signal.sig_hop1.emit({"t": time.perf_counter()})
+                self.sig_hop1.emit({"t": time.perf_counter()})
                 time.sleep(0.00001)
         else:
-            # Flow-controlled: emit in batches, wait for receiver
             sent = 0
             while sent < iterations:
                 batch_end = min(sent + _BATCH, iterations)
                 for _ in range(batch_end - sent):
-                    self.signal.sig_hop1.emit({"t": time.perf_counter()})
+                    self.sig_hop1.emit({"t": time.perf_counter()})
                     time.sleep(0.00001)
                 sent = batch_end
 
@@ -122,10 +125,11 @@ class Process1:
         return self.next_task.collect_hop_chunk(offset, count)
 
 
-@task(name="Process2", mode="process", restart=True,
-      signal_subscribe=["sig_ping", "sig_hop1"])
+@task(name="Process2", mode="process", restart=True)
 class Process2:
     """Process 2"""
+    sig_hop2 = TSignal(dict, name="sig_hop2")
+
     def __init__(self):
         self.next_task = None  # client:p3
         self._sig_results = []
@@ -148,6 +152,7 @@ class Process2:
         return self.next_task.ipc_receive(send_time)
 
     # ── Signal: direct test (P1→P2) ──
+    @on(Process1.sig_ping)
     def on_sig_ping(self, signal):
         recv_time = time.perf_counter()
         self._sig_results.append((recv_time - signal.data["t"]) * 1000)
@@ -163,8 +168,9 @@ class Process2:
         return self._sig_results[offset:offset + count]
 
     # ── Signal: 3-hop forward (P1→P2→P3) ──
+    @on(Process1.sig_hop1)
     def on_sig_hop1(self, signal):
-        self.signal.sig_hop2.emit(signal.data)
+        self.sig_hop2.emit(signal.data)
 
     def clear_hop_chain(self):
         self.next_task.clear_hop_chain()
@@ -177,10 +183,11 @@ class Process2:
         return self.next_task.collect_hop_chunk(offset, count)
 
 
-@task(name="Process3", mode="process", restart=True,
-      signal_subscribe=["sig_hop2"])
+@task(name="Process3", mode="process", restart=True)
 class Process3:
     """Process 3"""
+    sig_hop3 = TSignal(dict, name="sig_hop3")
+
     def __init__(self):
         self.next_task = None  # client:p4
 
@@ -198,8 +205,9 @@ class Process3:
         return self.next_task.ipc_receive(send_time)
 
     # ── Signal: 3-hop forward (P2→P3→P4) ──
+    @on(Process2.sig_hop2)
     def on_sig_hop2(self, signal):
-        self.signal.sig_hop3.emit(signal.data)
+        self.sig_hop3.emit(signal.data)
 
     def clear_hop_chain(self):
         self.next_task.clear_sig_results()
@@ -212,8 +220,7 @@ class Process3:
         return self.next_task.get_sig_results_chunk(offset, count)
 
 
-@task(name="Process4", mode="process", restart=True,
-      signal_subscribe=["sig_hop3"])
+@task(name="Process4", mode="process", restart=True)
 class Process4:
     """Process 4 — 3-hop endpoint"""
     def __init__(self):
@@ -230,6 +237,7 @@ class Process4:
         return {"elapsed_ms": (recv_time - send_time) * 1000}
 
     # ── Signal: 3-hop endpoint ──
+    @on(Process3.sig_hop3)
     def on_sig_hop3(self, signal):
         recv_time = time.perf_counter()
         self._sig_results.append((recv_time - signal.data["t"]) * 1000)

@@ -1,0 +1,35 @@
+{
+  "app_info": {
+    "name": "webcam_example",
+    "id": "node-webcam-001",
+    "version": "1.0.0"
+  },
+  "platform_config": {
+    "_smblock": {
+      "smblock_webcam": {
+        "shape": [2160, 3840, 3],
+        "maxsize": 10
+      }
+    },
+    "_monitor": {
+      "port": 7001,
+      "exit_hook": true,
+      "measurement": true
+    }
+  },
+  "task_config": {
+    "camera1/webcam_driver": {
+      "@import": "example.ex130b_camera_webcam.task_webcam_driver",
+      "smblock": "smblock:smblock_webcam",
+      "camera_index": 1,
+      "fps": 30,
+      "width": 3840,
+      "height": 2160
+    },
+    "viewer/WebcamView": {
+      "@import": "example.ex130b_camera_webcam.task_viewer",
+      "target": "client:camera1",
+      "smblock": "smblock:smblock_webcam"
+    }
+  }
+}

@@ -666,6 +666,590 @@
   상세 설계: doc/3080.InvokeDispenser설계.txt
 
 
+14. 예제 가이드 (example/)
+================================================================================
+
+  전체 예제 목록:
+  ┌────────────────────────┬────────────────────────────────────────────────────┐
+  │ 디렉토리                │ 주제                                               │
+  ├────────────────────────┼────────────────────────────────────────────────────┤
+  │ ex010_hello_world      │ 최소 구성 (TaskManager + @task)                   │
+  │ ex020_debug            │ debug 옵션 (signal, method 로그)                  │
+  │ ex030_profiler         │ TaskProfiler 성능 측정                            │
+  │ ex040_restart          │ restart=True 자동 복구                            │
+  │ ex050_select_signal    │ Signal 선택적 필터링                              │
+  │ ex060_dynamic_signal   │ 런타임 on/off 동적 구독                          │
+  │ ex070_chain_call       │ 7-Hop RMI 체인 + Signal 토큰 순환                │
+  │ ex080_persistent       │ gconfig 런타임 설정 읽기                          │
+  │ ex090_signal_rmi_combo │ Signal + RMI 조합 패턴                           │
+  │ ex091_property_rmi     │ @property RMI 프록시 (process/thread)            │
+  │ ex100_direct_update_ui │ Process → Signal → Qt UI 직접 업데이트           │
+  │ ex110_smblock          │ SmBlock 공유메모리 Producer-Consumer              │
+  │ ex120_task             │ 레거시 Task 구조 (비데코레이터)                   │
+  │ ex130_camera           │ IMI 산업용 카메라 + SmBlock 뷰어                 │
+  │ ex130a_camera          │ DeviceProperty 기반 카메라                       │
+  │ ex130b_camera_webcam   │ USB 웹캠 스트리밍                                │
+  │ ex140_performance      │ 성능 측정 GUI (4-process 체인)                   │
+  │ ex150_dynamic_task     │ 런타임 Task 생성/삭제                            │
+  │ ex160_device_property  │ DeviceProperty 선언적 디바이스 제어              │
+  │ ex170_web_debugger     │ 웹 모니터 + QoS 우선순위                         │
+  │ ex180_JoyStick         │ BT 게임패드 → CNC 제어                           │
+  │ ex510_save_image       │ 카메라 캡처 + 이미지 저장                        │
+  └────────────────────────┴────────────────────────────────────────────────────┘
+
+
+14.1 ex010_hello_world — 최소 구성
+--------------------------------------------------------------------------------
+
+  ALASKA의 최소 동작 구조. 3개 파일만으로 프로세스 Task 실행.
+
+  프로젝트 구조:
+    ex010_hello_world/
+    ├── config.json
+    ├── main.py
+    └── tasks.py
+
+  config.json:
+    {
+      "app_info": { "name": "hello_world", "id": "hello-001", "version": "1.0.0" },
+      "platform_config": {
+        "_monitor": { "port": 7000, "exit_hook": true }
+      },
+      "task_config": {
+        "hello/HelloTask": {
+          "@import": "example.ex010_hello_world.tasks"
+        }
+      }
+    }
+
+  tasks.py:
+    @task(mode="process")
+    class HelloTask:
+        def __init__(self):
+            self.count = 0
+
+        def run(self):
+            while self.running:
+                self.count += 1
+                print(f"[HelloTask] Hello #{self.count}")
+                time.sleep(1.0)
+
+  main.py:
+    from py_alaska import TaskManager, gconfig
+
+    gconfig.load(Path(__file__).parent / "config.json")
+    with TaskManager(gconfig):
+        input("Enter to stop...\n")
+
+  핵심 포인트:
+    - @task(mode="process") → 별도 프로세스에서 실행
+    - config "hello/HelloTask" → ID="hello", 클래스="HelloTask"
+    - TaskManager context manager로 생명주기 관리
+
+
+14.2 ex020_debug — 디버그 출력
+--------------------------------------------------------------------------------
+
+  debug 옵션별 로그 출력 시연.
+
+  config.json:
+    "task_config": {
+      "producer/ProducerTask": {
+        "@import": "example.ex020_debug.tasks"
+      },
+      "consumer/ConsumerTask": {
+        "@import": "example.ex020_debug.tasks",
+        "producer": "client:producer"           ← RMI 클라이언트 주입
+      }
+    }
+
+  tasks.py:
+    @task(name="ProducerTask", mode="process", debug="signal")
+    class ProducerTask:
+        """emit 시 시그널 이름/데이터 자동 출력"""
+        data_ready = TSignal(dict, name="data.ready")
+
+        def run(self):
+            while self.running:
+                self.count += 1
+                self.data_ready.emit({"count": self.count})
+                time.sleep(1.0)
+
+    @task(name="ConsumerTask", mode="process", debug="signal,method")
+    class ConsumerTask:
+        """시그널 수신 + RMI 호출 모두 자동 출력"""
+        def __init__(self):
+            self.producer = None                ← config에서 RmiClient 주입
+
+        def run(self):
+            while self.running:
+                count = self.producer.count     ← RMI 호출 (method 로그)
+                time.sleep(3.0)
+
+        @on("data.ready")
+        def on_data_ready(self, signal):        ← 자동 구독 (signal 로그)
+            self.received += 1
+
+  핵심 포인트:
+    - debug="signal" → emit/recv 시 자동 로그
+    - debug="method" → RMI 호출 시 자동 로그
+    - debug="signal,method" → 둘 다
+    - TSignal(dict, name="data.ready") → 타입 힌트 + 시그널명 선언
+    - @on("data.ready") → 명시적 구독 데코레이터
+
+
+14.3 ex040_restart — 자동 복구
+--------------------------------------------------------------------------------
+
+  restart=True 설정 시 예외 발생 후 자동 재시작.
+
+  tasks.py:
+    @task(name="UnstableTask", mode="process", restart=True)
+    class UnstableTask:
+        def __init__(self):
+            self.run_count = 0
+
+        def run(self):
+            self.run_count += 1
+            print(f"[UnstableTask] Started (run #{self.run_count})")
+            while self.running:
+                if random.random() < 0.1:
+                    raise RuntimeError(f"Crash at run #{self.run_count}")
+                time.sleep(0.5)
+
+    @task(name="WatcherTask", mode="process")
+    class WatcherTask:
+        def __init__(self):
+            self.unstable = None                ← RMI 클라이언트 주입
+
+        def run(self):
+            while self.running:
+                try:
+                    count = self.unstable.run_count   ← RMI로 상태 조회
+                except Exception as e:
+                    print(f"Unavailable: {e}")        ← 재시작 중 예외 처리
+                time.sleep(3.0)
+
+  핵심 포인트:
+    - restart=True → 예외 발생 시 자동 재시작
+    - run_count로 재시작 횟수 추적
+    - RMI 호출 시 Task 재시작 중이면 예외 → try/except 필수
+
+
+14.4 ex050_select_signal — 선택적 Signal 필터링
+--------------------------------------------------------------------------------
+
+  동일 시그널을 여러 Worker가 수신하되 데이터 기반으로 필터링.
+
+  config.json:
+    "task_config": {
+      "source/SourceTask":   { "interval": 0.5 },
+      "worker_a/WorkerTask": { "job_type": "a" },    ← 값 주입
+      "worker_b/WorkerTask": { "job_type": "b" },
+      "worker_c/WorkerTask": { "job_type": "c" },
+      "worker_d/WorkerTask": { "job_type": "d" },
+      "dest/DestTask":       { }
+    }
+
+  tasks.py:
+    @task(name="SourceTask", mode="process")
+    class SourceTask:
+        job = TSignal(dict, name="job")
+
+        def run(self):
+            while self.running:
+                job_type = random.choice("abcd")
+                self.job.emit({"id": self.job_count, "type": job_type})
+                time.sleep(self.interval)
+
+    @task(name="WorkerTask", mode="process")
+    class WorkerTask:
+        result = TSignal(dict, name="result")
+
+        @on("job")
+        def on_job(self, signal):
+            if signal.data["type"] != self.job_type:
+                return                              ← 자기 타입만 처리
+            result = "ok" if random.random() < 0.8 else "ng"
+            self.result.emit({"job_type": self.job_type, "result": result})
+
+  핵심 포인트:
+    - 같은 WorkerTask 클래스를 4개 인스턴스로 생성 (worker_a~d)
+    - config에서 "job_type" 값 주입 → self.job_type으로 접근
+    - Signal 핸들러 안에서 데이터 기반 필터링
+    - 1:N 브로드캐스트 후 각 Worker가 자기 몫만 처리
+
+
+14.5 ex060_dynamic_signal — 런타임 구독/해제
+--------------------------------------------------------------------------------
+
+  self.signal.xxx.on()/off()로 런타임에 구독을 동적 제어.
+
+  tasks.py:
+    @task(name="SensorTask", mode="process")
+    class SensorTask:
+        sensor_temp = TSignal(float, name="sensor.temp")
+        sensor_humidity = TSignal(float, name="sensor.humidity")
+
+        def run(self):
+            while self.running:
+                self.sensor_temp.emit(round(random.uniform(20, 40), 1))
+                self.sensor_humidity.emit(round(random.uniform(30, 80), 1))
+                time.sleep(0.3)
+
+    @task(name="MonitorTask", mode="process")
+    class MonitorTask:
+        def __init__(self):
+            self.subscribed = False
+
+        def run(self):
+            while self.running:
+                if self.subscribed:
+                    self.signal.sensor.temp.off(self._on_temp)     ← 동적 해제
+                    self.subscribed = False
+                else:
+                    self.signal.sensor.temp.on(self._on_temp)      ← 동적 구독
+                    self.subscribed = True
+                time.sleep(5.0)
+
+        def _on_temp(self, signal):
+            print(f"temp = {signal.data}")
+
+        def on_sensor_humidity(self, signal):
+            """자동 구독: 항상 수신 (on_ 패턴)"""
+            print(f"humidity = {signal.data}")
+
+  핵심 포인트:
+    - on_sensor_humidity → "sensor.humidity" 자동 구독 (항상 활성)
+    - self.signal.sensor.temp.on(callback) → 런타임 구독
+    - self.signal.sensor.temp.off(callback) → 런타임 해제
+    - 두 방식 혼용 가능 (자동 + 동적)
+
+
+14.6 ex070_chain_call — RMI 체인 + Signal 토큰 순환
+--------------------------------------------------------------------------------
+
+  7-Hop RMI 체인 호출과 Signal 피드백을 조합한 토큰 순환 패턴.
+
+  구조:
+    source ──[RMI]──→ mid1 → mid2 → mid3 → mid4 → mid5 → dest
+      ↑                                                      │
+      └──────────────[Signal: token.returned]─────────────────┘
+
+  config.json:
+    "task_config": {
+      "source/SourceTask":  { "mid": "client:mid1", "initial_tokens": 10 },
+      "mid1/RelayTask":     { "nextTask": "client:mid2" },
+      "mid2/RelayTask":     { "nextTask": "client:mid3" },
+      "mid3/RelayTask":     { "nextTask": "client:mid4" },
+      "mid4/RelayTask":     { "nextTask": "client:mid5" },
+      "mid5/RelayTask":     { "nextTask": "client:dest" },
+      "dest/RelayTask":     { }                               ← nextTask 없음
+    }
+
+  task_source.py:
+    @task(name="SourceTask", mode="thread")
+    class SourceTask:
+        def run(self):
+            self.tokens = [f"TOKEN-{i:02d}" for i in range(self.initial_tokens)]
+            while self.running and self.round_count < self.total_rounds:
+                if not self.tokens:
+                    time.sleep(0.001)
+                    continue
+                token_id = self.tokens.pop(0)
+                token = {"id": token_id, "send_time": time.time()}
+                self.mid.relay_token(token)           ← RMI 체인 시작
+
+        @on("token.returned")
+        def on_token_returned(self, signal):
+            round_time = (time.time() - signal.data["send_time"]) * 1000
+            self.round_times.append(round_time)
+            self.tokens.append(signal.data["id"])     ← 토큰 복귀
+            self.round_count += 1
+
+  task_relay.py:
+    @task(name="RelayTask", mode="thread")
+    class RelayTask:
+        token_returned = TSignal(dict, name="token.returned")
+
+        def __init__(self):
+            self.nextTask = None                      ← config에서 주입 (없으면 최종)
+
+        def relay_token(self, token: dict) -> str:
+            if self.nextTask:
+                return self.nextTask.relay_token(token)   ← 중계: RMI 전달
+            else:
+                self.token_returned.emit(token)           ← 최종: Signal 발신
+                return "ok"
+
+  핵심 포인트:
+    - 동일 RelayTask 클래스를 6개 인스턴스로 재사용
+    - nextTask 주입 여부로 중계/최종 역할 자동 결정
+    - RMI 체인: source → mid1.relay_token() → mid2 → ... → dest
+    - Signal 피드백: dest → token.returned → source
+    - 라운드 트립 시간 측정 (send_time 포함)
+
+
+14.7 ex100_direct_update_ui — Process → Signal → Qt UI
+--------------------------------------------------------------------------------
+
+  별도 프로세스에서 계산 후 Signal로 Qt UI를 직접 업데이트.
+
+  main.py:
+    from py_alaska import AlaskaApp
+    AlaskaApp.run(Path(__file__).parent / "config.json", main_task="score")
+
+  config.json:
+    "task_config": {
+      "sum_proc/SumProcess": { "@import": "..." },
+      "score/ScoreTask":     { "@import": "..." }     ← main_task
+    }
+
+  tasks.py (SumProcess):
+    @task(debug="rmi, signal")
+    class SumProcess:
+        score_update = TSignal(dict, name="score.update")
+
+        def run(self):
+            while self.running:
+                score = random.randint(1, 100)
+                self.total += score
+                self.score_update.emit({"score": score, "total": self.total})
+                time.sleep(0.1)
+
+  score_ui.py (ScoreTask):
+    @task(debug="signal")
+    class ScoreTask(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Score Monitor")
+            self._init_ui()
+
+        @on("score.update")
+        @ui_thread
+        def on_score_update(self, signal):
+            d = signal.data
+            self.label_score.setText(f"Current: {d['score']}")
+            self.label_total.setText(f"Total: {d['total']}")
+
+  핵심 포인트:
+    - AlaskaApp.run(config, main_task="score") → QWidget Task를 메인 윈도우로
+    - @task class가 QWidget을 상속 → Task이면서 Qt 위젯
+    - @on("score.update") + @ui_thread → Signal 수신 → Qt 스레드에서 UI 갱신
+    - SumProcess는 process 모드 → 별도 프로세스에서 계산
+
+
+14.8 ex110_smblock — 공유메모리 Producer-Consumer
+--------------------------------------------------------------------------------
+
+  SmBlock으로 프로세스 간 대용량 numpy 배열 전달 (Zero-Copy 접근).
+
+  config.json:
+    "platform_config": {
+      "_smblock": {
+        "pool": { "shape": [480, 640, 3], "maxsize": 1000 }
+      }
+    },
+    "task_config": {
+      "producer1/producer": { "smblock": "smblock:pool", "consumer": "client:consumer" },
+      "producer2/producer": { "smblock": "smblock:pool", "consumer": "client:consumer" },
+      "producer3/producer": { "smblock": "smblock:pool", "consumer": "client:consumer" },
+      "consumer/consumer":  { "smblock": "smblock:pool" }
+    }
+
+  task_producer.py:
+    @task(mode="process", restart=True)
+    class Producer:
+        def run(self):
+            while self.running:
+                image = np.random.randint(0, 255, self.smblock.shape, dtype=np.uint8)
+                index = self.smblock.malloc(image)       ← 할당 + 복사
+                if index >= 0:
+                    self.consumer.on_input(index)         ← RMI로 인덱스 전달
+                time.sleep(self.delay)
+
+  task_consumer.py:
+    @task(mode="process", restart=True)
+    class Consumer:
+        def on_input(self, index):
+            buf = self.smblock.get_buffer(index)          ← Zero-Copy 참조
+            # 이미지 처리...
+            self.smblock.mfree(index)                     ← 사용 후 반환
+
+  핵심 포인트:
+    - "smblock": "smblock:pool" → SmBlock 풀 자동 주입
+    - malloc(image) → 인덱스 반환, 실패 시 -1
+    - get_buffer(index) → numpy 뷰 (복사 없음)
+    - mfree(index) → 반드시 호출 (누락 시 메모리 누수)
+    - 3개 Producer, 1개 Consumer → N:1 패턴
+
+
+14.9 ex150_dynamic_task — 런타임 Task 생성/삭제
+--------------------------------------------------------------------------------
+
+  TaskManager API로 실행 중에 Task를 추가/제거.
+
+  main.py:
+    manager = TaskManager(gconfig)
+    manager.start_all()
+
+    # 동적 추가
+    manager.add_task("worker_1", "WorkerTask")
+
+    # RMI 호출
+    client = manager.get_client("worker_1")
+    client.ping()                                 → "pong from worker_1"
+    client.increment()                            → 1
+
+    # 동적 삭제
+    manager.remove_task("worker_1")
+
+    # 상태 조회
+    manager.get_status()
+
+  tasks.py:
+    @task(name="WorkerTask", mode="thread")
+    class WorkerTask:
+        def ping(self) -> str:
+            return f"pong from {self.runtime.name}"
+
+        def increment(self) -> int:
+            self.counter += 1
+            return self.counter
+
+        @on(ManagerTask.notify)                   ← 클래스 참조로 구독
+        def on_notify(self, sig):
+            print(f"received: {sig.data}")
+
+  핵심 포인트:
+    - manager.add_task(id, class_name) → 런타임 Task 생성
+    - manager.remove_task(id) → 런타임 Task 제거
+    - manager.get_client(id) → 동적 Task에도 RMI 접근 가능
+    - manager.get_status() → 전체 Task 상태 dict
+    - @on(ManagerTask.notify) → TSignal 객체 참조로 타입 안전 구독
+
+
+14.10 ex130_camera — 산업용 카메라 + SmBlock 뷰어
+--------------------------------------------------------------------------------
+
+  IMI 산업용 카메라를 SmBlock으로 Qt 뷰어에 스트리밍.
+
+  구조:
+    camera1 (process) ──[SmBlock + Signal]──→ viewer (thread/main)
+
+  config.json:
+    "platform_config": {
+      "_smblock": {
+        "camera_frames": { "shape": [2048, 2448, 3], "maxsize": 100 }
+      }
+    },
+    "task_config": {
+      "camera1/imi_cam_driver": {
+        "@import": "py_alaska.drives.imi.imi_camera",
+        "smblock": "smblock:camera_frames",
+        "mac_address": "ff:ff:ff:ff:ff:ff",
+        "fps": 900,
+        "exposure": 15000
+      },
+      "viewer/ImiCameraView": {
+        "@import": "example.ex130_camera.task_viewer",
+        "smblock": "smblock:camera_frames",
+        "camera1": "client:camera1"
+      }
+    }
+
+  패턴:
+    카메라 프로세스:
+      - ctypes 콜백 → SmBlock.malloc(image) → Signal emit (sm_index)
+    뷰어 스레드:
+      - on_camera_received → SmBlock.get_buffer(sm_index) → QPixmap → 표시
+      - SmBlock.mfree(sm_index) → 버퍼 반환
+
+  핵심 포인트:
+    - 카메라 드라이버는 process 모드 (격리)
+    - 뷰어는 thread 모드 + main_task (Qt 메인 윈도우)
+    - SmBlock으로 프레임 전달 (IPC 오버헤드 최소)
+    - Signal은 인덱스만 전달 (경량)
+    - mfree 호출 필수 (finally 블록에서)
+
+
+14.11 ex130b_camera_webcam — USB 웹캠 스트리밍
+--------------------------------------------------------------------------------
+
+  산업용 카메라 대신 USB 웹캠(cv2.VideoCapture)으로 동일 아키텍처 구현.
+
+  구조:
+    webcam (process) ──[SmBlock + Signal]──→ viewer (thread/main)
+
+  config.json:
+    "platform_config": {
+      "_smblock": {
+        "camera_frames": { "shape": [2160, 3840, 3], "maxsize": 10 }
+      }
+    },
+    "task_config": {
+      "camera1/WebcamTask": {
+        "smblock": "smblock:camera_frames",
+        "camera_index": 1,
+        "width": 3840, "height": 2160, "fps": 30
+      },
+      "viewer/WebcamView": {
+        "smblock": "smblock:camera_frames",
+        "camera1": "client:camera1"
+      }
+    }
+
+  핵심 포인트:
+    - ex130과 동일 아키텍처 (드라이버만 교체)
+    - cv2.VideoCapture로 웹캠 캡처
+    - 4K 해상도 시 SmBlock 크기 주의 (24MB/프레임)
+    - maxsize 줄여서 메모리 절약 (10개)
+
+
+14.12 기타 예제 요약
+--------------------------------------------------------------------------------
+
+  ex030_profiler:
+    - task_profiler 컨텍스트 매니저로 성능 측정
+    - with task_profiler("name") as p: ... p.lap("checkpoint")
+    - 단독 실행 가능 (TaskManager 불필요)
+
+  ex080_persistent:
+    - gconfig.data_get("user_config.interval", 1.0) → 런타임 설정 읽기
+    - gconfig.data_set("user_config.interval", 2.0) → 런타임 설정 쓰기
+    - 파일 잠금 기반 프로세스 안전
+
+  ex090_signal_rmi_combo:
+    - Signal로 알림 수신 → RMI로 상세 정보 조회
+    - 전형적 이벤트-드리븐 + RPC 조합 패턴
+
+  ex091_property_rmi:
+    - @property가 RMI 프록시를 통해 투명하게 동작
+    - process 모드: RmiClient._RmiProxy
+    - thread 모드: DirectClient._DirectProxy
+
+  ex140_performance:
+    - Qt GUI로 성능 벤치마크 실행/시각화
+    - 4-process 체인 RMI 레이턴시 측정
+
+  ex160_device_property:
+    - DEVICE_PROPERTY 딕셔너리로 디바이스 속성 선언
+    - validator, setter, debounce, notify 모드 지원
+    - resync 로직으로 하드웨어 동기화
+
+  ex170_web_debugger:
+    - TaskMonitor 웹 UI (http://localhost:7000)
+    - QoS 우선순위: QoS.REALTIME ~ QoS.BACKGROUND
+
+  ex180_JoyStick:
+    - BT 게임패드 입력 → CNC jog 제어
+    - 하드웨어 입출력 통합 예제
+
+  ex510_save_image:
+    - 카메라 캡처 + 파일 저장 통합
+    - QSplitter 70:30 레이아웃 (뷰어:저장UI)
+
+
 ================================================================================
   End of Developer Guide
 ================================================================================

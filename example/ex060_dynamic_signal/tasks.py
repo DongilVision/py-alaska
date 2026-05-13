@@ -33,11 +33,11 @@ class MonitorTask:
     def run(self):
         while self.running:
             if self.subscribed:
-                self.signal.sensor.temp.off(self._on_temp)
+                self.signal.off(SensorTask.sensor_temp, self._on_temp)
                 self.subscribed = False
                 print("[Monitor] temp 구독 해제")
             else:
-                self.signal.sensor.temp.on(self._on_temp)
+                self.signal.on(SensorTask.sensor_temp, self._on_temp)
                 self.subscribed = True
                 print("[Monitor] temp 구독 시작")
             time.sleep(5.0)

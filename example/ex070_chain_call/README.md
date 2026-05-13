@@ -54,3 +54,8 @@
 ```bash
 python main.py
 ```
+
+## Notes
+- Process ↔ Thread 상호 호출 지원 필수
+- 성능 0.5ms 이하 호출 성능 유지
+- Thread ↔ Thread 성능 튜닝은 별도 메커니즘 사용 가능
